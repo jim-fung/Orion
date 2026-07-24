@@ -3,17 +3,8 @@
 
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurface.h>
-
-/// Model configuration shared across all Orion components.
-typedef struct {
-    int n_layer;
-    int n_head;
-    int d_model;
-    int head_dim;
-    int hidden_dim;
-    int vocab;
-    int max_seq;
-} OrionModelConfig;
+#include "compiler/binding_plan.h"
+#include "model_config.h"
 
 /// Opaque handle to a compiled ANE program.
 typedef struct OrionProgram OrionProgram;
@@ -35,6 +26,27 @@ OrionProgram* orion_compile_mil(
     const char* program_tag
 );
 
+/// Verify that a BLOBFILE dictionary exactly matches a generated binding plan.
+/// Each weight must be present once, use dictionary offset zero, contain a valid
+/// 128-byte BLOBFILE header, and match the plan's payload size and SHA-256.
+bool orion_validate_weight_dictionary_for_plan(
+    const OrionBindingPlan* plan, NSDictionary* weight_dict
+);
+
+/// Compile only after validating the BLOBFILE dictionary against the plan.
+/// On validation failure, sets @c error and returns NULL (distinguishable from
+/// a private-compiler failure, which leaves @c error empty).
+OrionProgram* orion_compile_mil_with_plan(
+    const char* mil_text, const OrionBindingPlan* plan,
+    NSDictionary* weight_dict, const char* program_tag,
+    char* error, size_t error_size
+);
+
+/// Returns the binding plan cached inside a compiled program, or NULL if the
+/// program was compiled without a plan (e.g. via orion_compile_mil).
+/// The pointer is valid for the lifetime of @c prog.
+const OrionBindingPlan* orion_program_plan(const OrionProgram* prog);
+
 /// Evaluate a compiled ANE program.
 /// @param prog        Compiled program handle
 /// @param inputs      Array of input IOSurface tensors
@@ -44,6 +56,14 @@ OrionProgram* orion_compile_mil(
 /// @return true on success.
 bool orion_eval(
     OrionProgram* prog,
+    IOSurfaceRef* inputs, int num_inputs,
+    IOSurfaceRef* outputs, int num_outputs
+);
+
+/// Validate surfaces against the generated ABI plan, then evaluate them in
+/// the plan's alphabetical input/output binding order.
+bool orion_eval_with_plan(
+    OrionProgram* prog, const OrionBindingPlan* plan,
     IOSurfaceRef* inputs, int num_inputs,
     IOSurfaceRef* outputs, int num_outputs
 );

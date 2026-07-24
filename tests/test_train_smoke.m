@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <Accelerate/Accelerate.h>
 #import <math.h>
+#import <string.h>
 #import "kernels/training/stories_train.h"
 #import "core/checkpoint.h"
 
@@ -379,22 +380,55 @@ static void test_gradient_accumulation(void) {
 
 #pragma mark - Main
 
+typedef void (*SmokeTestFn)(void);
+
+typedef struct {
+    const char *name;
+    SmokeTestFn fn;
+} SmokeTestCase;
+
+static const SmokeTestCase kSmokeTests[] = {
+    {"trainer-create", test_trainer_create},
+    {"single-step", test_single_train_step},
+    {"adam-update", test_adam_update},
+    {"loss-decreases", test_loss_decreases},
+    {"gradient-accumulation", test_gradient_accumulation},
+    {"recompile-after-adam", test_recompile_after_adam},
+    {"checkpoint-save-load", test_checkpoint_save_load},
+};
+
 int main(int argc, const char* argv[]) {
     @autoreleasepool {
+        if (argc == 1) {
+            int failures = 0;
+            NSString *executable = @(argv[0]);
+            for (size_t i = 0; i < sizeof(kSmokeTests) / sizeof(kSmokeTests[0]); i++) {
+                NSTask *task = [[NSTask alloc] init];
+                task.executableURL = [NSURL fileURLWithPath:executable];
+                task.arguments = @[@(kSmokeTests[i].name)];
+                [task launchAndReturnError:nil];
+                [task waitUntilExit];
+                if (task.terminationStatus != 0) failures++;
+            }
+            NSLog(@"\n=== Smoke subprocesses: %zu passed, %d failed ===",
+                  sizeof(kSmokeTests) / sizeof(kSmokeTests[0]) - failures, failures);
+            return failures > 0 ? 1 : 0;
+        }
+
         NSLog(@"=== T072: Training Smoke Tests ===");
         NSLog(@"Using tiny config: %d layer, d=%d, h=%d, vocab=%d, seq=%d",
               kTinyConfig.n_layer, kTinyConfig.d_model, kTinyConfig.hidden_dim,
               kTinyConfig.vocab, kTinyConfig.max_seq);
 
-        test_trainer_create();
-        test_single_train_step();
-        test_adam_update();
-        test_loss_decreases();
-        test_gradient_accumulation();
-        test_recompile_after_adam();
-        test_checkpoint_save_load();
+        for (size_t i = 0; i < sizeof(kSmokeTests) / sizeof(kSmokeTests[0]); i++) {
+            if (strcmp(argv[1], kSmokeTests[i].name) == 0) {
+                kSmokeTests[i].fn();
+                NSLog(@"\n=== Results: %d passed, %d failed ===", g_pass, g_fail);
+                return g_fail > 0 ? 1 : 0;
+            }
+        }
 
-        NSLog(@"\n=== Results: %d passed, %d failed ===", g_pass, g_fail);
-        return g_fail > 0 ? 1 : 0;
+        NSLog(@"Unknown smoke test: %s", argv[1]);
+        return 2;
     }
 }

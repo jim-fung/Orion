@@ -52,6 +52,15 @@ static NSDictionary* make_random_wdict(NSArray<NSString*>* paths, NSArray<NSNumb
     return wdict;
 }
 
+static NSDictionary* subset_wdict(NSDictionary* source, NSArray<NSString*>* paths) {
+    NSMutableDictionary *result = [NSMutableDictionary dictionary];
+    for (NSString *path in paths) {
+        NSString *key = [@"@model_path" stringByAppendingPathComponent:path];
+        result[key] = source[key];
+    }
+    return result;
+}
+
 #pragma mark - T064: fwdAttn MIL Generation + Compile Tests
 
 static void test_fwd_attn_milgen(void) {
@@ -60,10 +69,11 @@ static void test_fwd_attn_milgen(void) {
     ASSERT(mil.length > 100, @"MIL should be non-trivial");
     ASSERT([mil containsString:@"rms1"], @"should contain RMSNorm");
     ASSERT([mil containsString:@"conv"], @"should contain conv (linear)");
-    ASSERT([mil containsString:@"matmul"], @"should contain matmul (attention)");
-    ASSERT([mil containsString:@"softmax"], @"should contain softmax");
-    // Multi-output: should return 6 fp16 outputs
-    ASSERT([mil containsString:@"-> (wo_conv, q_conv, k_conv, v_conv, attn_out, rms1_out)"], @"should have 6 outputs");
+    ASSERT([mil containsString:@"-> (k_conv, q_conv, rms1_out, v_conv)"], @"should have 4 alphabetical QKV outputs");
+    NSString *core = orion_kernel_adapter_generate_mil_2arg(orion_frontend_fwd_attn_core, 0, &kStories110M);
+    ASSERT([core containsString:@"matmul"], @"core should contain matmul");
+    ASSERT([core containsString:@"softmax"], @"core should contain softmax");
+    ASSERT([core containsString:@"-> (attn_out, wo_conv)"], @"core should have 2 alphabetical outputs");
     PASS();
 }
 
@@ -90,10 +100,16 @@ static void test_fwd_attn_compile(void) {
     ];
 
     NSDictionary *wdict = make_random_wdict(paths, sizes);
-    OrionProgram *prog = orion_compile_mil(mil.UTF8String, wdict, NULL);
-    ASSERT(prog != NULL, @"fwdAttn should compile on ANE");
+    NSDictionary *qkv_wdict = subset_wdict(wdict, [paths subarrayWithRange:NSMakeRange(0, 4)]);
+    NSDictionary *core_wdict = subset_wdict(wdict, [paths subarrayWithRange:NSMakeRange(4, 2)]);
+    OrionProgram *prog = orion_compile_mil(mil.UTF8String, qkv_wdict, NULL);
+    ASSERT(prog != NULL, @"fwdAttn QKV should compile on ANE");
+    NSString *core = orion_kernel_adapter_generate_mil_2arg(orion_frontend_fwd_attn_core, 0, &kStories110M);
+    OrionProgram *core_prog = orion_compile_mil(core.UTF8String, core_wdict, NULL);
+    ASSERT(core_prog != NULL, @"fwdAttn core should compile on ANE");
 
     orion_release_program(prog);
+    orion_release_program(core_prog);
     PASS();
 }
 
@@ -112,8 +128,13 @@ static void test_fwd_attn_eval(void) {
     NSArray *sizes = @[@(d), @(d*d), @(d*d), @(d*d), @(d*d), @(s*s)];
 
     NSDictionary *wdict = make_random_wdict(paths, sizes);
-    OrionProgram *prog = orion_compile_mil(mil.UTF8String, wdict, NULL);
-    ASSERT(prog != NULL, @"should compile");
+    NSDictionary *qkv_wdict = subset_wdict(wdict, [paths subarrayWithRange:NSMakeRange(0, 4)]);
+    NSDictionary *core_wdict = subset_wdict(wdict, [paths subarrayWithRange:NSMakeRange(4, 2)]);
+    OrionProgram *prog = orion_compile_mil(mil.UTF8String, qkv_wdict, NULL);
+    ASSERT(prog != NULL, @"QKV should compile");
+    NSString *core = orion_kernel_adapter_generate_mil_2arg(orion_frontend_fwd_attn_core, 0, &kStories110M);
+    OrionProgram *core_prog = orion_compile_mil(core.UTF8String, core_wdict, NULL);
+    ASSERT(core_prog != NULL, @"core should compile");
 
     // Create input tensor [1, d, 1, s] fp16
     IOSurfaceRef input = orion_tensor_create(d, s);
@@ -122,22 +143,27 @@ static void test_fwd_attn_eval(void) {
     orion_tensor_write_f32(input, in_data, d * s);
     free(in_data);
 
-    // 6 fp16 output surfaces — each [1, d, 1, s]
-    IOSurfaceRef out_oo = orion_tensor_create(d, s);
+    // QKV stage outputs: k, q, rms1, v.
     IOSurfaceRef out_qf = orion_tensor_create(d, s);
     IOSurfaceRef out_kf = orion_tensor_create(d, s);
     IOSurfaceRef out_vf = orion_tensor_create(d, s);
-    IOSurfaceRef out_af = orion_tensor_create(d, s);
     IOSurfaceRef out_xn = orion_tensor_create(d, s);
 
     IOSurfaceRef inputs[] = {input};
-    IOSurfaceRef outputs[] = {out_oo, out_qf, out_kf, out_vf, out_af, out_xn};
-    bool ok = orion_eval(prog, inputs, 1, outputs, 6);
-    ASSERT(ok, @"eval should succeed");
+    IOSurfaceRef qkv_outputs[] = {out_kf, out_qf, out_xn, out_vf};
+    bool ok = orion_eval(prog, inputs, 1, qkv_outputs, 4);
+    ASSERT(ok, @"QKV eval should succeed");
+
+    IOSurfaceRef out_af = orion_tensor_create(d, s);
+    IOSurfaceRef out_oo = orion_tensor_create(d, s);
+    IOSurfaceRef core_inputs[] = {out_kf, out_qf, out_vf};
+    IOSurfaceRef outputs[] = {out_af, out_oo};
+    ok = orion_eval(core_prog, core_inputs, 3, outputs, 2);
+    ASSERT(ok, @"core eval should succeed");
 
     // Verify each output has finite values (fp16→fp32 conversion on read)
     float *buf = calloc(d * s, sizeof(float));
-    for (int o = 0; o < 6; o++) {
+    for (int o = 0; o < 2; o++) {
         orion_tensor_read_f32(outputs[o], buf, d * s);
         int finite_count = 0;
         for (int i = 0; i < d * s; i++) {
@@ -149,8 +175,10 @@ static void test_fwd_attn_eval(void) {
 
     free(buf);
     CFRelease(input);
-    for (int i = 0; i < 6; i++) CFRelease(outputs[i]);
+    for (int i = 0; i < 4; i++) CFRelease(qkv_outputs[i]);
+    for (int i = 0; i < 2; i++) CFRelease(outputs[i]);
     orion_release_program(prog);
+    orion_release_program(core_prog);
     PASS();
 }
 
@@ -161,7 +189,7 @@ static void test_fwd_ffn_milgen(void) {
     ASSERT(mil != nil, @"should generate MIL");
     ASSERT([mil containsString:@"sigmoid"], @"should contain sigmoid (for SiLU)");
     // Multi-output: 5 fp16 outputs
-    ASSERT([mil containsString:@"-> (w2_conv, w1_conv, w3_conv, gate, rms2_out)"], @"should have 5 outputs");
+    ASSERT([mil containsString:@"-> (gate, rms2_out, w1_conv, w2_conv, w3_conv)"], @"should have 5 alphabetical outputs");
     PASS();
 }
 
@@ -218,13 +246,13 @@ static void test_fwd_ffn_eval(void) {
     IOSurfaceRef out_xn  = orion_tensor_create(h, s);   // rms2_out [d, s] (padded)
 
     IOSurfaceRef inputs[] = {input};
-    IOSurfaceRef outputs[] = {out_w2, out_w1, out_w3, out_gt, out_xn};
+    IOSurfaceRef outputs[] = {out_gt, out_xn, out_w1, out_w2, out_w3};
     bool ok = orion_eval(prog, inputs, 1, outputs, 5);
     ASSERT(ok, @"fwdFFN eval should succeed");
 
     // Verify outputs are finite (read logical sizes, not padded sizes)
     float *buf = calloc(h * s, sizeof(float));
-    int logical_sizes[] = {d*s, h*s, h*s, h*s, d*s};
+    int logical_sizes[] = {h*s, d*s, h*s, d*s, h*s};
     for (int o = 0; o < 5; o++) {
         orion_tensor_read_f32(outputs[o], buf, logical_sizes[o]);
         int finite_count = 0;

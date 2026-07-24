@@ -24,6 +24,10 @@ typedef struct {
     const char* name;           // Cache key name, e.g. "prefill_attn"
     OrionMILGenFn generate_mil; // MIL text generator
     OrionWDictFn build_wdict;   // Weight dictionary builder
+    // Optional compiler frontend (OrionFrontendFn, kept opaque to core).
+    // When present, kernel.m uses the mandatory adapter pipeline instead of
+    // generate_mil so adapted kernels cannot bypass ANE validation.
+    const void* adapter_frontend;
     int n_inputs;               // Expected number of input IOSurfaces
     int n_outputs;              // Expected number of output IOSurfaces
 } OrionKernel;

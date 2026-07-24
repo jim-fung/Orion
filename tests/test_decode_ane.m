@@ -173,7 +173,7 @@ static void test_decode_proj_mil_generation(void) {
     ASSERT(mil.length > 100, "MIL text should be substantial");
     ASSERT([mil containsString:@"func main<ios18>"], "Should have function header");
     ASSERT([mil containsString:@"[1,768,1,16]"], "Should use seq=16 tensors");
-    ASSERT([mil containsString:@"-> (q32, k32, v32)"], "Should have 3 outputs");
+    ASSERT([mil containsString:@"-> (k32, q32, v32)"], "Should have 3 alphabetical outputs");
     PASS("decode_proj MIL generation correct");
 }
 

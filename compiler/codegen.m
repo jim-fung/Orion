@@ -4,6 +4,28 @@
 #import "topo.h"
 #include <string.h>
 
+typedef struct {
+    int index;
+    const char *name;
+} OrionSortedIO;
+
+static int compare_graph_io_index(const void* left, const void* right) {
+    const OrionSortedIO *left_io = left;
+    const OrionSortedIO *right_io = right;
+    return strcmp(left_io->name, right_io->name);
+}
+
+static void sorted_io_indices(const OrionGraph* graph, bool outputs, int* indices, int count) {
+    OrionSortedIO sorted[ORION_MAX_GRAPH_IO];
+    for (int index = 0; index < count; index++) {
+        const OrionGraphIO *io = outputs ? &graph->outputs[index] : &graph->inputs[index];
+        sorted[index].index = index;
+        sorted[index].name = outputs ? graph->nodes[io->node_idx].name : io->name;
+    }
+    qsort(sorted, (size_t)count, sizeof(*sorted), compare_graph_io_index);
+    for (int index = 0; index < count; index++) indices[index] = sorted[index].index;
+}
+
 // Format a tensor type string: "tensor<fp16, [1,768,1,64]>"
 static NSString* fmt_tensor_type(OrionDtype dtype, const int shape[4]) {
     return [NSString stringWithFormat:@"tensor<%s, [%d,%d,%d,%d]>",
@@ -262,13 +284,16 @@ NSString* orion_codegen_mil(const OrionGraph* graph, const char* func_name) {
 
     // Function signature
     [m appendFormat:@"    func %s<ios18>(", func_name ? func_name : "main"];
+    int input_order[ORION_MAX_GRAPH_IO];
+    sorted_io_indices(graph, false, input_order, graph->n_inputs);
     for (int i = 0; i < graph->n_inputs; i++) {
         if (i > 0) [m appendString:@", "];
-        int node_idx = graph->inputs[i].node_idx;
+        const OrionGraphIO* input = &graph->inputs[input_order[i]];
+        int node_idx = input->node_idx;
         const OrionNode* inp = &graph->nodes[node_idx];
         [m appendFormat:@"%@ %s",
-         fmt_tensor_type(inp->dtype, inp->shape),
-         graph->inputs[i].name];
+          fmt_tensor_type(inp->dtype, inp->shape),
+          input->name];
     }
     [m appendString:@") {\n"];
 
@@ -279,9 +304,11 @@ NSString* orion_codegen_mil(const OrionGraph* graph, const char* func_name) {
 
     // Return tuple
     [m appendString:@"    } -> ("];
+    int output_order[ORION_MAX_GRAPH_IO];
+    sorted_io_indices(graph, true, output_order, graph->n_outputs);
     for (int i = 0; i < graph->n_outputs; i++) {
         if (i > 0) [m appendString:@", "];
-        [m appendString:@(graph->nodes[graph->outputs[i].node_idx].name)];
+        [m appendString:@(graph->nodes[graph->outputs[output_order[i]].node_idx].name)];
     }
     [m appendString:@");\n"];
     [m appendString:@"}\n"];

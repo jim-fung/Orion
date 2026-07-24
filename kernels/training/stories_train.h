@@ -26,7 +26,8 @@
 
 /// Per-layer ANE kernel programs.
 typedef struct {
-    OrionProgram *fwd_attn;   // 6 outputs
+    OrionProgram *fwd_attn;   // RMS/Q/K/V stage, 4 outputs
+    OrionProgram *fwd_attn_core; // attention/Wo stage, 2 outputs
     OrionProgram *fwd_ffn;    // 5 outputs
     OrionProgram *ffn_bwd;    // 3 outputs
     OrionProgram *sdpa_bwd1;  // 3 outputs
@@ -80,8 +81,9 @@ typedef struct {
     IOSurfaceRef fwd_ffn_in;      // [1, d, 1, s]
 
     // Forward outputs (6 + 5 separate IOSurfaces)
-    IOSurfaceRef fwd_attn_out[6]; // wo_out, q_out, k_out, v_out, attn_out, rms1_out
-    IOSurfaceRef fwd_ffn_out[5];  // w2_out, w1_out, w3_out, gate, rms2_out
+    IOSurfaceRef fwd_attn_qkv_out[4];  // k_out, q_out, rms1_out, v_out
+    IOSurfaceRef fwd_attn_core_out[2]; // attn_out, wo_out
+    IOSurfaceRef fwd_ffn_out[5];  // gate, rms2_out, w1_out, w2_out, w3_out
 
     // Backward inputs (concatenated, written from forward taps)
     IOSurfaceRef ffn_bwd_in;      // [1, d+2h, 1, s]

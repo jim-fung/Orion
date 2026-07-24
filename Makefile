@@ -61,12 +61,14 @@ COMPILER_C_SRC = \
 	compiler/pass_sram.c \
 	compiler/pass_uniform_outputs.c \
 	compiler/pass_ane_validate.c \
+	compiler/binding_plan.c \
 	compiler/pipeline.c \
 	compiler/frontends/gpt2_prefill.c \
 	compiler/frontends/gpt2_decode.c \
 	compiler/frontends/gpt2_final.c \
 	compiler/frontends/classifier_softmax.c \
 	compiler/frontends/stories_train.c \
+	compiler/frontends/voxtream_depth.c \
 	compiler/frontends/lora.c
 
 COMPILER_M_SRC = \
@@ -112,7 +114,9 @@ TEST_NAMES = \
 	test_infer_golden_ane \
 	test_bench_decode \
 	test_delta_compile \
-	test_lora
+	test_lora \
+	test_iosurface_tensor_checked \
+	test_plan_weight_dict
 
 # Compiler tests (link with compiler objects, not full library)
 COMPILER_TEST_NAMES = \

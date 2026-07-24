@@ -3,6 +3,61 @@
 
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurface.h>
+#include "compiler/binding_plan.h"
+
+typedef enum {
+    ORION_SURFACE_OK = 0,
+    ORION_SURFACE_NULL,
+    ORION_SURFACE_INVALID_ARGUMENT,
+    ORION_SURFACE_OVERFLOW,
+    ORION_SURFACE_ALLOCATION_MISMATCH,
+    ORION_SURFACE_LOCK_FAILED,
+    ORION_SURFACE_COPY_OUT_OF_BOUNDS,
+    ORION_SURFACE_DTYPE_MISMATCH,
+} OrionSurfaceStatus;
+
+typedef enum {
+    ORION_SURFACE_DTYPE_FP16 = 0,
+    ORION_SURFACE_DTYPE_FP32,
+} OrionSurfaceDtype;
+
+// Checked APIs are intended for generated binding plans. They preserve the
+// logical [1, C, 1, S] prefix while allowing a larger ABI allocation.
+IOSurfaceRef orion_tensor_create_checked(OrionSurfaceDtype dtype, int channels,
+                                         int seq_len, size_t allocation_bytes,
+                                         OrionSurfaceStatus *status);
+OrionSurfaceStatus orion_tensor_write_packed_checked(IOSurfaceRef surface,
+                                                       OrionSurfaceDtype dtype,
+                                                       const void *data,
+                                                       size_t packed_prefix_bytes);
+OrionSurfaceStatus orion_tensor_read_packed_checked(IOSurfaceRef surface,
+                                                      OrionSurfaceDtype dtype,
+                                                      void *data,
+                                                      size_t packed_prefix_bytes);
+OrionSurfaceStatus orion_tensor_copy_packed_checked(IOSurfaceRef dst,
+                                                      size_t dst_offset_bytes,
+                                                      IOSurfaceRef src,
+                                                      size_t src_offset_bytes,
+                                                      size_t byte_count);
+OrionSurfaceStatus orion_tensor_write_f32_as_fp16_at_checked(
+    IOSurfaceRef dst, size_t dst_offset_elements, const float *data,
+    size_t element_count);
+
+// Plan-bound wrappers reject caller-selected dtype, allocation, and byte ranges.
+IOSurfaceRef orion_tensor_create_for_binding(const OrionBindingPlanEntry *entry,
+                                              OrionSurfaceStatus *status);
+OrionSurfaceStatus orion_tensor_validate_for_binding(
+    IOSurfaceRef surface, const OrionBindingPlanEntry *entry);
+OrionSurfaceStatus orion_tensor_write_for_binding(
+    IOSurfaceRef surface, const OrionBindingPlanEntry *entry,
+    const void *data, size_t byte_count);
+OrionSurfaceStatus orion_tensor_read_for_binding(
+    IOSurfaceRef surface, const OrionBindingPlanEntry *entry,
+    void *data, size_t byte_count);
+OrionSurfaceStatus orion_tensor_copy_for_bindings(
+    IOSurfaceRef dst, const OrionBindingPlanEntry *dst_entry, size_t dst_offset_bytes,
+    IOSurfaceRef src, const OrionBindingPlanEntry *src_entry, size_t src_offset_bytes,
+    size_t byte_count);
 
 /// Create an IOSurface-backed fp16 tensor in ANE layout [1, C, 1, S].
 /// @param channels Number of channels (C dimension)

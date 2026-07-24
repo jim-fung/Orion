@@ -6,6 +6,7 @@
 
 #import "core/kernel.h"
 #include "graph.h"
+#include "binding_plan.h"
 
 // Frontend function type: builds a graph from model config (3-arg: layer, bucket, cfg).
 typedef OrionGraph* (*OrionFrontendFn)(int layer_idx, int bucket, const OrionModelConfig* cfg);
@@ -17,7 +18,26 @@ typedef OrionGraph* (*OrionFrontend2Fn)(int layer_idx, const OrionModelConfig* c
 // Builds graph -> validates -> optimizes -> codegen.
 NSString* orion_kernel_adapter_generate_mil(OrionFrontendFn frontend,
                                              int layer_idx, int bucket,
-                                             const OrionModelConfig* cfg);
+                                              const OrionModelConfig* cfg);
+
+// As above, but also returns a generated, validated ABI binding plan.
+NSString* orion_kernel_adapter_generate_mil_with_plan(OrionFrontendFn frontend,
+                                                        int layer_idx, int bucket,
+                                                        const OrionModelConfig* cfg,
+                                                         OrionBindingPlan* out_plan);
+
+// As above, with the source identity required for weighted plans.
+NSString* orion_kernel_adapter_generate_mil_with_plan_identity(
+    OrionFrontendFn frontend, int layer_idx, int bucket,
+    const OrionModelConfig* cfg, const OrionBindingPlanIdentity* identity,
+    OrionBindingPlan* out_plan);
+
+// Qualification entry point: MIL and plan come from the same optimized graph,
+// and deterministic JSON/Markdown plan artifacts are emitted before return.
+NSString* orion_kernel_adapter_generate_mil_with_artifacts(
+    OrionFrontendFn frontend, int layer_idx, int bucket,
+    const OrionModelConfig* cfg, const OrionBindingPlanIdentity* identity,
+    const char* json_path, const char* markdown_path, OrionBindingPlan* out_plan);
 
 // Direct API: generate MIL from a 2-arg frontend function (no bucket).
 NSString* orion_kernel_adapter_generate_mil_2arg(OrionFrontend2Fn frontend,

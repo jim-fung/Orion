@@ -218,6 +218,11 @@ static NSString* compiler_fwd_attn_adapter(int layer_idx, int bucket, const Orio
     return orion_kernel_adapter_generate_mil_2arg(orion_frontend_fwd_attn, layer_idx, cfg);
 }
 
+static NSString* compiler_fwd_attn_core_adapter(int layer_idx, int bucket, const OrionModelConfig* cfg) {
+    (void)bucket;
+    return orion_kernel_adapter_generate_mil_2arg(orion_frontend_fwd_attn_core, layer_idx, cfg);
+}
+
 static NSString* compiler_fwd_ffn_adapter(int layer_idx, int bucket, const OrionModelConfig* cfg) {
     (void)bucket;
     return orion_kernel_adapter_generate_mil_2arg(orion_frontend_fwd_ffn, layer_idx, cfg);
@@ -252,7 +257,15 @@ static NSDictionary* wdict_fwd_attn_adapter(int layer_idx, int bucket, const cha
         [L stringByAppendingPathComponent:@"rms1.bin"],
         [L stringByAppendingPathComponent:@"wq.bin"],
         [L stringByAppendingPathComponent:@"wk.bin"],
-        [L stringByAppendingPathComponent:@"wv.bin"],
+        [L stringByAppendingPathComponent:@"wv.bin"]
+    ]);
+}
+
+static NSDictionary* wdict_fwd_attn_core_adapter(int layer_idx, int bucket, const char* blob_dir) {
+    (void)bucket;
+    NSString *base = @(blob_dir);
+    NSString *L = [NSString stringWithFormat:@"layer%d", layer_idx];
+    return load_weight_dict(base, @[
         [L stringByAppendingPathComponent:@"wo.bin"],
         [NSString stringWithFormat:@"masks/causal_%d.bin", kStories110M.max_seq]
     ]);
@@ -317,6 +330,10 @@ static bool compile_layer(OrionLayerKernels* kern, int layer_idx,
     wdict = wdict_fwd_attn_adapter(layer_idx, s, base.UTF8String);
     kern->fwd_attn = orion_compile_mil(mil.UTF8String, wdict, "fwdAttn");
     if (!kern->fwd_attn) return false;
+    mil = compiler_fwd_attn_core_adapter(layer_idx, s, cfg);
+    wdict = wdict_fwd_attn_core_adapter(layer_idx, s, base.UTF8String);
+    kern->fwd_attn_core = orion_compile_mil(mil.UTF8String, wdict, "fwdAttnCore");
+    if (!kern->fwd_attn_core) return false;
 
     mil = compiler_fwd_ffn_adapter(layer_idx, s, cfg);
     wdict = wdict_fwd_ffn_adapter(layer_idx, s, base.UTF8String);
@@ -345,6 +362,17 @@ static bool compile_layer(OrionLayerKernels* kern, int layer_idx,
     return true;
 }
 
+static void release_layer_kernels(OrionLayerKernels* kern) {
+    if (kern->fwd_attn) orion_release_program(kern->fwd_attn);
+    if (kern->fwd_attn_core) orion_release_program(kern->fwd_attn_core);
+    if (kern->fwd_ffn) orion_release_program(kern->fwd_ffn);
+    if (kern->ffn_bwd) orion_release_program(kern->ffn_bwd);
+    if (kern->sdpa_bwd1) orion_release_program(kern->sdpa_bwd1);
+    if (kern->sdpa_bwd2) orion_release_program(kern->sdpa_bwd2);
+    if (kern->qkv_bwd) orion_release_program(kern->qkv_bwd);
+    memset(kern, 0, sizeof(*kern));
+}
+
 #pragma mark - Allocate Per-Layer IO
 
 static void alloc_layer_io(OrionLayerIO* io, const OrionModelConfig* cfg) {
@@ -359,8 +387,9 @@ static void alloc_layer_io(OrionLayerIO* io, const OrionModelConfig* cfg) {
     io->fwd_attn_in = orion_tensor_create(d, s);
     io->fwd_ffn_in  = orion_tensor_create(d, s);
 
-    // fwdAttn: 6 outputs, all [d, s] — naturally uniform
-    for (int i = 0; i < 6; i++) io->fwd_attn_out[i] = orion_tensor_create(d, s);
+    // Split attention stages: 4 QKV outputs and 2 attention-core outputs.
+    for (int i = 0; i < 4; i++) io->fwd_attn_qkv_out[i] = orion_tensor_create(d, s);
+    for (int i = 0; i < 2; i++) io->fwd_attn_core_out[i] = orion_tensor_create(d, s);
 
     // fwdFFN: 5 outputs — max(d, h) = h for uniform sizing
     for (int i = 0; i < 5; i++) io->fwd_ffn_out[i] = orion_tensor_create(h, s);
@@ -388,7 +417,8 @@ static void alloc_layer_io(OrionLayerIO* io, const OrionModelConfig* cfg) {
 static void free_layer_io(OrionLayerIO* io) {
     if (io->fwd_attn_in) CFRelease(io->fwd_attn_in);
     if (io->fwd_ffn_in) CFRelease(io->fwd_ffn_in);
-    for (int i = 0; i < 6; i++) if (io->fwd_attn_out[i]) CFRelease(io->fwd_attn_out[i]);
+    for (int i = 0; i < 4; i++) if (io->fwd_attn_qkv_out[i]) CFRelease(io->fwd_attn_qkv_out[i]);
+    for (int i = 0; i < 2; i++) if (io->fwd_attn_core_out[i]) CFRelease(io->fwd_attn_core_out[i]);
     for (int i = 0; i < 5; i++) if (io->fwd_ffn_out[i]) CFRelease(io->fwd_ffn_out[i]);
     if (io->ffn_bwd_in) CFRelease(io->ffn_bwd_in);
     if (io->sdpa_bwd1_in) CFRelease(io->sdpa_bwd1_in);
@@ -584,12 +614,7 @@ OrionTrainer* orion_trainer_create_deferred(const OrionModelConfig* cfg, const c
 void orion_trainer_free(OrionTrainer* t) {
     if (!t) return;
     for (int L = 0; L < t->n_layers; L++) {
-        if (t->kernels[L].fwd_attn)  orion_release_program(t->kernels[L].fwd_attn);
-        if (t->kernels[L].fwd_ffn)   orion_release_program(t->kernels[L].fwd_ffn);
-        if (t->kernels[L].ffn_bwd)   orion_release_program(t->kernels[L].ffn_bwd);
-        if (t->kernels[L].sdpa_bwd1) orion_release_program(t->kernels[L].sdpa_bwd1);
-        if (t->kernels[L].sdpa_bwd2) orion_release_program(t->kernels[L].sdpa_bwd2);
-        if (t->kernels[L].qkv_bwd)   orion_release_program(t->kernels[L].qkv_bwd);
+        release_layer_kernels(&t->kernels[L]);
         free_layer_io(&t->io[L]);
         free_layer_weights(&t->weights[L]);
         free_layer_grads(&t->grads[L]);
@@ -672,25 +697,33 @@ float orion_train_step(OrionTrainer* trainer,
             // Write layer input to ANE (CPU [s,d] → ANE [d,s])
             io_write_transpose(io->fwd_attn_in, x_in, d, s);
 
-            // fwdAttn: x → [wo_out, q_out, k_out, v_out, attn_out, rms1_out]
+            // Stage 1 outputs are k, q, rms1, v in alphabetical order.
             IOSurfaceRef attn_in[] = {io->fwd_attn_in};
-            bool ok = orion_eval(kern->fwd_attn, attn_in, 1, io->fwd_attn_out, 6);
+            bool ok = orion_eval(kern->fwd_attn, attn_in, 1, io->fwd_attn_qkv_out, 4);
             if (!ok) { NSLog(@"fwdAttn eval failed layer %d", L); return -1.0f; }
 
+            // Stage 2 inputs are k, q, v; outputs are attn, wo.
+            IOSurfaceRef core_in[] = {io->fwd_attn_qkv_out[0],
+                                      io->fwd_attn_qkv_out[1],
+                                      io->fwd_attn_qkv_out[3]};
+            ok = orion_eval(kern->fwd_attn_core, core_in, 3,
+                            io->fwd_attn_core_out, 2);
+            if (!ok) { NSLog(@"fwdAttnCore eval failed layer %d", L); return -1.0f; }
+
             // Residual: x2 = x_in + wo_out  (CPU)
-            io_read_transpose(io->fwd_attn_out[0], x2, d, s);  // wo_out
+            io_read_transpose(io->fwd_attn_core_out[1], x2, d, s);  // wo_out
             for (int i = 0; i < s * d; i++) x2[i] += x_in[i];
 
             // Write x2 to FFN input
             io_write_transpose(io->fwd_ffn_in, x2, d, s);
 
-            // fwdFFN: x2 → [w2_out, w1_out, w3_out, gate, rms2_out]
+            // fwdFFN outputs use the alphabetical MIL binding order.
             IOSurfaceRef ffn_in[] = {io->fwd_ffn_in};
             ok = orion_eval(kern->fwd_ffn, ffn_in, 1, io->fwd_ffn_out, 5);
             if (!ok) { NSLog(@"fwdFFN eval failed layer %d", L); return -1.0f; }
 
             // Residual: x_out = x2 + w2_out  (CPU)
-            io_read_transpose(io->fwd_ffn_out[0], x_out, d, s);  // w2_out
+            io_read_transpose(io->fwd_ffn_out[3], x_out, d, s);  // w2_out
             for (int i = 0; i < s * d; i++) x_out[i] += x2[i];
 
         }
@@ -765,9 +798,9 @@ float orion_train_step(OrionTrainer* trainer,
             // Assemble input: [dy(d), h1(h), h3(h)] into ffn_bwd_in
             io_write_transpose(io->ffn_bwd_in, dy, d, s);
             orion_tensor_copy_into(io->ffn_bwd_in, d,
-                                    io->fwd_ffn_out[1], h, s);  // w1_out = h1
+                                    io->fwd_ffn_out[2], h, s);  // w1_out = h1
             orion_tensor_copy_into(io->ffn_bwd_in, d + h,
-                                    io->fwd_ffn_out[2], h, s);  // w3_out = h3
+                                    io->fwd_ffn_out[4], h, s);  // w3_out = h3
 
             IOSurfaceRef ffn_bwd_in[] = {io->ffn_bwd_in};
             bool ok = orion_eval(kern->ffn_bwd, ffn_bwd_in, 1, io->ffn_bwd_out, 3);
@@ -787,8 +820,8 @@ float orion_train_step(OrionTrainer* trainer,
                 float *c_dy  = (float *)malloc(s * d * sizeof(float));
                 io_read_transpose(io->ffn_bwd_out[1], c_dh1, h, s);
                 io_read_transpose(io->ffn_bwd_out[2], c_dh3, h, s);
-                io_read_transpose(io->fwd_ffn_out[4], c_xn, d, s);   // rms2_out
-                io_read_transpose(io->fwd_ffn_out[3], c_gate, h, s);  // gate
+                io_read_transpose(io->fwd_ffn_out[1], c_xn, d, s);   // rms2_out
+                io_read_transpose(io->fwd_ffn_out[0], c_gate, h, s);  // gate
                 memcpy(c_dy, dy, s * d * sizeof(float));
 
                 int c_s = s, c_d = d, c_h = h;
@@ -811,11 +844,11 @@ float orion_train_step(OrionTrainer* trainer,
             // --- Attention Backward ---
             // sdpaBwd1 input: [qf(d), kf(d), vf(d), dx2(d)]
             orion_tensor_copy_into(io->sdpa_bwd1_in, 0,
-                                    io->fwd_attn_out[1], d, s);  // q_out
+                                    io->fwd_attn_qkv_out[1], d, s);  // q_out
             orion_tensor_copy_into(io->sdpa_bwd1_in, d,
-                                    io->fwd_attn_out[2], d, s);  // k_out
+                                    io->fwd_attn_qkv_out[0], d, s);  // k_out
             orion_tensor_copy_into(io->sdpa_bwd1_in, 2*d,
-                                    io->fwd_attn_out[3], d, s);  // v_out
+                                    io->fwd_attn_qkv_out[3], d, s);  // v_out
             {
                 IOSurfaceRef tmp = orion_tensor_create(d, s);
                 io_write_transpose(tmp, dx2, d, s);
@@ -833,9 +866,9 @@ float orion_train_step(OrionTrainer* trainer,
             orion_tensor_copy_into(io->sdpa_bwd2_in, sc_ch,
                                     io->sdpa_bwd1_out[2], sc_ch, s);  // dpf
             orion_tensor_copy_into(io->sdpa_bwd2_in, 2*sc_ch,
-                                    io->fwd_attn_out[1], d, s);       // q_out
+                                    io->fwd_attn_qkv_out[1], d, s);       // q_out
             orion_tensor_copy_into(io->sdpa_bwd2_in, 2*sc_ch + d,
-                                    io->fwd_attn_out[2], d, s);       // k_out
+                                    io->fwd_attn_qkv_out[0], d, s);       // k_out
 
             IOSurfaceRef sdpa2_in[] = {io->sdpa_bwd2_in};
             ok = orion_eval(kern->sdpa_bwd2, sdpa2_in, 1, io->sdpa_bwd2_out, 2);
@@ -849,11 +882,11 @@ float orion_train_step(OrionTrainer* trainer,
                 float *c_dv  = (float *)malloc(s * d * sizeof(float));
                 float *c_ao  = (float *)malloc(s * d * sizeof(float));
                 float *c_dx2 = (float *)malloc(s * d * sizeof(float));
-                io_read_transpose(io->fwd_attn_out[5], c_xn, d, s);  // rms1_out
+                io_read_transpose(io->fwd_attn_qkv_out[2], c_xn, d, s);  // rms1_out
                 io_read_transpose(io->sdpa_bwd2_out[0], c_dq, d, s); // dqf
                 io_read_transpose(io->sdpa_bwd2_out[1], c_dk, d, s); // dkf
                 io_read_transpose(io->sdpa_bwd1_out[0], c_dv, d, s); // dvf
-                io_read_transpose(io->fwd_attn_out[4], c_ao, d, s);  // attn_out
+                io_read_transpose(io->fwd_attn_core_out[0], c_ao, d, s);  // attn_out
                 memcpy(c_dx2, dx2, s * d * sizeof(float));
 
                 int c_s = s, c_d = d;
@@ -951,6 +984,9 @@ void orion_trainer_adam_update(OrionTrainer* t) {
 
 #pragma mark - T078: Recompile After Adam
 
+static bool patch_layer(OrionLayerKernels* kern, int layer_idx,
+                        const OrionModelConfig* cfg, NSString* weight_dir);
+
 bool orion_trainer_recompile(OrionTrainer* t, const char* weight_path) {
     @autoreleasepool {
         NSString *base = @(weight_path);
@@ -963,22 +999,10 @@ bool orion_trainer_recompile(OrionTrainer* t, const char* weight_path) {
         // Also write embed (needed for causal mask, not weight-bearing in ANE)
         // Causal mask doesn't change, no need to rewrite.
 
-        // Release old programs and recompile with new weights
+        // Reload weights in place. Recompiling all seven programs would exceed
+        // the private compiler's per-process budget after initial creation.
         for (int L = 0; L < nl; L++) {
-            OrionLayerKernels *kern = &t->kernels[L];
-
-            // Release old programs
-            if (kern->fwd_attn)  orion_release_program(kern->fwd_attn);
-            if (kern->fwd_ffn)   orion_release_program(kern->fwd_ffn);
-            if (kern->ffn_bwd)   orion_release_program(kern->ffn_bwd);
-            if (kern->sdpa_bwd1) orion_release_program(kern->sdpa_bwd1);
-            if (kern->sdpa_bwd2) orion_release_program(kern->sdpa_bwd2);
-            if (kern->qkv_bwd)   orion_release_program(kern->qkv_bwd);
-
-            memset(kern, 0, sizeof(OrionLayerKernels));
-
-            // Recompile with updated weights
-            if (!compile_layer(kern, L, t->cfg, base)) {
+            if (!patch_layer(&t->kernels[L], L, t->cfg, base)) {
                 NSLog(@"Recompile failed for layer %d", L);
                 return false;
             }
@@ -997,9 +1021,11 @@ static bool patch_layer(OrionLayerKernels* kern, int layer_idx,
 
     NSDictionary *wdict;
 
-    // fwd_attn: 6 weight blobs (rms1, wq, wk, wv, wo, causal_mask)
+    // Split attention programs have strict, disjoint weight dictionaries.
     wdict = wdict_fwd_attn_adapter(layer_idx, s, base.UTF8String);
     if (!orion_program_reload_weights(kern->fwd_attn, wdict)) return false;
+    wdict = wdict_fwd_attn_core_adapter(layer_idx, s, base.UTF8String);
+    if (!orion_program_reload_weights(kern->fwd_attn_core, wdict)) return false;
 
     // fwd_ffn: 4 weight blobs (rms2, w1, w3, w2)
     wdict = wdict_fwd_ffn_adapter(layer_idx, s, base.UTF8String);
@@ -1054,8 +1080,8 @@ bool orion_trainer_recompile_delta(OrionTrainer* t, const char* weight_path) {
 
 bool orion_trainer_needs_restart(const OrionTrainer* t, int* budget_remaining) {
     int used = orion_compile_count();
-    // 6 programs per layer; need enough budget for one full recompile
-    int needed = t->n_layers * 6;
+    // Split attention uses two programs, for seven programs per layer total.
+    int needed = t->n_layers * 7;
     int limit = STORIES_MAX_COMPILES;  // 100 (conservative vs ~119 hard limit)
     int remaining = limit - used;
 

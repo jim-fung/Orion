@@ -4,6 +4,7 @@
 // this test verifies structural equivalence (same ops, same weight refs).
 
 #import <Foundation/Foundation.h>
+#include <string.h>
 #include "compiler/graph.h"
 #include "compiler/builder.h"
 #include "compiler/pipeline.h"
@@ -15,7 +16,10 @@
 #include "compiler/frontends/gpt2_final.h"
 #include "compiler/frontends/classifier_softmax.h"
 #include "compiler/frontends/stories_train.h"
+#include "compiler/frontends/voxtream_depth.h"
 #include "compiler/model_config.h"
+#include "compiler/pass_ane_validate.h"
+#import "compiler/kernel_adapter.h"
 
 static int g_passed = 0, g_failed = 0;
 
@@ -119,7 +123,7 @@ static bool test_gpt2_decode_ffn(void) {
     return [mil containsString:@"hidden"];
 }
 
-// Test: Stories fwdAttn generates valid MIL
+// Test: Stories forward attention's compiler-required split generates valid MIL.
 static bool test_stories_fwd_attn(void) {
     OrionGraph* g = orion_frontend_fwd_attn(0, &kTestStories);
     if (!g) return false;
@@ -129,7 +133,17 @@ static bool test_stories_fwd_attn(void) {
     NSString* mil = orion_codegen_mil(g, "main");
     orion_graph_free(g);
 
-    return mil != nil && [mil containsString:@"matmul("] && [mil containsString:@"softmax("];
+    OrionGraph* core = orion_frontend_fwd_attn_core(0, &kTestStories);
+    if (!core) return false;
+    vr = orion_graph_validate(core);
+    if (!vr.valid) { orion_graph_free(core); return false; }
+    orion_pipeline_optimize(core);
+    NSString* core_mil = orion_codegen_mil(core, "main");
+    orion_graph_free(core);
+
+    return mil != nil && [mil containsString:@"q_conv"] &&
+           core_mil != nil && [core_mil containsString:@"matmul("] &&
+           [core_mil containsString:@"softmax("];
 }
 
 // Test: Stories fwdFFN generates valid MIL
@@ -252,6 +266,152 @@ static bool test_stories_qkv_bwd(void) {
     return mil != nil && [mil containsString:@"dx"];
 }
 
+static const OrionNode* live_node_named(const OrionGraph* g, const char* name) {
+    for (int i = 0; i < g->n_nodes; i++) {
+        if (g->nodes[i].is_live && strcmp(g->nodes[i].name, name) == 0) return &g->nodes[i];
+    }
+    return NULL;
+}
+
+static bool shape_is(const OrionNode* node, int a, int b, int c, int d) {
+    return node && node->shape[0] == a && node->shape[1] == b &&
+           node->shape[2] == c && node->shape[3] == d;
+}
+
+static bool test_voxtream_depth_layer(void) {
+    OrionGraph* g = orion_frontend_voxtream_depth_layer(0);
+    if (!g || orion_frontend_voxtream_depth_layer(-1) != NULL ||
+        orion_frontend_voxtream_depth_layer(4) != NULL) {
+        orion_graph_free(g);
+        return false;
+    }
+    OrionValidationResult vr = orion_graph_validate(g);
+    if (!vr.valid) { orion_graph_free(g); return false; }
+    orion_pipeline_optimize(g);
+    OrionANEValidationResult ar = orion_pass_ane_validate(g);
+    if (!ar.valid || g->n_inputs != 1 || g->n_outputs != 1) {
+        orion_graph_free(g);
+        return false;
+    }
+
+    bool shapes =
+        shape_is(live_node_named(g, "hidden"), 1, 1024, 1, 16) &&
+        shape_is(live_node_named(g, "q_conv"), 1, 1024, 1, 16) &&
+        shape_is(live_node_named(g, "k_conv"), 1, 256, 1, 16) &&
+        shape_is(live_node_named(g, "v_conv"), 1, 256, 1, 16) &&
+        shape_is(live_node_named(g, "q_rope_rotated_pairs"), 512, 16, 1, 2) &&
+        shape_is(live_node_named(g, "k_rope_rotated_pairs"), 128, 16, 1, 2) &&
+        shape_is(live_node_named(g, "attention_scores"), 2, 4, 16, 16) &&
+        shape_is(live_node_named(g, "attention_out"), 1, 1024, 1, 16) &&
+        shape_is(live_node_named(g, "mlp_w1_conv"), 1, 8192, 1, 16) &&
+        shape_is(live_node_named(g, "hidden_out"), 1, 1024, 1, 16);
+
+    const char* expected_paths[] = {
+        "@model_path/constants/causal_mask.bin",
+        "@model_path/constants/rope_k.bin",
+        "@model_path/constants/rope_q.bin",
+        "@model_path/weights/layer0/rms1.bin",
+        "@model_path/weights/layer0/rms2.bin",
+        "@model_path/weights/layer0/w1.bin",
+        "@model_path/weights/layer0/w2.bin",
+        "@model_path/weights/layer0/w3.bin",
+        "@model_path/weights/layer0/wk.bin",
+        "@model_path/weights/layer0/wo.bin",
+        "@model_path/weights/layer0/wq.bin",
+        "@model_path/weights/layer0/wv.bin",
+    };
+    bool seen[12] = {false};
+    int weight_count = 0;
+    bool no_banned_ops = true;
+    for (int i = 0; i < g->n_nodes; i++) {
+        const OrionNode* node = &g->nodes[i];
+        if (!node->is_live) continue;
+        if (node->op == ORION_OP_CONCAT_BANNED || node->op == ORION_OP_SPLIT ||
+            node->op == ORION_OP_PAD) no_banned_ops = false;
+        if (node->op != ORION_OP_CONST || !node->attrs.blob_path[0]) continue;
+        weight_count++;
+        if (node->attrs.blob_offset != 64) no_banned_ops = false;
+        for (int j = 0; j < 12; j++) {
+            if (strcmp(node->attrs.blob_path, expected_paths[j]) == 0) seen[j] = true;
+        }
+    }
+    bool all_weights = weight_count == 12;
+    for (int i = 0; i < 12; i++) all_weights = all_weights && seen[i];
+
+    NSString* mil = orion_codegen_mil(g, "voxtream_depth_layer0");
+    bool mil_ok = mil != nil && [mil containsString:@"softmax("] &&
+                  [mil containsString:@"sigmoid("] &&
+                  ![mil containsString:@"concat("] &&
+                  ![mil containsString:@"scaled_dot_product_attention"] &&
+                  ![mil containsString:@"gelu("] &&
+                  [mil containsString:@"-> (hidden_out)"];
+    orion_graph_free(g);
+
+    OrionGraph* final_norm = orion_frontend_voxtream_depth_final_norm();
+    if (!final_norm) return false;
+    OrionValidationResult final_vr = orion_graph_validate(final_norm);
+    orion_pipeline_optimize(final_norm);
+    OrionANEValidationResult final_ar = orion_pass_ane_validate(final_norm);
+    const OrionNode* final_output = live_node_named(final_norm, "hidden_out");
+    bool final_weight = false;
+    for (int i = 0; i < final_norm->n_nodes; i++) {
+        const OrionNode* node = &final_norm->nodes[i];
+        if (node->is_live && node->op == ORION_OP_CONST &&
+            strcmp(node->attrs.blob_path, "@model_path/weights/final_norm.bin") == 0 &&
+            node->attrs.blob_offset == 64) final_weight = true;
+    }
+    NSString* final_mil = orion_codegen_mil(final_norm, "voxtream_depth_final_norm");
+    bool final_ok = final_vr.valid && final_ar.valid &&
+        shape_is(final_output, 1, 1024, 1, 16) && final_weight &&
+        final_mil != nil && [final_mil containsString:@"-> (hidden_out)"];
+    orion_graph_free(final_norm);
+    return shapes && all_weights && no_banned_ops && mil_ok && final_ok;
+}
+
+static bool test_voxtream_depth_adapter_path(void) {
+    OrionModelConfig config = {
+        .n_layer = ORION_VOXTREAM_DEPTH_LAYERS,
+        .n_head = ORION_VOXTREAM_DEPTH_HEADS,
+        .d_model = ORION_VOXTREAM_DEPTH_DIM,
+        .head_dim = ORION_VOXTREAM_DEPTH_HEAD_DIM,
+        .hidden_dim = ORION_VOXTREAM_DEPTH_HIDDEN_DIM,
+        .max_seq = ORION_VOXTREAM_DEPTH_BUCKET,
+    };
+    NSString* mil = orion_kernel_adapter_generate_mil(
+        orion_frontend_voxtream_depth_layer_adapter, 0,
+        ORION_VOXTREAM_DEPTH_BUCKET, &config);
+    config.hidden_dim--;
+    NSString* wrong_config = orion_kernel_adapter_generate_mil(
+        orion_frontend_voxtream_depth_layer_adapter, 0,
+        ORION_VOXTREAM_DEPTH_BUCKET, &config);
+    NSString* wrong_bucket = orion_kernel_adapter_generate_mil(
+        orion_frontend_voxtream_depth_layer_adapter, 0,
+        ORION_VOXTREAM_DEPTH_BUCKET - 1, NULL);
+    NSString* missing_config = orion_kernel_adapter_generate_mil(
+        orion_frontend_voxtream_depth_layer_adapter, 0,
+        ORION_VOXTREAM_DEPTH_BUCKET, NULL);
+    return mil != nil && [mil containsString:@"-> (hidden_out)"] &&
+        wrong_config == nil && wrong_bucket == nil && missing_config == nil;
+}
+
+static bool test_voxtream_depth_all_layers_have_distinct_paths(void) {
+    for (int layer = 0; layer < ORION_VOXTREAM_DEPTH_LAYERS; layer++) {
+        OrionGraph* g = orion_frontend_voxtream_depth_layer(layer);
+        if (!g || !orion_graph_validate(g).valid) { orion_graph_free(g); return false; }
+        char expected[256];
+        snprintf(expected, sizeof(expected), "@model_path/weights/layer%d/wq.bin", layer);
+        bool found = false;
+        for (int i = 0; i < g->n_nodes; i++) {
+            if (g->nodes[i].op == ORION_OP_CONST &&
+                strcmp(g->nodes[i].attrs.blob_path, expected) == 0 &&
+                g->nodes[i].attrs.blob_offset == 64) found = true;
+        }
+        orion_graph_free(g);
+        if (!found) return false;
+    }
+    return true;
+}
+
 int main(int argc __attribute__((unused)), char* argv[] __attribute__((unused))) {
     @autoreleasepool {
         printf("test_compiler_equiv:\n");
@@ -269,6 +429,9 @@ int main(int argc __attribute__((unused)), char* argv[] __attribute__((unused)))
         TEST(stories_sdpa_bwd1);
         TEST(stories_sdpa_bwd2);
         TEST(stories_qkv_bwd);
+        TEST(voxtream_depth_layer);
+        TEST(voxtream_depth_adapter_path);
+        TEST(voxtream_depth_all_layers_have_distinct_paths);
 
         printf("\n%d/%d passed\n", g_passed, g_passed + g_failed);
         return g_failed > 0 ? 1 : 0;

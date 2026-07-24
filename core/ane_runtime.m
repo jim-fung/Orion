@@ -2,6 +2,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <dlfcn.h>
+#import <CommonCrypto/CommonDigest.h>
 
 // T015: orion_compile_mil — compile MIL text to ANE program
 // T016: orion_eval — evaluate a compiled program
@@ -16,6 +17,49 @@ static Class g_AIO;   // _ANEIOSurfaceObject
 static bool  g_init;
 static int   g_compile_count;
 
+static uint32_t read_le32(const uint8_t* bytes) {
+    return (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
+           ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24);
+}
+
+static NSString* sha256_hex(NSData* data) {
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(data.bytes, (CC_LONG)data.length, digest);
+    NSMutableString* text = [NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH * 2];
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) [text appendFormat:@"%02x", digest[i]];
+    return text;
+}
+
+bool orion_validate_weight_dictionary_for_plan(
+    const OrionBindingPlan* plan, NSDictionary* weight_dict
+) {
+    char error[256] = {0};
+    NSDictionary* dictionary = weight_dict ?: @{};
+    if (!plan || !orion_binding_plan_validate_finalized(plan, error, sizeof(error)) ||
+        dictionary.count != (NSUInteger)plan->n_weights) return false;
+    for (int i = 0; i < plan->n_weights; i++) {
+        const OrionBindingPlanWeight* weight = &plan->weights[i];
+        NSString* path = [NSString stringWithUTF8String:weight->path];
+        NSDictionary* entry = dictionary[path];
+        if (![entry isKindOfClass:[NSDictionary class]] ||
+            ![entry[@"offset"] isKindOfClass:[NSNumber class]] ||
+            [entry[@"offset"] unsignedLongLongValue] != 0 ||
+            ![entry[@"data"] isKindOfClass:[NSData class]]) return false;
+        NSData* data = entry[@"data"];
+        if (data.length < 128) return false;
+        const uint8_t* bytes = data.bytes;
+        if (bytes[0] != 0x01 || bytes[4] != 0x02 ||
+            bytes[64] != 0xef || bytes[65] != 0xbe ||
+            bytes[66] != 0xad || bytes[67] != 0xde || bytes[68] != 0x01 ||
+            read_le32(bytes + 72) != weight->logical_bytes ||
+            read_le32(bytes + 80) != 128 ||
+            data.length != (NSUInteger)128 + weight->logical_bytes ||
+            ![[sha256_hex(data) lowercaseString] isEqualToString:
+                [[NSString stringWithUTF8String:weight->sha256] lowercaseString]]) return false;
+    }
+    return true;
+}
+
 #pragma mark - OrionProgram
 
 struct OrionProgram {
@@ -23,6 +67,8 @@ struct OrionProgram {
     void *tmpDir;      // NSString* tmp directory (retained)
     char tag[256];
     bool loaded;
+    OrionBindingPlan plan;  // Cached when compiled via orion_compile_mil_with_plan
+    bool has_plan;
 };
 
 #pragma mark - Init
@@ -99,7 +145,9 @@ OrionProgram* orion_compile_mil(
         BOOL ok = ((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
             model, @selector(compileWithQoS:options:error:), 21, @{}, &e);
         if (!ok) {
-            if (e) NSLog(@"ANE compile error: %@", e);
+            if (e) NSLog(@"ANE compile error [%s, attempt %d]: %@",
+                         program_tag ? program_tag : "untagged",
+                         g_compile_count + 1, e);
             [fm removeItemAtPath:tmpDir error:nil];
             return NULL;
         }
@@ -127,7 +175,43 @@ OrionProgram* orion_compile_mil(
     }
 }
 
+OrionProgram* orion_compile_mil_with_plan(
+    const char* mil_text, const OrionBindingPlan* plan,
+    NSDictionary* weight_dict, const char* program_tag,
+    char* error, size_t error_size
+) {
+    if (error && error_size) error[0] = '\0';
+    if (!mil_text || !plan || !plan->mil_identity[0]) {
+        if (error && error_size) snprintf(error, error_size, "MIL text and MIL-bound plan are required");
+        return NULL;
+    }
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    char mil_identity[ORION_SHA256_HEX_LENGTH + 1];
+    CC_SHA256(mil_text, (CC_LONG)strlen(mil_text), digest);
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) snprintf(mil_identity + i * 2, 3, "%02x", digest[i]);
+    if (strcmp(mil_identity, plan->mil_identity) != 0) {
+        if (error && error_size) snprintf(error, error_size, "MIL text does not match the binding plan");
+        return NULL;
+    }
+    if (!orion_validate_weight_dictionary_for_plan(plan, weight_dict)) {
+        if (error && error_size) snprintf(error, error_size, "weight dictionary does not match the binding plan");
+        return NULL;
+    }
+    OrionProgram* prog = orion_compile_mil(mil_text, weight_dict, program_tag);
+    if (prog && plan) {
+        prog->plan = *plan;
+        prog->has_plan = true;
+    }
+    return prog;
+}
+
+const OrionBindingPlan* orion_program_plan(const OrionProgram* prog) {
+    return (prog && prog->has_plan) ? &prog->plan : NULL;
+}
+
 #pragma mark - T016: Eval
+
+#import "iosurface_tensor.h"
 
 bool orion_eval(
     OrionProgram* prog,
@@ -180,6 +264,26 @@ bool orion_eval(
         }
         return ok;
     }
+}
+
+bool orion_eval_with_plan(
+    OrionProgram* prog, const OrionBindingPlan* plan,
+    IOSurfaceRef* inputs, int num_inputs,
+    IOSurfaceRef* outputs, int num_outputs
+) {
+    char error[256] = {0};
+    if (!prog || !plan || !inputs || !outputs ||
+        !orion_binding_plan_validate_finalized(plan, error, sizeof(error)) ||
+        num_inputs != plan->n_inputs || num_outputs != plan->n_outputs) return false;
+    for (int i = 0; i < num_inputs; i++) {
+        if (orion_tensor_validate_for_binding(inputs[i], &plan->inputs[i]) !=
+            ORION_SURFACE_OK) return false;
+    }
+    for (int i = 0; i < num_outputs; i++) {
+        if (orion_tensor_validate_for_binding(outputs[i], &plan->outputs[i]) !=
+            ORION_SURFACE_OK) return false;
+    }
+    return orion_eval(prog, inputs, num_inputs, outputs, num_outputs);
 }
 
 #pragma mark - T017: Release

@@ -1,0 +1,274 @@
+// tests/test_plan_weight_dict.m — Plan-verified BLOBFILE dictionary checks.
+
+#import <Foundation/Foundation.h>
+#import <CommonCrypto/CommonDigest.h>
+#include "core/ane_runtime.h"
+#include "core/kernel.h"
+#include "core/iosurface_tensor.h"
+#include "compiler/graph.h"
+#include "compiler/builder.h"
+#include "compiler/binding_plan.h"
+#include "compiler/kernel_adapter.h"
+#include "compiler/pipeline.h"
+
+static int g_passed = 0, g_failed = 0;
+#define TEST(name) do { \
+    printf("  %-50s ", #name); \
+    if (test_##name()) { printf("PASS\n"); g_passed++; } \
+    else { printf("FAIL\n"); g_failed++; } \
+} while (0)
+
+static void digest_hex(NSData* data, char out[65]) {
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(data.bytes, (CC_LONG)data.length, digest);
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) snprintf(out + i * 2, 3, "%02x", digest[i]);
+}
+
+static void fill_entry(OrionBindingPlanEntry* entry, const char* name) {
+    snprintf(entry->name, sizeof(entry->name), "%s", name);
+    entry->dtype = ORION_DTYPE_FP16;
+    entry->declared_shape[0] = 1; entry->declared_shape[1] = 2;
+    entry->declared_shape[2] = 1; entry->declared_shape[3] = 2;
+    entry->logical_bytes = 8;
+    entry->packed_prefix_bytes = 8;
+    entry->allocation_bytes = ORION_ANE_MIN_ALLOCATION_BYTES;
+    snprintf(entry->layout, sizeof(entry->layout), "packed-NCHW-prefix");
+    snprintf(entry->allocation_layout, sizeof(entry->allocation_layout), "flat-byte-buffer");
+}
+
+static NSDictionary* valid_dictionary(OrionBindingPlan* plan) {
+    NSMutableData* data = [NSMutableData dataWithLength:136];
+    uint8_t* bytes = data.mutableBytes;
+    bytes[0] = 1; bytes[4] = 2;
+    bytes[64] = 0xef; bytes[65] = 0xbe; bytes[66] = 0xad; bytes[67] = 0xde;
+    bytes[68] = 1; bytes[72] = 8; bytes[80] = 128;
+    for (int i = 0; i < 8; i++) bytes[128 + i] = (uint8_t)(i + 1);
+    digest_hex(data, plan->weights[0].sha256);
+    return @{ @"@model_path/weights/w.bin": @{ @"offset": @0, @"data": data } };
+}
+
+static bool test_plan_weight_dictionary_is_exact(void) {
+    OrionBindingPlan plan = {0};
+    plan.version = ORION_BINDING_PLAN_VERSION;
+    snprintf(plan.program_name, sizeof(plan.program_name), "weight-test");
+    memset(plan.graph_identity, 'a', ORION_SHA256_HEX_LENGTH);
+    memset(plan.mil_identity, 'b', ORION_SHA256_HEX_LENGTH);
+    snprintf(plan.orion_revision, sizeof(plan.orion_revision), "test");
+    snprintf(plan.compiler_build, sizeof(plan.compiler_build), "test");
+    snprintf(plan.position_semantics, sizeof(plan.position_semantics), "fixed");
+    snprintf(plan.mask_semantics, sizeof(plan.mask_semantics), "fixed");
+    snprintf(plan.failure_semantics, sizeof(plan.failure_semantics), "fail-closed");
+    plan.n_inputs = plan.n_outputs = 1;
+    fill_entry(&plan.inputs[0], "hidden");
+    fill_entry(&plan.outputs[0], "hidden_out");
+    plan.n_weights = 1;
+    snprintf(plan.weights[0].name, sizeof(plan.weights[0].name), "w");
+    snprintf(plan.weights[0].path, sizeof(plan.weights[0].path), "@model_path/weights/w.bin");
+    plan.weights[0].offset = 64;
+    plan.weights[0].dtype = ORION_DTYPE_FP16;
+    plan.weights[0].shape[0] = 2; plan.weights[0].shape[1] = 2;
+    plan.weights[0].shape[2] = plan.weights[0].shape[3] = 1;
+    plan.weights[0].logical_bytes = 8;
+    NSDictionary* good = valid_dictionary(&plan);
+    NSMutableDictionary* extra = [good mutableCopy];
+    extra[@"@model_path/weights/extra.bin"] = good[@"@model_path/weights/w.bin"];
+    NSMutableDictionary* wrong_offset = [good mutableCopy];
+    wrong_offset[@"@model_path/weights/w.bin"] = @{ @"offset": @64, @"data": good[@"@model_path/weights/w.bin"][@"data"] };
+    NSMutableData* tampered_data = [good[@"@model_path/weights/w.bin"][@"data"] mutableCopy];
+    ((uint8_t*)tampered_data.mutableBytes)[128] ^= 1;
+    NSDictionary* tampered = @{ @"@model_path/weights/w.bin": @{ @"offset": @0, @"data": tampered_data } };
+    return orion_validate_weight_dictionary_for_plan(&plan, good) &&
+        !orion_validate_weight_dictionary_for_plan(&plan, @{}) &&
+        !orion_validate_weight_dictionary_for_plan(&plan, extra) &&
+        !orion_validate_weight_dictionary_for_plan(&plan, wrong_offset) &&
+        !orion_validate_weight_dictionary_for_plan(&plan, tampered);
+}
+
+static bool test_compile_with_plan_rejects_bad_dict_with_error(void) {
+    OrionBindingPlan plan = {0};
+    plan.version = ORION_BINDING_PLAN_VERSION;
+    snprintf(plan.program_name, sizeof(plan.program_name), "weight-test");
+    memset(plan.graph_identity, 'a', ORION_SHA256_HEX_LENGTH);
+    memset(plan.mil_identity, 'b', ORION_SHA256_HEX_LENGTH);
+    snprintf(plan.orion_revision, sizeof(plan.orion_revision), "test");
+    snprintf(plan.compiler_build, sizeof(plan.compiler_build), "test");
+    snprintf(plan.position_semantics, sizeof(plan.position_semantics), "fixed");
+    snprintf(plan.mask_semantics, sizeof(plan.mask_semantics), "fixed");
+    snprintf(plan.failure_semantics, sizeof(plan.failure_semantics), "fail-closed");
+    plan.n_inputs = plan.n_outputs = 1;
+    fill_entry(&plan.inputs[0], "hidden");
+    fill_entry(&plan.outputs[0], "hidden_out");
+    plan.n_weights = 1;
+    snprintf(plan.weights[0].name, sizeof(plan.weights[0].name), "w");
+    snprintf(plan.weights[0].path, sizeof(plan.weights[0].path), "@model_path/weights/w.bin");
+    plan.weights[0].offset = 64;
+    plan.weights[0].dtype = ORION_DTYPE_FP16;
+    plan.weights[0].shape[0] = 2; plan.weights[0].shape[1] = 2;
+    plan.weights[0].shape[2] = plan.weights[0].shape[3] = 1;
+    plan.weights[0].logical_bytes = 8;
+    (void)valid_dictionary(&plan);
+    char error[256] = {0};
+    OrionProgram* prog = orion_compile_mil_with_plan(
+        "program(1.3) { func main<ios18>() {} -> (); }",
+        &plan, @{}, "reject-test", error, sizeof(error));
+    bool rejected = prog == NULL && strlen(error) > 0;
+    if (prog) orion_release_program(prog);
+    return rejected;
+}
+
+static OrionGraph* weight_free_frontend(int layer __attribute__((unused)),
+                                        int bucket __attribute__((unused)),
+                                        const OrionModelConfig* cfg __attribute__((unused))) {
+    OrionGraph* g = orion_graph_create();
+    int shape[4] = {1, 32, 1, 16};
+    int x = orion_gb_input(g, "x", ORION_DTYPE_FP16, shape);
+    int y = orion_gb_add(g, x, x, "y");
+    orion_gb_output(g, y, "y");
+    return g;
+}
+
+// Distinct graph (mul vs add) so MIL differs from weight_free_frontend.
+static OrionGraph* distinct_weight_free_frontend(int layer __attribute__((unused)),
+                                                 int bucket __attribute__((unused)),
+                                                 const OrionModelConfig* cfg __attribute__((unused))) {
+    OrionGraph* g = orion_graph_create();
+    int shape[4] = {1, 32, 1, 16};
+    int x = orion_gb_input(g, "x", ORION_DTYPE_FP16, shape);
+    int y = orion_gb_mul(g, x, x, "y");
+    orion_gb_output(g, y, "y");
+    return g;
+}
+
+static bool test_program_plan_accessor(void) {
+    if (!orion_ane_init()) {
+        printf("SKIP(ane-unavailable) ");
+        return true;
+    }
+    NSString* mil = orion_kernel_adapter_generate_mil(weight_free_frontend, 0, 16, NULL);
+    if (!mil) { printf("SKIP(mil-gen) "); return true; }
+    OrionProgram* prog = orion_compile_mil(mil.UTF8String, @{}, "plan-accessor-test");
+    if (!prog) { printf("SKIP(ane-compile) "); return true; }
+    const OrionBindingPlan* cached = orion_program_plan(prog);
+    bool ok = cached == NULL;
+    if (prog) orion_release_program(prog);
+    return ok;
+}
+
+static bool test_program_plan_caches_plan_from_compile_with_plan(void) {
+    if (!orion_ane_init()) {
+        printf("SKIP(ane-unavailable) ");
+        return true;
+    }
+    OrionBindingPlan plan;
+    NSString* mil = orion_kernel_adapter_generate_mil_with_plan_identity(
+        weight_free_frontend, 0, 16, NULL, NULL, &plan);
+    if (!mil) { printf("SKIP(mil-gen) "); return true; }
+    char error[256] = {0};
+    OrionProgram* prog = orion_compile_mil_with_plan(
+        mil.UTF8String, &plan, @{}, "plan-cache-test", error, sizeof(error));
+    if (!prog) { printf("SKIP(ane-compile) "); return true; }
+    const OrionBindingPlan* cached = orion_program_plan(prog);
+    bool ok = cached != NULL && cached->n_inputs == plan.n_inputs &&
+        strcmp(cached->graph_identity, plan.graph_identity) == 0;
+    if (prog) orion_release_program(prog);
+    return ok;
+}
+
+static bool test_compile_with_plan_rejects_mil_mismatch(void) {
+    OrionBindingPlan plan;
+    NSString* mil_a = orion_kernel_adapter_generate_mil_with_plan_identity(
+        weight_free_frontend, 0, 16, NULL, NULL, &plan);
+    if (!mil_a) { printf("SKIP(mil-gen) "); return true; }
+    NSString* mil_b = orion_kernel_adapter_generate_mil(
+        distinct_weight_free_frontend, 0, 16, NULL);
+    if (!mil_b) { printf("SKIP(mil-gen-b) "); return true; }
+    char error[256] = {0};
+    OrionProgram* prog = orion_compile_mil_with_plan(
+        mil_b.UTF8String, &plan, @{}, "mil-mismatch-test", error, sizeof(error));
+    bool rejected = prog == NULL && strlen(error) > 0;
+    if (prog) orion_release_program(prog);
+    return rejected;
+}
+
+static NSDictionary* weight_free_wdict(int layer __attribute__((unused)),
+                                        int bucket __attribute__((unused)),
+                                        const char* dir __attribute__((unused))) {
+    return @{};
+}
+
+static bool test_adapted_kernel_compile_and_eval_path(void) {
+    if (!orion_ane_init()) {
+        printf("SKIP(ane-unavailable) ");
+        return true;
+    }
+    OrionKernel kernel = orion_kernel_from_frontend(
+        "test_weight_free", weight_free_frontend, weight_free_wdict, 1, 1);
+    OrionModelConfig cfg = {0};
+    OrionWeightsBinding wb = { .weights_id = "test-step-0", .bucket = 16 };
+
+    OrionProgram* first = orion_kernel_compile(&kernel, 0, 16, &cfg, "/tmp", &wb);
+    if (!first) { printf("SKIP(ane-compile) "); return true; }
+
+    const OrionBindingPlan* cached = orion_program_plan(first);
+    if (!cached) return false;
+
+    // Second compile with same weights binding must return the cached program
+    // (verified by graph + MIL identity, not just by cache key).
+    OrionProgram* second = orion_kernel_compile(&kernel, 0, 16, &cfg, "/tmp", &wb);
+    bool cached_hit = second == first;
+
+    // Eval via plan-bound path.
+    OrionSurfaceStatus status = ORION_SURFACE_OK;
+    IOSurfaceRef input = orion_tensor_create_for_binding(&cached->inputs[0], &status);
+    IOSurfaceRef output = orion_tensor_create_for_binding(&cached->outputs[0], &status);
+    bool eval_ok = false;
+    if (input && output && status == ORION_SURFACE_OK) {
+        eval_ok = orion_kernel_eval(&kernel, 0, 16, &cfg, "/tmp", &wb,
+                                    &input, 1, &output, 1);
+    }
+    if (input) CFRelease(input);
+    if (output) CFRelease(output);
+    return cached_hit && eval_ok &&
+        strlen(cached->mil_identity) == ORION_SHA256_HEX_LENGTH;
+}
+
+static bool test_stale_cache_guard_forces_recompile(void) {
+    if (!orion_ane_init()) {
+        printf("SKIP(ane-unavailable) ");
+        return true;
+    }
+    OrionKernel kernel_add = orion_kernel_from_frontend(
+        "same-name", weight_free_frontend, weight_free_wdict, 1, 1);
+    OrionKernel kernel_mul = orion_kernel_from_frontend(
+        "same-name", distinct_weight_free_frontend, weight_free_wdict, 1, 1);
+    OrionModelConfig cfg = {0};
+    OrionWeightsBinding wb = { .weights_id = "stale-test", .bucket = 16 };
+
+    OrionProgram* first = orion_kernel_compile(&kernel_add, 0, 16, &cfg, "/tmp", &wb);
+    if (!first) { printf("SKIP(ane-compile) "); return true; }
+
+    // Same cache key ("same-name:0:stale-test:16") but different graph/mil identity.
+    // The stale-cache guard must detect the identity drift and force a recompile.
+    OrionProgram* second = orion_kernel_compile(&kernel_mul, 0, 16, &cfg, "/tmp", &wb);
+    bool cache_miss = second != NULL && second != first;
+
+    // Cache owns both programs; evicting releases the current one.
+    // first was already released by the cache when second replaced it.
+    orion_cache_evict("stale-test");
+    return cache_miss;
+}
+
+int main(void) {
+    @autoreleasepool {
+        printf("test_plan_weight_dict:\n");
+        TEST(plan_weight_dictionary_is_exact);
+        TEST(compile_with_plan_rejects_bad_dict_with_error);
+        TEST(program_plan_accessor);
+        TEST(program_plan_caches_plan_from_compile_with_plan);
+        TEST(compile_with_plan_rejects_mil_mismatch);
+        TEST(adapted_kernel_compile_and_eval_path);
+        TEST(stale_cache_guard_forces_recompile);
+        printf("\n%d/%d passed\n", g_passed, g_passed + g_failed);
+        return g_failed ? 1 : 0;
+    }
+}

@@ -8,8 +8,6 @@
 
 OrionGraph* orion_frontend_fwd_attn(int layer, const OrionModelConfig* cfg) {
     int d  = cfg->d_model;
-    int nh = cfg->n_head;
-    int hd = cfg->head_dim;
     int s  = cfg->max_seq;
     OrionGraph* g = orion_graph_create();
 
@@ -35,23 +33,34 @@ OrionGraph* orion_frontend_fwd_attn(int layer, const OrionModelConfig* cfg) {
     snprintf(wpath, sizeof(wpath), "@model_path/layer%d/wv.bin", layer);
     int v = orion_gb_linear(g, rms1, "v", d, d, s, wpath, NULL);
 
-    // Causal attention
-    char mask_path[256];
-    snprintf(mask_path, sizeof(mask_path), "@model_path/masks/causal_%d.bin", s);
-    int attn = orion_pattern_attention(g, q, k, v, mask_path, nh, hd, s, "attn");
-
-    // Output projection
-    snprintf(wpath, sizeof(wpath), "@model_path/layer%d/wo.bin", layer);
-    int wo = orion_gb_linear(g, attn, "wo", d, d, s, wpath, NULL);
-
-    // Multi-output (alphabetical: attn_out, k_out, q_out, rms1_out, v_out, wo_out)
-    orion_gb_output(g, wo, "wo_out");
+    // QKV boundary. The causal attention and Wo projection run in the
+    // separate fwd_attn_core program; the private compiler rejects the
+    // fused projection-plus-attention graph at this shape.
     orion_gb_output(g, q, "q_out");
     orion_gb_output(g, k, "k_out");
     orion_gb_output(g, v, "v_out");
-    orion_gb_output(g, attn, "attn_out");
     orion_gb_output(g, rms1, "rms1_out");
 
+    return g;
+}
+
+OrionGraph* orion_frontend_fwd_attn_core(int layer, const OrionModelConfig* cfg) {
+    int d = cfg->d_model, s = cfg->max_seq;
+    OrionGraph* g = orion_graph_create();
+    int shape[4] = {1, d, 1, s};
+    int q = orion_gb_input(g, "q", ORION_DTYPE_FP16, shape);
+    int k = orion_gb_input(g, "k", ORION_DTYPE_FP16, shape);
+    int v = orion_gb_input(g, "v", ORION_DTYPE_FP16, shape);
+
+    char path[256];
+    snprintf(path, sizeof(path), "@model_path/masks/causal_%d.bin", s);
+    int attn = orion_pattern_attention(g, q, k, v, path,
+                                       cfg->n_head, cfg->head_dim, s, "attn");
+    snprintf(path, sizeof(path), "@model_path/layer%d/wo.bin", layer);
+    int wo = orion_gb_linear(g, attn, "wo", d, d, s, path, NULL);
+
+    orion_gb_output(g, attn, "attn_out");
+    orion_gb_output(g, wo, "wo_out");
     return g;
 }
 

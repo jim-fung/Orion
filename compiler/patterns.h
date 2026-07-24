@@ -9,9 +9,25 @@
 // Attention pattern: decomposed SDPA (Q@K^T -> mask -> softmax -> @V)
 // Returns output node index. mask_path is BLOBFILE path for causal mask.
 int orion_pattern_attention(OrionGraph* g, int q, int k, int v,
-                            const char* mask_path,
-                            int n_heads, int head_dim, int seq,
-                            const char* prefix);
+                             const char* mask_path,
+                             int n_heads, int head_dim, int seq,
+                             const char* prefix);
+
+// Fixed-position interleaved RoPE. The BLOBFILE contains one 2x2 rotation
+// matrix per head pair and sequence position.
+int orion_pattern_rope_interleaved(OrionGraph* g, int input,
+                                   const char* rotations_path,
+                                   int n_heads, int head_dim, int seq,
+                                   const char* prefix);
+
+// Grouped-query attention without K/V concatenation or physical repetition.
+// Query heads are grouped as [kv_heads, queries_per_kv, S, head_dim], while
+// K/V use [kv_heads, 1, S, head_dim] and broadcast across each query group.
+int orion_pattern_gqa_attention(OrionGraph* g, int q, int k, int v,
+                                const char* mask_path,
+                                int n_heads, int n_kv_heads,
+                                int head_dim, int seq,
+                                const char* prefix);
 
 // FFN pattern: linear -> activation -> linear
 // activation: 0=GELU, 1=SiLU

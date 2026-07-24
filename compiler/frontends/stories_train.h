@@ -5,9 +5,13 @@
 #include "../graph.h"
 #include "../model_config.h"
 
-// Forward attention with taps: x -> RMSNorm -> QKV -> SDPA -> Wo
-// Outputs: wo_out, q_out, k_out, v_out, attn_out, rms1_out (all fp16)
+// Forward attention stage 1: x -> RMSNorm -> QKV.
+// Outputs: q_out, k_out, v_out, rms1_out (all fp16)
 OrionGraph* orion_frontend_fwd_attn(int layer, const OrionModelConfig* cfg);
+
+// Forward attention stage 2: [q,k,v] -> SDPA -> Wo.
+// Outputs: attn_out, wo_out (all fp16)
+OrionGraph* orion_frontend_fwd_attn_core(int layer, const OrionModelConfig* cfg);
 
 // Forward FFN with taps: x -> RMSNorm -> SwiGLU -> W2
 // Outputs: w2_out, w1_out, w3_out, gate, rms2_out (all fp16)

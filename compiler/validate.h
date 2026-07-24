@@ -18,6 +18,7 @@ typedef struct {
 // - No banned ops (concat)
 // - All nodes have names
 // - At least one output marked
+// - Reshape, transpose, matmul, convolution, and broadcast shapes agree
 OrionValidationResult orion_graph_validate(const OrionGraph* graph);
 
 #endif // ORION_VALIDATE_H
