@@ -295,3 +295,37 @@ int orion_pattern_cast_to_fp32(OrionGraph* g, int input, const char* name, int d
     int shape[4] = {1, dim, 1, seq};
     return orion_gb_cast(g, input, ORION_DTYPE_FP32, name, shape);
 }
+
+int orion_pattern_rope_interleaved_elementwise(
+    OrionGraph* g, int input, const char* cos_path, const char* sin_path,
+    const char* perm_path, int n_heads, int head_dim, int seq,
+    const char* prefix) {
+    if (!g || input < 0 || !cos_path || !sin_path || !perm_path ||
+        n_heads <= 0 || head_dim <= 0 || (head_dim % 2) != 0 || seq <= 0 ||
+        !prefix) return -1;
+    // y = x * cos + (perm @ x) * sin, where perm is the fixed signed
+    // interleaved pair-swap matrix. This avoids the batched rank-4 rotation
+    // matmul the private compiler rejects.
+    const int width = n_heads * head_dim;
+    char buf[ORION_MAX_NAME];
+    int table_shape[4] = {1, width, 1, seq};
+    int perm_shape[4] = {width, width, 1, 1};
+    snprintf(buf, sizeof(buf), "%s_cos", prefix);
+    int cos = orion_gb_const_weight(g, buf, ORION_DTYPE_FP16, table_shape,
+                                    cos_path, 64);
+    snprintf(buf, sizeof(buf), "%s_sin", prefix);
+    int sin = orion_gb_const_weight(g, buf, ORION_DTYPE_FP16, table_shape,
+                                    sin_path, 64);
+    snprintf(buf, sizeof(buf), "%s_perm", prefix);
+    int perm = orion_gb_const_weight(g, buf, ORION_DTYPE_FP16, perm_shape,
+                                     perm_path, 64);
+    int swapped_shape = width;
+    snprintf(buf, sizeof(buf), "%s_swapped", prefix);
+    int swapped = orion_gb_conv1x1(g, input, perm, -1, buf, swapped_shape, seq);
+    snprintf(buf, sizeof(buf), "%s_cos_scaled", prefix);
+    int cos_scaled = orion_gb_mul(g, input, cos, buf);
+    snprintf(buf, sizeof(buf), "%s_sin_scaled", prefix);
+    int sin_scaled = orion_gb_mul(g, swapped, sin, buf);
+    snprintf(buf, sizeof(buf), "%s_out", prefix);
+    return orion_gb_add(g, cos_scaled, sin_scaled, buf);
+}

@@ -47,6 +47,11 @@ OrionProgram* orion_compile_mil_with_plan(
 /// The pointer is valid for the lifetime of @c prog.
 const OrionBindingPlan* orion_program_plan(const OrionProgram* prog);
 
+/// Returns the program's on-disk model directory, or NULL. Intended for
+/// diagnostics and tooling that inspects compiled model artifacts.
+/// The pointer is valid until the next call on the same thread.
+const char* orion_program_model_dir(const OrionProgram* prog);
+
 /// Evaluate a compiled ANE program.
 /// @param prog        Compiled program handle
 /// @param inputs      Array of input IOSurface tensors
@@ -76,12 +81,14 @@ void orion_release_program(OrionProgram* prog);
 int orion_compile_count(void);
 
 /// Create a new ANE program with patched weights, reusing compiled artifacts
-/// from a donor program. Skips compilation entirely — only loads.
+/// from a donor program. Skips compilation entirely — only loads. The patch
+/// is rejected when the private runtime would alias the donor's model path.
 ///
 /// The ANE compiler's "data" file IS the BLOBFILE. By creating a new model
 /// identity and copying the compiled net.plist + new BLOBFILE, we can load
-/// new weights without compiling. This produces output identical to a fresh
-/// compile (verified: max diff = 0.0).
+/// new weights without compiling. For a plan-bound donor, the returned program
+/// retains the donor ABI/MIL identity while recording and validating hashes for
+/// the replacement BLOBFILE bytes.
 ///
 /// @param donor        A previously compiled OrionProgram (provides net.plist)
 /// @param mil_text     Same MIL text used to compile the donor
@@ -97,15 +104,12 @@ OrionProgram* orion_program_patch_weights(
     const char* program_tag
 );
 
-/// Reload an existing ANE program with new weights in-place.
-/// Unloads the model, updates weight files on disk, then reloads.
-/// Much faster than orion_program_patch_weights since it skips
-/// descriptor/model creation and MIL parsing.
+/// Legacy in-place reload is disabled because private model-file replacement
+/// cannot be made transactional. Use orion_program_patch_weights instead.
 ///
 /// @param prog         The program to reload (must be loaded)
 /// @param weight_dict  New weight dict (same keys, new data)
-/// @return true on success, false on failure. On failure, program is
-///         in an unloaded state and should be released.
+/// @return Always false.
 bool orion_program_reload_weights(
     OrionProgram* prog,
     NSDictionary* weight_dict

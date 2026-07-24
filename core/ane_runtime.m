@@ -69,7 +69,51 @@ struct OrionProgram {
     bool loaded;
     OrionBindingPlan plan;  // Cached when compiled via orion_compile_mil_with_plan
     bool has_plan;
+    char primary_weight_path[512]; // BLOBFILE materialized as compiled data
 };
+
+static bool rebound_plan_for_weights(const OrionProgram* donor,
+                                     NSDictionary* weight_dict,
+                                     const char* patched_mil,
+                                     OrionBindingPlan* out_plan) {
+    if (!donor || !donor->has_plan || !out_plan) return false;
+    *out_plan = donor->plan;
+    if ((NSUInteger)out_plan->n_weights != weight_dict.count) return false;
+    for (int i = 0; i < out_plan->n_weights; i++) {
+        NSString* path = @(out_plan->weights[i].path);
+        NSDictionary* entry = weight_dict[path];
+        NSData* data = [entry isKindOfClass:[NSDictionary class]] ? entry[@"data"] : nil;
+        if (![data isKindOfClass:[NSData class]]) return false;
+        unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+        CC_SHA256(data.bytes, (CC_LONG)data.length, digest);
+        for (int j = 0; j < CC_SHA256_DIGEST_LENGTH; j++) {
+            snprintf(out_plan->weights[i].sha256 + j * 2, 3, "%02x", digest[j]);
+        }
+        out_plan->weights[i].sha256[ORION_SHA256_HEX_LENGTH] = '\0';
+    }
+    return orion_binding_plan_set_mil_identity(out_plan, patched_mil) &&
+           orion_validate_weight_dictionary_for_plan(out_plan, weight_dict);
+}
+
+static NSString* patched_mil_text(const char* mil_text, NSDictionary* weight_dict) {
+    CC_SHA256_CTX context;
+    CC_SHA256_Init(&context);
+    NSArray<NSString*>* paths = [[weight_dict allKeys]
+        sortedArrayUsingSelector:@selector(compare:)];
+    for (NSString* path in paths) {
+        NSData* path_data = [path dataUsingEncoding:NSUTF8StringEncoding];
+        NSData* blob = weight_dict[path][@"data"];
+        CC_SHA256_Update(&context, path_data.bytes, (CC_LONG)path_data.length);
+        CC_SHA256_Update(&context, blob.bytes, (CC_LONG)blob.length);
+    }
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256_Final(digest, &context);
+    NSMutableString* identity = [NSMutableString stringWithCapacity:64];
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++)
+        [identity appendFormat:@"%02x", digest[i]];
+    return [NSString stringWithFormat:@"%s\n// orion-weight-patch:%@\n",
+                                      mil_text, identity];
+}
 
 #pragma mark - Init
 
@@ -162,11 +206,26 @@ OrionProgram* orion_compile_mil(
 
         g_compile_count++;
 
+        // Record which declared BLOBFILE the compiler materialized as data.
+        // Byte equality is unambiguous for replacement: equal candidates are
+        // interchangeable payloads, and a missing match disables patching.
+        NSString *dataPath = [tmpDir stringByAppendingPathComponent:@"data"];
+        NSData *compiledData = [NSData dataWithContentsOfFile:dataPath];
+
         // Wrap in OrionProgram (manual retain for C struct)
         OrionProgram *prog = (OrionProgram *)calloc(1, sizeof(OrionProgram));
         prog->model = (void *)CFBridgingRetain(model);
         prog->tmpDir = (void *)CFBridgingRetain(tmpDir);
         prog->loaded = true;
+        for (NSString *path in wdict) {
+            NSData *data = wdict[path][@"data"];
+            if (compiledData && [data isEqualToData:compiledData] &&
+                (!prog->primary_weight_path[0] ||
+                 strcmp(path.UTF8String, prog->primary_weight_path) < 0)) {
+                strlcpy(prog->primary_weight_path, path.UTF8String,
+                        sizeof(prog->primary_weight_path));
+            }
+        }
         if (program_tag) {
             strlcpy(prog->tag, program_tag, sizeof(prog->tag));
         }
@@ -207,6 +266,15 @@ OrionProgram* orion_compile_mil_with_plan(
 
 const OrionBindingPlan* orion_program_plan(const OrionProgram* prog) {
     return (prog && prog->has_plan) ? &prog->plan : NULL;
+}
+
+const char* orion_program_model_dir(const OrionProgram* prog) {
+    if (!prog || !prog->tmpDir) return NULL;
+    static _Thread_local char dir_buffer[4096];
+    NSString* dir = (__bridge NSString*)prog->tmpDir;
+    if (![dir getFileSystemRepresentation:dir_buffer
+                                maxLength:sizeof(dir_buffer)]) return NULL;
+    return dir_buffer;
 }
 
 #pragma mark - T016: Eval
@@ -330,12 +398,19 @@ OrionProgram* orion_program_patch_weights(
     NSDictionary* weight_dict,
     const char* program_tag
 ) {
-    if (!g_init || !donor || !donor->tmpDir || !mil_text) return NULL;
+    if (!g_init || !donor || !donor->tmpDir || !mil_text ||
+        !donor->primary_weight_path[0]) return NULL;
 
     @autoreleasepool {
-        NSData *milData = [NSData dataWithBytes:mil_text length:strlen(mil_text)];
         NSDictionary *wdict = weight_dict ?: @{};
+        NSString* patchedMIL = patched_mil_text(mil_text, wdict);
+        NSData *milData = [patchedMIL dataUsingEncoding:NSUTF8StringEncoding];
         NSFileManager *fm = [NSFileManager defaultManager];
+        OrionBindingPlan rebound_plan;
+        bool has_rebound_plan = donor->has_plan;
+        if (has_rebound_plan &&
+            !rebound_plan_for_weights(donor, wdict, patchedMIL.UTF8String,
+                                      &rebound_plan)) return NULL;
 
         // Create descriptor + model with new weights
         id desc = ((id(*)(Class,SEL,id,id,id))objc_msgSend)(
@@ -352,17 +427,20 @@ OrionProgram* orion_program_patch_weights(
         NSString *newDir = [NSTemporaryDirectory() stringByAppendingPathComponent:hexId];
         NSString *donorDir = (__bridge NSString *)donor->tmpDir;
         bool sameDir = [newDir isEqualToString:donorDir];
-
         if (sameDir) {
-            // Same hexId as donor (same MIL text + weight dict keys).
-            // Directory and net.plist already exist — just update weight files.
-            // Steal tmpDir ownership from donor so release won't delete the shared dir.
-            CFRelease(donor->tmpDir);
-            donor->tmpDir = NULL;
+            // Patching in place mutates the donor and cannot be transactional.
+            // Constant-only programs are reused directly by callers instead.
+            return NULL;
         } else {
             // Different hexId — set up new directory with donor's net.plist
             [fm removeItemAtPath:newDir error:nil];
-            [fm createDirectoryAtPath:newDir withIntermediateDirectories:YES attributes:nil error:nil];
+            NSError* mkdirErr = nil;
+            if (![fm createDirectoryAtPath:newDir withIntermediateDirectories:YES
+                                attributes:nil error:&mkdirErr]) {
+                NSLog(@"patch_weights[%s]: model directory creation failed: %@",
+                      program_tag ?: "?", mkdirErr);
+                return NULL;
+            }
 
             NSString *srcPlist = [donorDir stringByAppendingPathComponent:@"net.plist"];
             NSString *dstPlist = [newDir stringByAppendingPathComponent:@"net.plist"];
@@ -384,14 +462,27 @@ OrionProgram* orion_program_patch_weights(
         // weight blobs, write the primary one (first entry) as data and others
         // to their weight paths. Also write model.mil for completeness.
 
-        [milData writeToFile:[newDir stringByAppendingPathComponent:@"model.mil"]
-                  atomically:YES];
+        if (![milData writeToFile:[newDir stringByAppendingPathComponent:@"model.mil"]
+                       atomically:YES]) {
+            [fm removeItemAtPath:newDir error:nil];
+            return NULL;
+        }
 
         // Write weight blobs to weights/ and also as the data file
-        [fm createDirectoryAtPath:[newDir stringByAppendingPathComponent:@"weights"]
-            withIntermediateDirectories:YES attributes:nil error:nil];
+        NSError* weightsDirErr = nil;
+        if (![fm createDirectoryAtPath:[newDir stringByAppendingPathComponent:@"weights"]
+             withIntermediateDirectories:YES attributes:nil error:&weightsDirErr]) {
+            [fm removeItemAtPath:newDir error:nil];
+            return NULL;
+        }
 
-        bool dataWritten = false;
+        // Use the primary BLOBFILE observed during donor compilation. Never
+        // infer it from size or NSDictionary iteration order.
+        NSData* baked = wdict[@(donor->primary_weight_path)][@"data"];
+        if (!baked) {
+            [fm removeItemAtPath:newDir error:nil];
+            return NULL;
+        }
         for (NSString *path in wdict) {
             NSDictionary *entry = wdict[path];
             NSData *data = entry[@"data"];
@@ -401,24 +492,29 @@ OrionProgram* orion_program_patch_weights(
                                                                     withString:@""];
                 NSString *fullPath = [newDir stringByAppendingPathComponent:relPath];
                 NSString *dir = [fullPath stringByDeletingLastPathComponent];
-                [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-                [data writeToFile:fullPath atomically:YES];
-
-                // First blob also becomes the data file
-                if (!dataWritten) {
-                    [data writeToFile:[newDir stringByAppendingPathComponent:@"data"]
-                           atomically:YES];
-                    dataWritten = true;
+                NSError* dirErr = nil;
+                if (![fm createDirectoryAtPath:dir withIntermediateDirectories:YES
+                                     attributes:nil error:&dirErr] ||
+                    ![data writeToFile:fullPath atomically:YES]) {
+                    [fm removeItemAtPath:newDir error:nil];
+                    return NULL;
                 }
+
             }
         }
+        bool dataWritten = [baked writeToFile:
+            [newDir stringByAppendingPathComponent:@"data"] atomically:YES];
 
         // If no weights, copy the donor's data file
         if (!dataWritten) {
             NSString *srcData = [donorDir stringByAppendingPathComponent:@"data"];
-            [fm copyItemAtPath:srcData
-                        toPath:[newDir stringByAppendingPathComponent:@"data"]
-                         error:nil];
+            NSError* dataErr = nil;
+            if (![fm copyItemAtPath:srcData
+                             toPath:[newDir stringByAppendingPathComponent:@"data"]
+                              error:&dataErr]) {
+                [fm removeItemAtPath:newDir error:nil];
+                return NULL;
+            }
         }
 
         // Load WITHOUT compiling — the key delta patching optimization
@@ -436,6 +532,10 @@ OrionProgram* orion_program_patch_weights(
         prog->model = (void *)CFBridgingRetain(model);
         prog->tmpDir = (void *)CFBridgingRetain(newDir);
         prog->loaded = true;
+        if (has_rebound_plan) prog->plan = rebound_plan;
+        prog->has_plan = has_rebound_plan;
+        strlcpy(prog->primary_weight_path, donor->primary_weight_path,
+                sizeof(prog->primary_weight_path));
         if (program_tag) {
             strlcpy(prog->tag, program_tag, sizeof(prog->tag));
         }
@@ -449,42 +549,10 @@ bool orion_program_reload_weights(
     OrionProgram* prog,
     NSDictionary* weight_dict
 ) {
-    if (!g_init || !prog || !prog->model || !prog->tmpDir) return false;
-
-    @autoreleasepool {
-        id model = (__bridge id)prog->model;
-        NSString *dir = (__bridge NSString *)prog->tmpDir;
-        NSDictionary *wdict = weight_dict ?: @{};
-
-        // Unload from ANE
-        if (prog->loaded) {
-            NSError *e = nil;
-            ((BOOL(*)(id,SEL,unsigned int,NSError**))objc_msgSend)(
-                model, @selector(unloadWithQoS:error:), 21, &e);
-            prog->loaded = false;
-        }
-
-        // Update weight files on disk
-        for (NSString *path in wdict) {
-            NSDictionary *entry = wdict[path];
-            NSData *data = entry[@"data"];
-            if (data) {
-                NSString *relPath = [path stringByReplacingOccurrencesOfString:@"@model_path/"
-                                                                    withString:@""];
-                NSString *fullPath = [dir stringByAppendingPathComponent:relPath];
-                [data writeToFile:fullPath atomically:NO];
-            }
-        }
-
-        // Reload with new weights
-        NSError *e = nil;
-        BOOL ok = ((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
-            model, @selector(loadWithQoS:options:error:), 21, @{}, &e);
-        if (!ok) {
-            if (e) NSLog(@"orion_program_reload_weights LOAD FAILED: %@", e);
-            return false;
-        }
-        prog->loaded = true;
-        return true;
-    }
+    // Private runtime reload is not transactional and has no proven mapping
+    // from declared BLOBFILE paths to compiled data. Callers must use
+    // orion_program_patch_weights(), which creates an isolated model.
+    (void)prog;
+    (void)weight_dict;
+    return false;
 }

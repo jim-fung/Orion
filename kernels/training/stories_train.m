@@ -320,41 +320,50 @@ static NSDictionary* wdict_qkv_bwd_adapter(int layer_idx, int bucket, const char
 static bool compile_layer(OrionLayerKernels* kern, int layer_idx,
                            const OrionModelConfig* cfg, NSString* weight_dir) {
     // Training compiles directly — no cache (weights change every recompile)
+    static unsigned long s_compile_generation = 0;
+    unsigned long generation = __sync_add_and_fetch(&s_compile_generation, 1);
     int s = cfg->max_seq;
     NSString *base = weight_dir;
 
     NSString *mil;
     NSDictionary *wdict;
 
-    mil = compiler_fwd_attn_adapter(layer_idx, s, cfg);
+    mil = [compiler_fwd_attn_adapter(layer_idx, s, cfg)
+        stringByAppendingFormat:@"\n// orion-training-generation:%lu\n", generation];
     wdict = wdict_fwd_attn_adapter(layer_idx, s, base.UTF8String);
     kern->fwd_attn = orion_compile_mil(mil.UTF8String, wdict, "fwdAttn");
     if (!kern->fwd_attn) return false;
-    mil = compiler_fwd_attn_core_adapter(layer_idx, s, cfg);
+    mil = [compiler_fwd_attn_core_adapter(layer_idx, s, cfg)
+        stringByAppendingFormat:@"\n// orion-training-generation:%lu\n", generation];
     wdict = wdict_fwd_attn_core_adapter(layer_idx, s, base.UTF8String);
     kern->fwd_attn_core = orion_compile_mil(mil.UTF8String, wdict, "fwdAttnCore");
     if (!kern->fwd_attn_core) return false;
 
-    mil = compiler_fwd_ffn_adapter(layer_idx, s, cfg);
+    mil = [compiler_fwd_ffn_adapter(layer_idx, s, cfg)
+        stringByAppendingFormat:@"\n// orion-training-generation:%lu\n", generation];
     wdict = wdict_fwd_ffn_adapter(layer_idx, s, base.UTF8String);
     kern->fwd_ffn = orion_compile_mil(mil.UTF8String, wdict, "fwdFFN");
     if (!kern->fwd_ffn) return false;
 
-    mil = compiler_ffn_bwd_adapter(layer_idx, s, cfg);
+    mil = [compiler_ffn_bwd_adapter(layer_idx, s, cfg)
+        stringByAppendingFormat:@"\n// orion-training-generation:%lu\n", generation];
     wdict = wdict_ffn_bwd_adapter(layer_idx, s, base.UTF8String);
     kern->ffn_bwd = orion_compile_mil(mil.UTF8String, wdict, "ffnBwd");
     if (!kern->ffn_bwd) return false;
 
-    mil = compiler_sdpa_bwd1_adapter(layer_idx, s, cfg);
+    mil = [compiler_sdpa_bwd1_adapter(layer_idx, s, cfg)
+        stringByAppendingFormat:@"\n// orion-training-generation:%lu\n", generation];
     wdict = wdict_sdpa_bwd1_adapter(layer_idx, s, base.UTF8String);
     kern->sdpa_bwd1 = orion_compile_mil(mil.UTF8String, wdict, "sdpaBwd1");
     if (!kern->sdpa_bwd1) return false;
 
-    mil = compiler_sdpa_bwd2_adapter(layer_idx, s, cfg);
+    mil = [compiler_sdpa_bwd2_adapter(layer_idx, s, cfg)
+        stringByAppendingFormat:@"\n// orion-training-generation:%lu\n", generation];
     kern->sdpa_bwd2 = orion_compile_mil(mil.UTF8String, @{}, "sdpaBwd2");
     if (!kern->sdpa_bwd2) return false;
 
-    mil = compiler_qkv_bwd_adapter(layer_idx, s, cfg);
+    mil = [compiler_qkv_bwd_adapter(layer_idx, s, cfg)
+        stringByAppendingFormat:@"\n// orion-training-generation:%lu\n", generation];
     wdict = wdict_qkv_bwd_adapter(layer_idx, s, base.UTF8String);
     kern->qkv_bwd = orion_compile_mil(mil.UTF8String, wdict, "qkvBwd");
     if (!kern->qkv_bwd) return false;
@@ -991,6 +1000,9 @@ bool orion_trainer_recompile(OrionTrainer* t, const char* weight_path) {
     @autoreleasepool {
         NSString *base = @(weight_path);
         int nl = t->n_layers;
+        OrionLayerKernels *replacement = calloc(
+            (size_t)nl, sizeof(OrionLayerKernels));
+        if (!replacement) return false;
 
         // Write updated CPU weights to disk as BLOBFILE
         for (int L = 0; L < nl; L++) {
@@ -999,14 +1011,25 @@ bool orion_trainer_recompile(OrionTrainer* t, const char* weight_path) {
         // Also write embed (needed for causal mask, not weight-bearing in ANE)
         // Causal mask doesn't change, no need to rewrite.
 
-        // Reload weights in place. Recompiling all seven programs would exceed
-        // the private compiler's per-process budget after initial creation.
+        // Compile a complete replacement set before changing any live handle.
+        // This mode is intentionally compiler-expensive but transactional.
         for (int L = 0; L < nl; L++) {
-            if (!patch_layer(&t->kernels[L], L, t->cfg, base)) {
+            if (!compile_layer(&replacement[L], L, t->cfg, base)) {
                 NSLog(@"Recompile failed for layer %d", L);
+                for (int i = 0; i <= L; i++) {
+                    release_layer_kernels(&replacement[i]);
+                }
+                free(replacement);
                 return false;
             }
         }
+
+        for (int L = 0; L < nl; L++) {
+            release_layer_kernels(&t->kernels[L]);
+            t->kernels[L] = replacement[L];
+            memset(&replacement[L], 0, sizeof(replacement[L]));
+        }
+        free(replacement);
 
         return true;
     }
@@ -1018,34 +1041,51 @@ static bool patch_layer(OrionLayerKernels* kern, int layer_idx,
                         const OrionModelConfig* cfg, NSString* weight_dir) {
     int s = cfg->max_seq;
     NSString *base = weight_dir;
+    OrionLayerKernels replacement = {0};
 
-    NSDictionary *wdict;
+#define PATCH_PROGRAM(field, mil_fn, dict_fn, tag) do { \
+    NSString* patch_mil = mil_fn(layer_idx, s, cfg); \
+    NSDictionary* patch_dict = dict_fn(layer_idx, s, base.UTF8String); \
+    replacement.field = orion_program_patch_weights( \
+        kern->field, patch_mil.UTF8String, patch_dict, tag); \
+    if (!replacement.field) goto patch_failed; \
+} while (0)
 
-    // Split attention programs have strict, disjoint weight dictionaries.
-    wdict = wdict_fwd_attn_adapter(layer_idx, s, base.UTF8String);
-    if (!orion_program_reload_weights(kern->fwd_attn, wdict)) return false;
-    wdict = wdict_fwd_attn_core_adapter(layer_idx, s, base.UTF8String);
-    if (!orion_program_reload_weights(kern->fwd_attn_core, wdict)) return false;
+    PATCH_PROGRAM(fwd_attn, compiler_fwd_attn_adapter,
+                  wdict_fwd_attn_adapter, "fwdAttnPatch");
+    PATCH_PROGRAM(fwd_attn_core, compiler_fwd_attn_core_adapter,
+                  wdict_fwd_attn_core_adapter, "fwdAttnCorePatch");
+    PATCH_PROGRAM(fwd_ffn, compiler_fwd_ffn_adapter,
+                  wdict_fwd_ffn_adapter, "fwdFFNPatch");
+    PATCH_PROGRAM(ffn_bwd, compiler_ffn_bwd_adapter,
+                  wdict_ffn_bwd_adapter, "ffnBwdPatch");
+    PATCH_PROGRAM(sdpa_bwd1, compiler_sdpa_bwd1_adapter,
+                  wdict_sdpa_bwd1_adapter, "sdpaBwd1Patch");
+    PATCH_PROGRAM(qkv_bwd, compiler_qkv_bwd_adapter,
+                  wdict_qkv_bwd_adapter, "qkvBwdPatch");
 
-    // fwd_ffn: 4 weight blobs (rms2, w1, w3, w2)
-    wdict = wdict_fwd_ffn_adapter(layer_idx, s, base.UTF8String);
-    if (!orion_program_reload_weights(kern->fwd_ffn, wdict)) return false;
-
-    // ffn_bwd: 3 weight blobs (w2t, w1t, w3t)
-    wdict = wdict_ffn_bwd_adapter(layer_idx, s, base.UTF8String);
-    if (!orion_program_reload_weights(kern->ffn_bwd, wdict)) return false;
-
-    // sdpa_bwd1: 2 weight blobs (wot, causal_mask)
-    wdict = wdict_sdpa_bwd1_adapter(layer_idx, s, base.UTF8String);
-    if (!orion_program_reload_weights(kern->sdpa_bwd1, wdict)) return false;
-
-    // sdpa_bwd2: NO weights — keep existing program unchanged
-
-    // qkv_bwd: 3 weight blobs (wqt, wkt, wvt)
-    wdict = wdict_qkv_bwd_adapter(layer_idx, s, base.UTF8String);
-    if (!orion_program_reload_weights(kern->qkv_bwd, wdict)) return false;
-
+    // The weight-free SDPA stage remains valid. Replace all weighted handles
+    // only after every isolated patch has loaded successfully.
+    replacement.sdpa_bwd2 = kern->sdpa_bwd2;
+    orion_release_program(kern->fwd_attn);
+    orion_release_program(kern->fwd_attn_core);
+    orion_release_program(kern->fwd_ffn);
+    orion_release_program(kern->ffn_bwd);
+    orion_release_program(kern->sdpa_bwd1);
+    orion_release_program(kern->qkv_bwd);
+    *kern = replacement;
+#undef PATCH_PROGRAM
     return true;
+
+patch_failed:
+#undef PATCH_PROGRAM
+    if (replacement.fwd_attn) orion_release_program(replacement.fwd_attn);
+    if (replacement.fwd_attn_core) orion_release_program(replacement.fwd_attn_core);
+    if (replacement.fwd_ffn) orion_release_program(replacement.fwd_ffn);
+    if (replacement.ffn_bwd) orion_release_program(replacement.ffn_bwd);
+    if (replacement.sdpa_bwd1) orion_release_program(replacement.sdpa_bwd1);
+    if (replacement.qkv_bwd) orion_release_program(replacement.qkv_bwd);
+    return false;
 }
 
 bool orion_trainer_recompile_delta(OrionTrainer* t, const char* weight_path) {

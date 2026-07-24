@@ -295,21 +295,25 @@ static bool test_voxtream_depth_layer(void) {
     }
 
     bool shapes =
-        shape_is(live_node_named(g, "hidden"), 1, 1024, 1, 16) &&
-        shape_is(live_node_named(g, "q_conv"), 1, 1024, 1, 16) &&
-        shape_is(live_node_named(g, "k_conv"), 1, 256, 1, 16) &&
-        shape_is(live_node_named(g, "v_conv"), 1, 256, 1, 16) &&
-        shape_is(live_node_named(g, "q_rope_rotated_pairs"), 512, 16, 1, 2) &&
-        shape_is(live_node_named(g, "k_rope_rotated_pairs"), 128, 16, 1, 2) &&
-        shape_is(live_node_named(g, "attention_scores"), 2, 4, 16, 16) &&
-        shape_is(live_node_named(g, "attention_out"), 1, 1024, 1, 16) &&
-        shape_is(live_node_named(g, "mlp_w1_conv"), 1, 8192, 1, 16) &&
-        shape_is(live_node_named(g, "hidden_out"), 1, 1024, 1, 16);
+        shape_is(live_node_named(g, "hidden"), 1, 1024, 1, 32) &&
+        shape_is(live_node_named(g, "q_conv"), 1, 1024, 1, 32) &&
+        shape_is(live_node_named(g, "k_conv"), 1, 256, 1, 32) &&
+        shape_is(live_node_named(g, "v_conv"), 1, 256, 1, 32) &&
+        shape_is(live_node_named(g, "q_rope_swapped"), 1, 1024, 1, 32) &&
+        shape_is(live_node_named(g, "k_rope_swapped"), 1, 256, 1, 32) &&
+        shape_is(live_node_named(g, "attention_scores"), 2, 4, 32, 32) &&
+        shape_is(live_node_named(g, "attention_out"), 1, 1024, 1, 32) &&
+        shape_is(live_node_named(g, "mlp_w1_conv"), 1, 8192, 1, 32) &&
+        shape_is(live_node_named(g, "hidden_out"), 1, 1024, 1, 32);
 
     const char* expected_paths[] = {
         "@model_path/constants/causal_mask.bin",
-        "@model_path/constants/rope_k.bin",
-        "@model_path/constants/rope_q.bin",
+        "@model_path/constants/rope_k_cos.bin",
+        "@model_path/constants/rope_k_perm.bin",
+        "@model_path/constants/rope_k_sin.bin",
+        "@model_path/constants/rope_q_cos.bin",
+        "@model_path/constants/rope_q_perm.bin",
+        "@model_path/constants/rope_q_sin.bin",
         "@model_path/weights/layer0/rms1.bin",
         "@model_path/weights/layer0/rms2.bin",
         "@model_path/weights/layer0/w1.bin",
@@ -320,7 +324,7 @@ static bool test_voxtream_depth_layer(void) {
         "@model_path/weights/layer0/wq.bin",
         "@model_path/weights/layer0/wv.bin",
     };
-    bool seen[12] = {false};
+    bool seen[16] = {false};
     int weight_count = 0;
     bool no_banned_ops = true;
     for (int i = 0; i < g->n_nodes; i++) {
@@ -331,12 +335,12 @@ static bool test_voxtream_depth_layer(void) {
         if (node->op != ORION_OP_CONST || !node->attrs.blob_path[0]) continue;
         weight_count++;
         if (node->attrs.blob_offset != 64) no_banned_ops = false;
-        for (int j = 0; j < 12; j++) {
+        for (int j = 0; j < 16; j++) {
             if (strcmp(node->attrs.blob_path, expected_paths[j]) == 0) seen[j] = true;
         }
     }
-    bool all_weights = weight_count == 12;
-    for (int i = 0; i < 12; i++) all_weights = all_weights && seen[i];
+    bool all_weights = weight_count == 16;
+    for (int i = 0; i < 16; i++) all_weights = all_weights && seen[i];
 
     NSString* mil = orion_codegen_mil(g, "voxtream_depth_layer0");
     bool mil_ok = mil != nil && [mil containsString:@"softmax("] &&
@@ -362,7 +366,7 @@ static bool test_voxtream_depth_layer(void) {
     }
     NSString* final_mil = orion_codegen_mil(final_norm, "voxtream_depth_final_norm");
     bool final_ok = final_vr.valid && final_ar.valid &&
-        shape_is(final_output, 1, 1024, 1, 16) && final_weight &&
+        shape_is(final_output, 1, 1024, 1, 32) && final_weight &&
         final_mil != nil && [final_mil containsString:@"-> (hidden_out)"];
     orion_graph_free(final_norm);
     return shapes && all_weights && no_banned_ops && mil_ok && final_ok;

@@ -52,4 +52,9 @@ int orion_pattern_residual(OrionGraph* g, int x, int sublayer_output,
 int orion_pattern_cast_to_fp16(OrionGraph* g, int input, const char* name, int dim, int seq);
 int orion_pattern_cast_to_fp32(OrionGraph* g, int input, const char* name, int dim, int seq);
 
+int orion_pattern_rope_interleaved_elementwise(
+    OrionGraph* g, int input, const char* cos_path, const char* sin_path,
+    const char* perm_path, int n_heads, int head_dim, int seq,
+    const char* prefix);
+
 #endif // ORION_PATTERNS_H

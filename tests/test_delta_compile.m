@@ -79,7 +79,7 @@ static float* random_weights(int count, unsigned int seed) {
     float *w = (float *)malloc(count * sizeof(float));
     srand(seed);
     for (int i = 0; i < count; i++)
-        w[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.02f;
+        w[i] = ((float)rand() / (float)RAND_MAX - 0.5f) * 0.02f;
     return w;
 }
 
@@ -242,6 +242,8 @@ static void test_consecutive_patches(void) {
 }
 
 int main(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
     @autoreleasepool {
         printf("=== Orion Delta Compile Test (T151) ===\n");
 

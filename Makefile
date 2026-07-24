@@ -69,6 +69,7 @@ COMPILER_C_SRC = \
 	compiler/frontends/classifier_softmax.c \
 	compiler/frontends/stories_train.c \
 	compiler/frontends/voxtream_depth.c \
+	compiler/frontends/voxtream_depth_chain.c \
 	compiler/frontends/lora.c
 
 COMPILER_M_SRC = \
@@ -116,7 +117,9 @@ TEST_NAMES = \
 	test_delta_compile \
 	test_lora \
 	test_iosurface_tensor_checked \
-	test_plan_weight_dict
+	test_plan_weight_dict \
+	test_voxtream_depth_ane \
+	test_voxtream_depth_chain_ane
 
 # Compiler tests (link with compiler objects, not full library)
 COMPILER_TEST_NAMES = \
