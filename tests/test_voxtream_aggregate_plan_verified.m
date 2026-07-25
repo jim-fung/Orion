@@ -220,15 +220,9 @@ int main(void) {
         printf("  compiles consumed: %d\n", compile_delta);
         printf("  plan cached: %s\n", orion_program_plan(prog) ? "yes" : "no");
 
-        // 7. Evaluate parity: compile proved, now prove numerical correctness.
-        // Load the exported reference fixtures and compare ANE output.
-        NSData *input0 = [NSData dataWithContentsOfFile:
-            [export stringByAppendingPathComponent:
-                @"ane_references/packed_hidden.batch0.fp16.bin"]];
-        NSData *ref0 = [NSData dataWithContentsOfFile:
-            [export stringByAppendingPathComponent:
-                @"ane_references/packed_layer_0_output.batch0.fp16.bin"]];
-
+        // 7. Evaluate parity for BOTH CFG fixture branches.
+        // The export's two batches represent the two CFG branches (guidance
+        // and generation). Both must pass the parity gates.
         #define PLAN_DIM 1024
         #define PLAN_SEQ 32
         #define PLAN_LOGICAL 16
@@ -236,11 +230,25 @@ int main(void) {
         static const double PLAN_MAX_ABS_GATE = 0.03;
         static const double PLAN_REL_L2_GATE = 0.005;
 
-        if (!input0 || input0.length != PLAN_TENSOR_BYTES ||
-            !ref0 || ref0.length != PLAN_TENSOR_BYTES) {
-            fprintf(stderr, "FAIL: cannot load reference fixtures\n");
-            orion_release_program(prog);
-            return 1;
+        NSString *batch_names[2] = {@"batch0", @"batch1"};
+        NSData *batch_inputs[2];
+        NSData *batch_refs[2];
+        for (int b = 0; b < 2; b++) {
+            batch_inputs[b] = [NSData dataWithContentsOfFile:
+                [export stringByAppendingPathComponent:
+                    [NSString stringWithFormat:@"ane_references/packed_hidden.%@.fp16.bin",
+                                               batch_names[b]]]];
+            batch_refs[b] = [NSData dataWithContentsOfFile:
+                [export stringByAppendingPathComponent:
+                    [NSString stringWithFormat:@"ane_references/packed_layer_0_output.%@.fp16.bin",
+                                               batch_names[b]]]];
+            if (!batch_inputs[b] || batch_inputs[b].length != PLAN_TENSOR_BYTES ||
+                !batch_refs[b] || batch_refs[b].length != PLAN_TENSOR_BYTES) {
+                fprintf(stderr, "FAIL: cannot load reference fixtures for %s\n",
+                        batch_names[b].UTF8String);
+                orion_release_program(prog);
+                return 1;
+            }
         }
 
         IOSurfaceRef in_surf = orion_tensor_create(PLAN_DIM, PLAN_SEQ);
@@ -254,38 +262,56 @@ int main(void) {
         _Float16 *output = malloc(PLAN_TENSOR_BYTES);
         if (!output) { fprintf(stderr, "FAIL: malloc\n"); return 1; }
 
-        orion_tensor_write(in_surf, input0.bytes, PLAN_TENSOR_BYTES);
-        if (!orion_eval(prog, &in_surf, 1, &out_surf, 1)) {
-            fprintf(stderr, "FAIL: ANE evaluation\n");
-            orion_release_program(prog);
-            free(output);
-            return 1;
-        }
-        orion_tensor_read(out_surf, output, PLAN_TENSOR_BYTES);
+        // Evaluate each CFG branch and compute parity against its reference.
+        bool parity_failed = false;
+        for (int b = 0; b < 2; b++) {
+            orion_tensor_write(in_surf, batch_inputs[b].bytes, PLAN_TENSOR_BYTES);
+            if (!orion_eval(prog, &in_surf, 1, &out_surf, 1)) {
+                fprintf(stderr, "FAIL: ANE evaluation for %s\n",
+                        batch_names[b].UTF8String);
+                orion_release_program(prog);
+                free(output);
+                return 1;
+            }
+            orion_tensor_read(out_surf, output, PLAN_TENSOR_BYTES);
 
-        // Parity on logical tokens [0,16) of 32.
-        const _Float16 *ref = ref0.bytes;
-        double max_abs = 0.0, err_sq = 0.0, ref_sq = 0.0;
-        for (int c = 0; c < PLAN_DIM; c++) {
-            for (int t = 0; t < PLAN_LOGICAL; t++) {
-                size_t idx = (size_t)c * PLAN_SEQ + t;
-                double diff = fabs((double)output[idx] - (double)ref[idx]);
-                if (diff > max_abs) max_abs = diff;
-                double d = (double)output[idx] - (double)ref[idx];
-                err_sq += d * d;
-                ref_sq += (double)ref[idx] * (double)ref[idx];
+            // Retain the ANE output tensor for Torch/MLX/ANE comparison.
+            NSString *dump_path = [export stringByAppendingPathComponent:
+                [NSString stringWithFormat:@"ane_references/ane_plan_verified_layer0_output.%@.fp16.bin",
+                                           batch_names[b]]];
+            {   // Retain the ANE output tensor for Torch/MLX/ANE comparison.
+                NSData *dump = [NSData dataWithBytes:output length:PLAN_TENSOR_BYTES];
+                [dump writeToFile:dump_path atomically:YES];
+            }
+
+            // Parity on logical tokens [0,16) of 32.
+            const _Float16 *ref = batch_refs[b].bytes;
+            double max_abs = 0.0, err_sq = 0.0, ref_sq = 0.0;
+            for (int c = 0; c < PLAN_DIM; c++) {
+                for (int t = 0; t < PLAN_LOGICAL; t++) {
+                    size_t idx = (size_t)c * PLAN_SEQ + t;
+                    double diff = fabs((double)output[idx] - (double)ref[idx]);
+                    if (diff > max_abs) max_abs = diff;
+                    double d = (double)output[idx] - (double)ref[idx];
+                    err_sq += d * d;
+                    ref_sq += (double)ref[idx] * (double)ref[idx];
+                }
+            }
+            double rel_l2 = ref_sq > 0.0 ? sqrt(err_sq / ref_sq) : INFINITY;
+
+            printf("Parity (%s, logical tokens [0,16)):\n", batch_names[b].UTF8String);
+            printf("  max_abs:     %.6f (gate %.3f) %s\n", max_abs, PLAN_MAX_ABS_GATE,
+                   max_abs <= PLAN_MAX_ABS_GATE ? "PASS" : "FAIL");
+            printf("  relative_l2: %.9f (gate %.4f) %s\n", rel_l2, PLAN_REL_L2_GATE,
+                   rel_l2 <= PLAN_REL_L2_GATE ? "PASS" : "FAIL");
+
+            if (max_abs > PLAN_MAX_ABS_GATE || rel_l2 > PLAN_REL_L2_GATE) {
+                parity_failed = true;
             }
         }
-        double rel_l2 = ref_sq > 0.0 ? sqrt(err_sq / ref_sq) : INFINITY;
 
-        printf("Parity (batch0, logical tokens [0,16)):\n");
-        printf("  max_abs:     %.6f (gate %.3f) %s\n", max_abs, PLAN_MAX_ABS_GATE,
-               max_abs <= PLAN_MAX_ABS_GATE ? "PASS" : "FAIL");
-        printf("  relative_l2: %.9f (gate %.4f) %s\n", rel_l2, PLAN_REL_L2_GATE,
-               rel_l2 <= PLAN_REL_L2_GATE ? "PASS" : "FAIL");
-
-        if (max_abs > PLAN_MAX_ABS_GATE || rel_l2 > PLAN_REL_L2_GATE) {
-            fprintf(stderr, "FAIL: plan-verified parity gates not met\n");
+        if (parity_failed) {
+            fprintf(stderr, "FAIL: plan-verified parity gates not met for both CFG branches\n");
             orion_release_program(prog);
             free(output);
             return 1;
@@ -297,7 +323,7 @@ int main(void) {
         double total_ms[PLAN_TIMED_SAMPLES];
         for (int s = -PLAN_WARMUP; s < PLAN_TIMED_SAMPLES; s++) {
             uint64_t t0 = mach_absolute_time();
-            orion_tensor_write(in_surf, input0.bytes, PLAN_TENSOR_BYTES);
+            orion_tensor_write(in_surf, batch_inputs[0].bytes, PLAN_TENSOR_BYTES);
             orion_eval(prog, &in_surf, 1, &out_surf, 1);
             orion_tensor_read(out_surf, output, PLAN_TENSOR_BYTES);
             uint64_t t1 = mach_absolute_time();
