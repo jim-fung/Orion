@@ -2,22 +2,28 @@
 //
 // Bounded channel-count probe for the Orion ANE runtime (ORX-102).
 //
-// This test determines whether the M5 Pro ANE compiler accepts a graph at a
-// given channel count and sequence length. It is the decisive experiment for
-// channel-packed CFG: if 2048 channels @ seq=32 compiles, the latency
-// redesign (halving ANE evaluations from 2 to 1 per layer per codebook step)
-// is viable.
+// Determines whether the M5 Pro ANE compiler accepts a graph at a given channel
+// count and sequence length. This is the decisive experiment for channel-packed
+// CFG: if 2048 channels @ seq=32 compiles, the latency redesign (halving ANE
+// evaluations from 2 to 1 per layer per codebook step) is viable.
 //
-// The test uses build_probe_identity, which is weight-free (no BLOBFILE
-// needed), honoring VOXTREAM_PROBE_CHANNELS and VOXTREAM_PROBE_SEQ env vars.
-// This probes I/O surface / channel-layout support, not conv MAC routing.
+// Two probe kinds, selected by VOXTREAM_PROBE_KIND:
+//   identity (default) — weight-free elementwise add. Probes I/O surface /
+//     channel-layout support only. Already PASSED at 2048ch @ seq=32 (0c729dd).
+//   conv                — a d×d conv1x1 (linear) projection. Probes conv MAC
+//     routing at the channel-packed dimension — the load-bearing op for the
+//     real channel-packed depth layer. Requires a synthetic weight blob.
 //
-// Compile budget: exactly 1 compile on success, 0 on failure (per Orion's
+// Compile budget: exactly 1 compile on success, 0 on rejection (per Orion's
 // success counter; the private compiler's internal limit may count failed
-// attempts separately). The hard guard is compile_delta <= 1.
+// attempts separately). Hard guard: compile_delta <= 1.
 //
 // Usage:
-//   VOXTREAM_PROBE_CHANNELS=2048 VOXTREAM_PROBE_SEQ=32 ./build/test_voxtream_probe_channels
+//   # identity (already passed — do not re-run on the last diagnostic attempt):
+//   VOXTREAM_PROBE_CHANNELS=2048 VOXTREAM_PROBE_SEQ=32 ./build/tests/test_voxtream_probe_channels
+//   # conv (the open ORX-102 question):
+//   VOXTREAM_PROBE_KIND=conv VOXTREAM_PROBE_CHANNELS=2048 VOXTREAM_PROBE_SEQ=32 \
+//       ./build/tests/test_voxtream_probe_channels
 //
 // Skip behavior: returns 0 (inert) when VOXTREAM_PROBE_CHANNELS is unset or
 // the ANE is unavailable, so it does not consume budget under `make test`
@@ -40,7 +46,7 @@ int main(void) {
         const char* channels_env = getenv("VOXTREAM_PROBE_CHANNELS");
         if (!channels_env || !*channels_env) {
             printf("SKIP: set VOXTREAM_PROBE_CHANNELS=<N> [VOXTREAM_PROBE_SEQ=<S>] "
-                   "to run the channel-count probe\n");
+                   "[VOXTREAM_PROBE_KIND=identity|conv] to run the channel-count probe\n");
             return 0;
         }
         const int d = atoi(channels_env);
@@ -51,6 +57,11 @@ int main(void) {
         }
         const char* seq_env = getenv("VOXTREAM_PROBE_SEQ");
         const int s = (seq_env && *seq_env) ? atoi(seq_env) : 32;
+        const char* kind_env = getenv("VOXTREAM_PROBE_KIND");
+        NSString* kind = (kind_env && *kind_env)
+            ? [NSString stringWithUTF8String:kind_env]
+            : @"identity";
+        BOOL conv = [kind isEqualToString:@"conv"];
 
         if (!orion_ane_init()) {
             printf("SKIP: ANE unavailable (private runtime not accessible)\n");
@@ -60,13 +71,13 @@ int main(void) {
         printf("=== Orion channel-count probe (ORX-102) ===\n");
         printf("  channels (d): %d\n", d);
         printf("  seq (s):      %d\n", s);
-        printf("  graph:        identity (weight-free, elementwise add)\n");
+        printf("  kind:         %s\n", conv ? "conv (d×d linear projection)"
+                                            : "identity (weight-free elementwise add)");
 
         // --- build the probe graph ---
-        // build_probe_identity reads VOXTREAM_PROBE_CHANNELS/SEQ from the env
-        // and builds: input hidden {1,d,1,s} -> add(hidden,hidden) -> output.
-        OrionGraph* graph = orion_frontend_voxtream_depth_probe_identity_adapter(
-            0, 0, NULL);
+        OrionGraph* graph = conv
+            ? orion_frontend_voxtream_depth_probe_conv_adapter(0, 0, NULL)
+            : orion_frontend_voxtream_depth_probe_identity_adapter(0, 0, NULL);
         if (!graph) {
             fprintf(stderr, "FAIL: probe graph build returned NULL\n");
             return 1;
@@ -91,11 +102,48 @@ int main(void) {
 
         printf("  MIL size:     %lu bytes\n", (unsigned long)mil.length);
 
+        // --- weight dict: identity is weight-free; conv needs a synthetic
+        // d×d fp16 BLOBFILE so the compiler can embed it. The probe tests
+        // compilation acceptance (MAC routing at d channels), not numerical
+        // correctness, so an arbitrary finite weight is sufficient — BUT the
+        // weight dict must be a valid BLOBFILE (128-byte header + payload),
+        // matching the format orion_compile_mil validates (ane_runtime.m
+        // weight-dict check: bytes[0]=0x01, [4]=0x02, [64:68]=deadbeef,
+        // [68]=0x01, le32([72])=payload_size, le32([80])=128). A raw fp16
+        // blob with no header is rejected as InvalidMILProgram. ---
+        NSDictionary* weight_dict = @{};
+        if (conv) {
+            const size_t n = (size_t)d * (size_t)d;
+            const size_t payload_bytes = n * sizeof(_Float16);
+            NSMutableData* blob = [NSMutableData dataWithLength:128 + payload_bytes];
+            uint8_t* bytes = blob.mutableBytes;
+            // BLOBFILE header (single-tensor, offset=64 → payload at byte 128).
+            bytes[0] = 0x01;
+            bytes[4] = 0x02;
+            bytes[64] = 0xef; bytes[65] = 0xbe; bytes[66] = 0xad; bytes[67] = 0xde;
+            bytes[68] = 0x01;
+            // le32 payload_size at offset 72, le32 data_offset=128 at offset 80.
+            uint32_t p32 = (uint32_t)payload_bytes;
+            bytes[72] = p32 & 0xff; bytes[73] = (p32 >> 8) & 0xff;
+            bytes[74] = (p32 >> 16) & 0xff; bytes[75] = (p32 >> 24) & 0xff;
+            bytes[80] = 128; bytes[81] = 0; bytes[82] = 0; bytes[83] = 0;
+            // Payload: small finite fp16 pattern at byte 128.
+            _Float16* p = (_Float16*)(bytes + 128);
+            for (size_t i = 0; i < n; i++) p[i] = (_Float16)((i % 7) * 0.001 - 0.003);
+            // The conv graph references @model_path/weights/layer0/wq.bin.
+            weight_dict = @{@"@model_path/weights/layer0/wq.bin":
+                            @{@"offset": @0, @"data": blob}};
+        }
+
         // --- bounded compile (budget guard: delta <= 1) ---
+        // Print ABSOLUTE counts before and after, per PRD §14.4 (not just delta).
         const int count_before = orion_compile_count();
+        printf("  compile_count_before: %d\n", count_before);
         OrionProgram* prog = orion_compile_mil(
-            mil.UTF8String, @{}, "probe-channels");
-        const int compile_delta = orion_compile_count() - count_before;
+            mil.UTF8String, weight_dict, "probe-channels");
+        const int count_after = orion_compile_count();
+        const int compile_delta = count_after - count_before;
+        printf("  compile_count_after:  %d\n", count_after);
 
         // Hard budget guard: this probe must never consume more than 1 compile.
         if (compile_delta > 1) {
@@ -109,17 +157,19 @@ int main(void) {
         // --- report ---
         if (prog) {
             printf("\n");
-            printf("PROBE PASS: %d channels @ seq=%d COMPILED (delta=%d)\n",
-                   d, s, compile_delta);
-            printf("  -> Channel-packed CFG at this dimension is COMPILER-VIABLE.\n");
+            printf("PROBE PASS: %s @ %d channels @ seq=%d COMPILED (delta=%d)\n",
+                   conv ? "conv" : "identity", d, s, compile_delta);
+            printf("  -> Channel-packed CFG at this dimension is COMPILER-VIABLE"
+                   " for this op class.\n");
             orion_release_program(prog);
             return 0;
         } else {
             printf("\n");
-            printf("PROBE FAIL: %d channels @ seq=%d REJECTED by ANE compiler "
-                   "(delta=%d)\n", d, s, compile_delta);
-            printf("  -> Channel-packed CFG at this dimension is NOT viable. "
-                   "Fall back to sequence-pack or graph-fusion redesign.\n");
+            printf("PROBE FAIL: %s @ %d channels @ seq=%d REJECTED by ANE compiler "
+                   "(delta=%d)\n",
+                   conv ? "conv" : "identity", d, s, compile_delta);
+            printf("  -> Channel-packed CFG at this dimension is NOT viable for this"
+                   " op class. Fall back to sequence-pack or graph-fusion redesign.\n");
             return 1;
         }
     }

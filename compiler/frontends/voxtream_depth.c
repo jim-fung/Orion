@@ -389,7 +389,15 @@ static OrionGraph* build_probe_identity(void) {
 
 static OrionGraph* build_probe_conv(int layer) {
     if (layer < 0 || layer >= ORION_VOXTREAM_DEPTH_LAYERS) return NULL;
-    const int d = ORION_VOXTREAM_DEPTH_DIM;
+    // ORX-102: honor VOXTREAM_PROBE_CHANNELS so the conv (linear/conv1x1) MAC
+    // routing can be probed at the channel-packed dimension (2048), not just
+    // the default 1024. build_probe_identity already proved the [1,2048,1,32]
+    // I/O surface compiles (commit 0c729dd); this probe tests whether the
+    // compiler routes a d×d conv at that channel count — the load-bearing op
+    // for the real channel-packed depth layer.
+    const char* channels_override = getenv("VOXTREAM_PROBE_CHANNELS");
+    const int d = channels_override ? atoi(channels_override) : ORION_VOXTREAM_DEPTH_DIM;
+    if (d <= 0) return NULL;
     const char* seq_override = getenv("VOXTREAM_PROBE_SEQ");
     const int s = seq_override ? atoi(seq_override) : ORION_VOXTREAM_DEPTH_BUCKET;
     OrionGraph* g = orion_graph_create();
@@ -405,7 +413,10 @@ static OrionGraph* build_probe_conv(int layer) {
 
 static OrionGraph* build_probe_rms(int layer) {
     if (layer < 0 || layer >= ORION_VOXTREAM_DEPTH_LAYERS) return NULL;
-    const int d = ORION_VOXTREAM_DEPTH_DIM;
+    // ORX-102: honor VOXTREAM_PROBE_CHANNELS for RMSNorm-at-channel-count probing.
+    const char* channels_override = getenv("VOXTREAM_PROBE_CHANNELS");
+    const int d = channels_override ? atoi(channels_override) : ORION_VOXTREAM_DEPTH_DIM;
+    if (d <= 0) return NULL;
     const char* seq_override = getenv("VOXTREAM_PROBE_SEQ");
     const int s = seq_override ? atoi(seq_override) : ORION_VOXTREAM_DEPTH_BUCKET;
     OrionGraph* g = orion_graph_create();
@@ -430,14 +441,18 @@ OrionGraph* orion_frontend_voxtream_depth_probe_identity_adapter(
 }
 
 OrionGraph* orion_frontend_voxtream_depth_probe_conv_adapter(
-    int layer, int bucket, const OrionModelConfig* config) {
-    if (!fixed_config(bucket, config)) return NULL;
+    int layer, int bucket __attribute__((unused)),
+    const OrionModelConfig* config __attribute__((unused))) {
+    // Probes read channel/seq from VOXTREAM_PROBE_CHANNELS/SEQ env, not from a
+    // production OrionModelConfig — mirror the identity probe adapter and do
+    // NOT gate on fixed_config (which would reject the NULL config the probe
+    // driver passes). Only the layer range is validated, inside build_probe_conv.
     return build_probe_conv(layer);
 }
 
 OrionGraph* orion_frontend_voxtream_depth_probe_rms_adapter(
-    int layer, int bucket, const OrionModelConfig* config) {
-    if (!fixed_config(bucket, config)) return NULL;
+    int layer, int bucket __attribute__((unused)),
+    const OrionModelConfig* config __attribute__((unused))) {
     return build_probe_rms(layer);
 }
 
