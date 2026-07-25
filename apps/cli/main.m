@@ -6,6 +6,7 @@
 extern int orion_cmd_infer(int argc, const char* argv[]);
 extern int orion_cmd_train(int argc, const char* argv[]);
 extern int orion_cmd_bench(int argc, const char* argv[]);
+extern int orion_cmd_depth_eval(int argc, const char* argv[]);
 
 static void print_usage(void) {
     fprintf(stderr,
@@ -15,6 +16,7 @@ static void print_usage(void) {
         "  orion infer   [options]   Run inference\n"
         "  orion train   [options]   Train a model\n"
         "  orion bench   [options]   Run benchmarks\n"
+        "  orion depth-eval [options]  Drive the VoXtream depth loop on the ANE\n"
         "\n"
         "Run 'orion <command> --help' for command-specific options.\n"
     );
@@ -35,6 +37,8 @@ int main(int argc, const char* argv[]) {
             return orion_cmd_train(argc - 1, argv + 1);
         } else if (strcmp(cmd, "bench") == 0) {
             return orion_cmd_bench(argc - 1, argv + 1);
+        } else if (strcmp(cmd, "depth-eval") == 0) {
+            return orion_cmd_depth_eval(argc - 1, argv + 1);
         } else if (strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0) {
             print_usage();
             return 0;
