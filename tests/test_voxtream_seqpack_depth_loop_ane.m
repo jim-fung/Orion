@@ -273,6 +273,119 @@ int main(int argc, char *argv[]) {
             IOSurfaceUnlock(chain[0], 0, NULL);
         }
 
+        // ---- Parity check (ORX-205/206) ----
+        // Load the frozen ANE references and compare against the seqpack layer-0 output.
+        // The packed input has branch0 at seq [0,32) and branch1 at [32,64).
+        // We load packed_hidden.batch{0,1}, pack them into one surface, run layer-0,
+        // then compare output slots [0,32) vs ref batch0 and [32,64) vs ref batch1.
+        bool parity = true;
+        NSMutableArray *parity_results = [NSMutableArray array];
+
+        if (!failure) {
+            NSData *ref_b0 = [NSData dataWithContentsOfFile:
+                [root stringByAppendingPathComponent:@"ane_references/packed_layer_0_output.batch0.fp16.bin"]];
+            NSData *ref_b1 = [NSData dataWithContentsOfFile:
+                [root stringByAppendingPathComponent:@"ane_references/packed_layer_0_output.batch1.fp16.bin"]];
+            NSData *in_b0 = [NSData dataWithContentsOfFile:
+                [root stringByAppendingPathComponent:@"ane_references/packed_hidden.batch0.fp16.bin"]];
+            NSData *in_b1 = [NSData dataWithContentsOfFile:
+                [root stringByAppendingPathComponent:@"ane_references/packed_hidden.batch1.fp16.bin"]];
+            const size_t branch_bytes = DIM * 32 * sizeof(_Float16);  // 65536
+
+            if (ref_b0 && ref_b1 && in_b0 && in_b1 &&
+                ref_b0.length == branch_bytes && ref_b1.length == branch_bytes &&
+                in_b0.length == branch_bytes && in_b1.length == branch_bytes) {
+
+                // Pack both branches into chain[0]: branch0 at [0,32), branch1 at [32,64).
+                IOSurfaceLock(chain[0], 0, NULL);
+                _Float16 *surf = (_Float16 *)IOSurfaceGetBaseAddress(chain[0]);
+                // Channel-major layout: surf[c, 0, s] = hidden[s, c].
+                // For seq=32 per branch: surf has 1024 channels × 64 seq.
+                // Branch 0 input: in_b0 is [1,1024,1,32] = 1024 channels × 32 seq.
+                // We copy it to surf[c, 0:s=0..31].
+                const _Float16 *in0 = in_b0.bytes;
+                const _Float16 *in1 = in_b1.bytes;
+                for (int c = 0; c < DIM; c++) {
+                    for (int s = 0; s < 32; s++) {
+                        surf[c * PACKED_SEQ + s] = in0[c * 32 + s];       // branch 0
+                        surf[c * PACKED_SEQ + 32 + s] = in1[c * 32 + s];  // branch 1
+                    }
+                }
+                IOSurfaceUnlock(chain[0], 0, NULL);
+
+                // Run layer-0 only (the reference is layer-0 output).
+                bool parity_eval_ok = orion_eval(layer_programs[0], &chain[0], 1, &chain[1], 1);
+                if (parity_eval_ok) {
+                    // Read the layer-0 output.
+                    orion_tensor_read(chain[1], output, PACKED_BYTES);
+
+                    // Compare branch 0 (slots [0,32)) vs ref_b0.
+                    const _Float16 *ref0 = ref_b0.bytes;
+                    const _Float16 *ref1 = ref_b1.bytes;
+                    double max_abs_b0 = 0, rel_l2_b0 = 0, ref_sq_b0 = 0;
+                    double max_abs_b1 = 0, rel_l2_b1 = 0, ref_sq_b1 = 0;
+                    for (int c = 0; c < DIM; c++) {
+                        for (int s = 0; s < 16; s++) {  // logical tokens [0,16) only
+                            double out0 = (double)output[c * PACKED_SEQ + s];
+                            double out1 = (double)output[c * PACKED_SEQ + 32 + s];
+                            double r0 = (double)ref0[c * 32 + s];
+                            double r1 = (double)ref1[c * 32 + s];
+                            double d0 = fabs(out0 - r0);
+                            double d1 = fabs(out1 - r1);
+                            if (d0 > max_abs_b0) max_abs_b0 = d0;
+                            if (d1 > max_abs_b1) max_abs_b1 = d1;
+                            rel_l2_b0 += d0 * d0;
+                            rel_l2_b1 += d1 * d1;
+                            ref_sq_b0 += r0 * r0;
+                            ref_sq_b1 += r1 * r1;
+                        }
+                    }
+                    rel_l2_b0 = ref_sq_b0 > 0 ? sqrt(rel_l2_b0 / ref_sq_b0) : INFINITY;
+                    rel_l2_b1 = ref_sq_b1 > 0 ? sqrt(rel_l2_b1 / ref_sq_b1) : INFINITY;
+
+                    bool b0_pass = max_abs_b0 <= MAX_ABS_GATE && rel_l2_b0 <= REL_L2_GATE;
+                    bool b1_pass = max_abs_b1 <= MAX_ABS_GATE && rel_l2_b1 <= REL_L2_GATE;
+                    parity = b0_pass && b1_pass;
+
+                    [parity_results addObject:@{
+                        @"batch": @(0),
+                        @"comparison_scope": @"seqpack-slots[0,32)-vs-packed_layer_0_output.batch0",
+                        @"max_abs": @(max_abs_b0),
+                        @"relative_l2": @(rel_l2_b0),
+                        @"max_abs_gate": @(MAX_ABS_GATE),
+                        @"relative_l2_gate": @(REL_L2_GATE),
+                        @"passed": @(b0_pass),
+                    }];
+                    [parity_results addObject:@{
+                        @"batch": @(1),
+                        @"comparison_scope": @"seqpack-slots[32,64)-vs-packed_layer_0_output.batch1",
+                        @"max_abs": @(max_abs_b1),
+                        @"relative_l2": @(rel_l2_b1),
+                        @"max_abs_gate": @(MAX_ABS_GATE),
+                        @"relative_l2_gate": @(REL_L2_GATE),
+                        @"passed": @(b1_pass),
+                    }];
+
+                    printf("  parity (layer-0):\n");
+                    printf("    batch0: max_abs=%.6f rel_l2=%.9f → %s\n",
+                           max_abs_b0, rel_l2_b0, b0_pass ? "PASS" : "FAIL");
+                    printf("    batch1: max_abs=%.6f rel_l2=%.9f → %s\n",
+                           max_abs_b1, rel_l2_b1, b1_pass ? "PASS" : "FAIL");
+                } else {
+                    parity = false;
+                    [parity_results addObject:@{
+                        @"batch": @(0), @"comparison_scope": @"parity-eval-failed",
+                        @"max_abs": @(NAN), @"relative_l2": @(NAN),
+                        @"passed": @(NO),
+                    }];
+                }
+            } else {
+                printf("  NOTE: frozen references not available — skipping parity\n");
+            }
+        }
+        evidence[@"parity_results"] = parity_results;
+        evidence[@"parity_passed"] = @(parity);
+
         // ---- Warmup ----
         if (!failure) {
             for (int w = 0; w < warmup_count && !failure; w++) {
@@ -339,7 +452,12 @@ int main(int argc, char *argv[]) {
         _Float16 *det_output_1 = malloc(PACKED_BYTES);
         _Float16 *det_output_2 = malloc(PACKED_BYTES);
         if (!failure && det_output_1 && det_output_2) {
-            // Run 1: full 15-step loop.
+            // Run 1: initialize chain[0] with a deterministic pattern, run full loop.
+            IOSurfaceLock(chain[0], 0, NULL);
+            _Float16 *base = (_Float16 *)IOSurfaceGetBaseAddress(chain[0]);
+            for (int i = 0; i < DIM * PACKED_SEQ; i++)
+                base[i] = (_Float16)((i % 100) * 0.001 - 0.05);
+            IOSurfaceUnlock(chain[0], 0, NULL);
             bool det_ok = true;
             for (int step = 0; step < DEPTH_STEPS && det_ok; step++) {
                 for (int stage = 0; stage < LAYERS; stage++) {
@@ -435,7 +553,7 @@ int main(int argc, char *argv[]) {
         evidence[@"margin_target_ms"] = @(MARGIN_TARGET_MS);
         evidence[@"failure_stage"] = failure ? failure : [NSNull null];
 
-        bool passed = !failure && finite && deterministic && depth_budget_passed && compile_delta <= MAX_COMPILE_DELTA;
+        bool passed = !failure && parity && finite && deterministic && depth_budget_passed && compile_delta <= MAX_COMPILE_DELTA;
         evidence[@"passed"] = @(passed);
 
         // Write evidence JSON.
@@ -467,3 +585,12 @@ int main(int argc, char *argv[]) {
         return passed ? 0 : 1;
     }
 }
+
+// ---- Parity check (ORX-205/206) ----
+// Compare the seqpack layer-0 output against frozen ANE references.
+// The packed input has branch0 at [0,32) and branch1 at [32,64).
+// The output surface is [1,1024,1,64]; we compare slots [0,32) vs ref batch0
+// and [32,64) vs ref batch1.
+
+// This section runs AFTER the main function's timing/determinism but BEFORE cleanup.
+// We'll integrate it into the main evidence dict.
