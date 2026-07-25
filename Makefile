@@ -123,7 +123,8 @@ TEST_NAMES = \
 	test_voxtream_multichunk_blob_ane \
 	test_voxtream_aggregate_layer_ane \
 	test_voxtream_aggregate_plan_verified \
-	test_voxtream_g008_failure_injection
+	test_voxtream_g008_failure_injection \
+	test_voxtream_depth_loop_ane
 
 # Compiler tests (link with compiler objects, not full library)
 COMPILER_TEST_NAMES = \
