@@ -971,6 +971,11 @@ int main(void) {
         double readback_p99 = percentile(readback_samples, sample_count, 0.99);
         const bool complete_depth_measurement = n_layers == 4 &&
             getenv("VOXTREAM_DEPTH_CHAIN_FINAL_NORM") != NULL;
+        // Stage-summed bound: stage_sum_p99 is the sum of all 4 layer stages,
+        // so this is more complete than a one-layer projection, but it is still
+        // a stage-summed NON-CONTIGUOUS bound, NOT a real dependent loop
+        // measurement. The real dependent 15-step × 2-branch depth loop
+        // measured p99 = 70.8 ms on M5 Pro.
         double projected_separate_cfg_stage_sum_p99_ms = complete_depth_measurement
             ? stage_sum_p99 * 15.0 * 2.0 : NAN;
         const double depth_budget_ms = 60.0;
@@ -998,7 +1003,7 @@ int main(void) {
                stage_sum_p50, stage_sum_p95, stage_sum_p99, prepare_p99,
                device_p99, readback_p99);
         if (complete_depth_measurement) {
-            printf(" projected_15step_separate_cfg_stage_sum_p99_ms=%.2f",
+            printf(" stage_summed_bound_15step_separate_cfg_p99_ms=%.2f",
                    projected_separate_cfg_stage_sum_p99_ms);
         }
         printf("\n");
@@ -1051,7 +1056,7 @@ int main(void) {
                 @"prepare_stage_sum_p99_ms": @(prepare_p99),
                 @"device_eval_stage_sum_p99_ms": @(device_p99),
                 @"readback_stage_sum_p99_ms": @(readback_p99),
-                @"projected_15step_separate_cfg_stage_sum_p99_ms":
+                @"stage_summed_bound_15step_separate_cfg_p99_ms":
                     complete_depth_measurement
                         ? @(projected_separate_cfg_stage_sum_p99_ms)
                         : [NSNull null],

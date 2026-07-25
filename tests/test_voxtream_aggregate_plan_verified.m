@@ -343,13 +343,22 @@ int main(void) {
                 if (sorted[i] > sorted[j]) { double tmp = sorted[i]; sorted[i] = sorted[j]; sorted[j] = tmp; }
         double p50 = sorted[PLAN_TIMED_SAMPLES / 2];
         double p99 = sorted[(int)(0.99 * (PLAN_TIMED_SAMPLES - 1))];
-        double projected_depth = p99 * 15.0 * 2.0;  // 15 steps × 2 CFG branches
+        // One-layer-equivalent projection: this test measures only layer 0.
+        // Each codebook step actually executes FOUR transformer layers, so
+        // scaling a single layer by 15 steps × 2 CFG branches undercounts the
+        // real loop. The real dependent 15-step × 2-branch depth loop
+        // (tests/test_voxtream_depth_loop_ane.m) measured p99 = 70.8 ms on
+        // M5 Pro. Reported here as INFORMATIONAL, not a complete-loop
+        // projection, and does NOT gate the G009 qualification.
+        double one_layer_equivalent_projection_ms = p99 * 15.0 * 2.0;
 
         printf("Timing (%d samples, contiguous write→eval→readback):\n", PLAN_TIMED_SAMPLES);
         printf("  p50:              %.3f ms\n", p50);
         printf("  p99:              %.3f ms\n", p99);
-        printf("  projected depth:  %.1f ms (budget 60 ms) %s\n", projected_depth,
-               projected_depth < 60.0 ? "PASS" : "FAIL");
+        printf("  one-layer-equiv projection: %.1f ms "
+               "(INFO one-layer-equivalent, not a complete-loop projection; "
+               "real 4-layer/step loop measured 70.8 ms p99)\n",
+               one_layer_equivalent_projection_ms);
 
         orion_release_program(prog);
         free(output);

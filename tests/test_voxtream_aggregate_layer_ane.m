@@ -757,6 +757,12 @@ int main(void) {
                     if (stage < 4) layer_p99_sum += stage_p99;
                 }
                 const double mean_layer_p99 = layer_p99_sum / 4.0;
+                // Mean-of-4-layers projection: closer to a complete loop than
+                // the one-layer-equivalent figure below, but it is still a
+                // non-contiguous mean-layer projection, NOT a real dependent
+                // loop measurement. It is an OPTIMISTIC LOWER BOUND: the real
+                // dependent 15-step × 2-branch depth loop measured p99 = 70.8 ms
+                // on M5 Pro. Kept as a diagnostic budget gate here.
                 d_projection = mean_layer_p99 * PROJECTION_DEPTH_STEPS *
                                PROJECTION_CFG_BRANCHES;
                 depth_latency = d_projection < DEPTH_BUDGET_MS;
@@ -769,7 +775,7 @@ int main(void) {
                     @"stage_p99": stage_stats,
                     @"p50_ms": @(d_p50), @"p95_ms": @(d_p95), @"p99_ms": @(d_p99),
                     @"mean_layer_p99_ms": @(mean_layer_p99),
-                    @"projected_separate_cfg_depth_p99_ms": @(d_projection),
+                    @"mean_layer_projection_p99_ms": @(d_projection),
                     @"depth_budget_ms": @(DEPTH_BUDGET_MS),
                 };
             }
@@ -803,7 +809,7 @@ int main(void) {
         evidence[@"timed_samples"] = @(timed ? sample_count : 0);
 
         bool latency_passed = false;
-        double p99 = NAN, projected = NAN;
+        double p99 = NAN, one_layer_projection_ms = NAN;
         if (timed && sample_count > 0) {
             double sorted[MAX_SAMPLES];
             memcpy(sorted, total_samples, sizeof(double) * (size_t)sample_count);
@@ -811,11 +817,16 @@ int main(void) {
             double p50 = percentile_sorted(sorted, sample_count, 0.50);
             double p95 = percentile_sorted(sorted, sample_count, 0.95);
             p99 = percentile_sorted(sorted, sample_count, 0.99);
-            projected = p99 * PROJECTION_DEPTH_STEPS * PROJECTION_CFG_BRANCHES;
-            // Binding gate (user ruling 2026-07-25): the 60 ms separate-CFG
-            // depth-budget projection. The 0.5 ms per-layer p99 target is
-            // recorded as informational; measured p99 was 0.51-0.53 ms.
-            latency_passed = projected < DEPTH_BUDGET_MS;
+            // One-layer-equivalent projection: p99 here is the single
+            // aggregate-layer p99, so scaling by 15 steps × 2 CFG branches
+            // undercounts the real loop (each codebook step runs FOUR
+            // transformer layers). This is INFORMATIONAL and an optimistic
+            // lower bound; the real dependent depth loop measured p99 = 70.8 ms
+            // on M5 Pro. The 0.5 ms per-layer p99 target is also informational;
+            // measured p99 was 0.51-0.53 ms.
+            one_layer_projection_ms = p99 * PROJECTION_DEPTH_STEPS *
+                                      PROJECTION_CFG_BRANCHES;
+            latency_passed = one_layer_projection_ms < DEPTH_BUDGET_MS;
             evidence[@"timing"] = @{
                 @"timing_method": @"contiguous-layer-invocation",
                 @"surface_allocation": @"outside-timed-region",
@@ -831,8 +842,8 @@ int main(void) {
                 @"layer_p99_target_ms": @(LAYER_P99_GATE_MS),
                 @"layer_p99_target_met": @(p99 <= LAYER_P99_GATE_MS),
                 @"latency_gate_basis":
-                    @"separate-cfg-depth-projection-under-60ms-budget-binding",
-                @"projected_separate_cfg_depth_p99_ms": @(projected),
+                    @"one-layer-equivalent-informational-projection",
+                @"one_layer_equivalent_projection_p99_ms": @(one_layer_projection_ms),
                 @"depth_budget_ms": @(DEPTH_BUDGET_MS),
             };
         }
@@ -864,8 +875,9 @@ int main(void) {
         }
         if (timed) {
             printf("  contiguous layer p99=%.4f ms (informational target %.4f ms), "
-                   "projected depth p99=%.3f ms (budget %.0f ms)\n",
-                   p99, LAYER_P99_GATE_MS, projected, DEPTH_BUDGET_MS);
+                   "one-layer-equiv projection=%.3f ms (INFO one-layer-equivalent; "
+                   "real loop 70.8 ms p99; budget %.0f ms)\n",
+                   p99, LAYER_P99_GATE_MS, one_layer_projection_ms, DEPTH_BUDGET_MS);
         }
         if (depth_evidence) {
             NSDictionary *dt = depth_evidence[@"timing"];
@@ -875,9 +887,10 @@ int main(void) {
                    [depth_evidence[@"deterministic"] boolValue] ? "yes" : "no");
             if (dt) {
                 printf("  contiguous 4-layer+final-norm p99=%.4f ms, "
-                       "mean-layer projection=%.3f ms (budget %.0f ms)\n",
+                       "mean-layer projection=%.3f ms (optimistic lower bound; "
+                       "real loop 70.8 ms p99; budget %.0f ms)\n",
                        [dt[@"p99_ms"] doubleValue],
-                       [dt[@"projected_separate_cfg_depth_p99_ms"] doubleValue],
+                       [dt[@"mean_layer_projection_p99_ms"] doubleValue],
                        [dt[@"depth_budget_ms"] doubleValue]);
             }
             if (depth_evidence[@"failure_stage"] != [NSNull null])
