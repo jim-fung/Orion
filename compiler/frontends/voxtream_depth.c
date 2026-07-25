@@ -456,6 +456,101 @@ OrionGraph* orion_frontend_voxtream_depth_probe_rms_adapter(
     return build_probe_rms(layer);
 }
 
+// ORX-003: full channel-packed depth-layer graph for compile-acceptance probing.
+// Mirrors the production orion_frontend_voxtream_depth_layer but doubles the
+// channel axis (d -> 2d = 2048) so both CFG branches run in ONE ANE eval.
+// Weights are block-diagonal: [branch0_weights 0; 0 branch1_weights] so the
+// two 1024-wide branches cannot mix. n_heads 8->16, n_kv_heads 2->4,
+// head_dim 128 unchanged (per ORX-102 recall). This is a COMPILE-ACCEPTANCE
+// probe: it uses synthetic block-diagonal weight blobs (diagonal = the layer's
+// real production weight, off-diagonal = zero), not production parity. The
+// probe validates that the full graph (RMSNorm -> Q/K/V -> RoPE -> GQA -> Wo ->
+// MLP, all at 2048 channels) compiles and produces finite output.
+static OrionGraph* build_channel_packed_depth_layer(int layer) {
+    if (layer < 0 || layer >= ORION_VOXTREAM_DEPTH_LAYERS) return NULL;
+    const char* channels_override = getenv("VOXTREAM_PROBE_CHANNELS");
+    const int d_packed = channels_override
+        ? atoi(channels_override)
+        : (2 * ORION_VOXTREAM_DEPTH_DIM);  // default 2048
+    if (d_packed <= 0) return NULL;
+    const int d = ORION_VOXTREAM_DEPTH_DIM;       // per-branch width (1024)
+    if (d_packed != 2 * d) return NULL;            // channel-pack = exactly 2 branches
+    const int h = 2 * ORION_VOXTREAM_DEPTH_HIDDEN_DIM;  // MLP hidden, doubled
+    const int s = ORION_VOXTREAM_DEPTH_ANE_SEQ;
+    const int n_heads = 2 * ORION_VOXTREAM_DEPTH_HEADS;       // 16
+    const int n_kv_heads = 2 * ORION_VOXTREAM_DEPTH_KV_HEADS; // 4
+    const int head_dim = ORION_VOXTREAM_DEPTH_HEAD_DIM;       // 128
+    const int kv = n_kv_heads * head_dim;                      // 512
+
+    OrionGraph* g = orion_graph_create();
+    if (!g) return NULL;
+
+    int hidden_shape[4] = {1, d_packed, 1, s};
+    int scale_shape[4] = {1, d_packed, 1, 1};
+    int hidden = orion_gb_input(g, "hidden", ORION_DTYPE_FP16, hidden_shape);
+    char path[256];
+
+    // RMSNorm1 (per-channel scale, doubled).
+    snprintf(path, sizeof(path), "@model_path/weights/layer%d/rms1.bin", layer);
+    int rms1_weight = orion_gb_const_weight(g, "rms1_weight", ORION_DTYPE_FP16,
+                                             scale_shape, path, 64);
+    int normalized = orion_gb_rmsnorm(g, hidden, rms1_weight,
+                                      ORION_VOXTREAM_DEPTH_RMS_EPS,
+                                      "rms1", d_packed, s);
+
+    // Q/K/V projections at the packed dimension (block-diagonal weights).
+    snprintf(path, sizeof(path), "@model_path/weights/layer%d/wq.bin", layer);
+    int q = orion_gb_linear(g, normalized, "q", d_packed, d_packed, s, path, NULL);
+    snprintf(path, sizeof(path), "@model_path/weights/layer%d/wk.bin", layer);
+    int k = orion_gb_linear(g, normalized, "k", d_packed, kv, s, path, NULL);
+    snprintf(path, sizeof(path), "@model_path/weights/layer%d/wv.bin", layer);
+    int v = orion_gb_linear(g, normalized, "v", d_packed, kv, s, path, NULL);
+
+    // RoPE (duplicated tables per branch — position reset, per ORX-103 proof).
+    int q_rope = orion_pattern_rope_interleaved_elementwise(
+        g, q, "@model_path/constants/rope_q_cos.bin",
+        "@model_path/constants/rope_q_sin.bin",
+        "@model_path/constants/rope_q_perm.bin",
+        n_heads, head_dim, s, "q_rope");
+    int k_rope = orion_pattern_rope_interleaved_elementwise(
+        g, k, "@model_path/constants/rope_k_cos.bin",
+        "@model_path/constants/rope_k_sin.bin",
+        "@model_path/constants/rope_k_perm.bin",
+        n_kv_heads, head_dim, s, "k_rope");
+
+    // GQA attention with the packed head counts + block-diagonal causal mask.
+    int attention = orion_pattern_gqa_attention(
+        g, q_rope, k_rope, v, "@model_path/constants/causal_mask.bin",
+        n_heads, n_kv_heads, head_dim, s, "attention");
+
+    snprintf(path, sizeof(path), "@model_path/weights/layer%d/wo.bin", layer);
+    int projected = orion_gb_linear(g, attention, "wo", d_packed, d_packed, s, path, NULL);
+    int attention_residual = orion_pattern_residual(g, hidden, projected,
+                                                     "attention_residual");
+
+    snprintf(path, sizeof(path), "@model_path/weights/layer%d/rms2.bin", layer);
+    int rms2_weight = orion_gb_const_weight(g, "rms2_weight", ORION_DTYPE_FP16,
+                                             scale_shape, path, 64);
+    int mlp_input = orion_gb_rmsnorm(g, attention_residual, rms2_weight,
+                                     ORION_VOXTREAM_DEPTH_RMS_EPS,
+                                     "rms2", d_packed, s);
+
+    char w1[256], w2[256], w3[256];
+    snprintf(w1, sizeof(w1), "@model_path/weights/layer%d/w1.bin", layer);
+    snprintf(w2, sizeof(w2), "@model_path/weights/layer%d/w2.bin", layer);
+    snprintf(w3, sizeof(w3), "@model_path/weights/layer%d/w3.bin", layer);
+    int mlp = orion_pattern_swiglu_ffn(g, mlp_input, "mlp", d_packed, h, s, w1, w3, w2);
+    int output = orion_pattern_residual(g, attention_residual, mlp, "hidden_out");
+    orion_gb_output(g, output, "hidden_out");
+    return g;
+}
+
+OrionGraph* orion_frontend_voxtream_depth_probe_depth_layer_adapter(
+    int layer, int bucket __attribute__((unused)),
+    const OrionModelConfig* config __attribute__((unused))) {
+    return build_channel_packed_depth_layer(layer);
+}
+
 static OrionGraph* build_qperm(int layer) {
     if (layer < 0 || layer >= ORION_VOXTREAM_DEPTH_LAYERS) return NULL;
     const int d = ORION_VOXTREAM_DEPTH_DIM;

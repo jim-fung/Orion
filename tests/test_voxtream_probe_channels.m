@@ -68,16 +68,28 @@ int main(void) {
             return 0;
         }
 
-        printf("=== Orion channel-count probe (ORX-102) ===\n");
+        printf("=== Orion channel-count probe (ORX-102/003) ===\n");
         printf("  channels (d): %d\n", d);
         printf("  seq (s):      %d\n", s);
-        printf("  kind:         %s\n", conv ? "conv (d×d linear projection)"
-                                            : "identity (weight-free elementwise add)");
+        NSString* kind_label;
+        if ([kind isEqualToString:@"conv"]) {
+            kind_label = @"conv (d×d linear projection)";
+        } else if ([kind isEqualToString:@"depth_layer"]) {
+            kind_label = @"depth_layer (full channel-packed layer graph)";
+        } else {
+            kind_label = @"identity (weight-free elementwise add)";
+        }
+        printf("  kind:         %s\n", kind_label.UTF8String);
 
         // --- build the probe graph ---
-        OrionGraph* graph = conv
-            ? orion_frontend_voxtream_depth_probe_conv_adapter(0, 0, NULL)
-            : orion_frontend_voxtream_depth_probe_identity_adapter(0, 0, NULL);
+        OrionGraph* graph;
+        if ([kind isEqualToString:@"conv"]) {
+            graph = orion_frontend_voxtream_depth_probe_conv_adapter(0, 0, NULL);
+        } else if ([kind isEqualToString:@"depth_layer"]) {
+            graph = orion_frontend_voxtream_depth_probe_depth_layer_adapter(0, 0, NULL);
+        } else {
+            graph = orion_frontend_voxtream_depth_probe_identity_adapter(0, 0, NULL);
+        }
         if (!graph) {
             fprintf(stderr, "FAIL: probe graph build returned NULL\n");
             return 1;
@@ -102,38 +114,64 @@ int main(void) {
 
         printf("  MIL size:     %lu bytes\n", (unsigned long)mil.length);
 
-        // --- weight dict: identity is weight-free; conv needs a synthetic
-        // d×d fp16 BLOBFILE so the compiler can embed it. The probe tests
-        // compilation acceptance (MAC routing at d channels), not numerical
-        // correctness, so an arbitrary finite weight is sufficient — BUT the
-        // weight dict must be a valid BLOBFILE (128-byte header + payload),
-        // matching the format orion_compile_mil validates (ane_runtime.m
-        // weight-dict check: bytes[0]=0x01, [4]=0x02, [64:68]=deadbeef,
-        // [68]=0x01, le32([72])=payload_size, le32([80])=128). A raw fp16
-        // blob with no header is rejected as InvalidMILProgram. ---
-        NSDictionary* weight_dict = @{};
-        if (conv) {
-            const size_t n = (size_t)d * (size_t)d;
+        // --- weight dict builder: a valid single-tensor BLOBFILE for an
+        // arbitrary rows×cols fp16 weight. Header format per ane_runtime.m:
+        // bytes[0]=0x01, [4]=0x02, [64:68]=deadbeef, [68]=0x01,
+        // le32([72])=payload_size, le32([80])=128. Payload at byte 128. ---
+        NSData* (^make_blob)(int, int) = ^NSData*(int rows, int cols) {
+            const size_t n = (size_t)rows * (size_t)cols;
             const size_t payload_bytes = n * sizeof(_Float16);
             NSMutableData* blob = [NSMutableData dataWithLength:128 + payload_bytes];
             uint8_t* bytes = blob.mutableBytes;
-            // BLOBFILE header (single-tensor, offset=64 → payload at byte 128).
-            bytes[0] = 0x01;
-            bytes[4] = 0x02;
+            bytes[0] = 0x01; bytes[4] = 0x02;
             bytes[64] = 0xef; bytes[65] = 0xbe; bytes[66] = 0xad; bytes[67] = 0xde;
             bytes[68] = 0x01;
-            // le32 payload_size at offset 72, le32 data_offset=128 at offset 80.
             uint32_t p32 = (uint32_t)payload_bytes;
             bytes[72] = p32 & 0xff; bytes[73] = (p32 >> 8) & 0xff;
             bytes[74] = (p32 >> 16) & 0xff; bytes[75] = (p32 >> 24) & 0xff;
             bytes[80] = 128; bytes[81] = 0; bytes[82] = 0; bytes[83] = 0;
-            // Payload: small finite fp16 pattern at byte 128.
             _Float16* p = (_Float16*)(bytes + 128);
             for (size_t i = 0; i < n; i++) p[i] = (_Float16)((i % 7) * 0.001 - 0.003);
-            // The conv graph references @model_path/weights/layer0/wq.bin.
-            weight_dict = @{@"@model_path/weights/layer0/wq.bin":
-                            @{@"offset": @0, @"data": blob}};
+            return blob;
+        };
+        NSDictionary* (^entry)(NSData*) = ^NSDictionary*(NSData* blob) {
+            return @{@"offset": @0, @"data": blob};
+        };
+
+        // --- assemble the weight dict per probe kind ---
+        NSMutableDictionary* wdict = [NSMutableDictionary dictionary];
+        if ([kind isEqualToString:@"conv"]) {
+            wdict[@"@model_path/weights/layer0/wq.bin"] = entry(make_blob(d, d));
+        } else if ([kind isEqualToString:@"depth_layer"]) {
+            // Channel-packed dims: d_packed = 2*d = 2048 (set by the graph
+            // builder from VOXTREAM_PROBE_CHANNELS). Per-branch head geometry
+            // doubles: n_heads 8->16, n_kv_heads 2->4, head_dim 128.
+            const int D = d;  // d from VOXTREAM_PROBE_CHANNELS = 2048
+            const int kv = 4 * 128;  // n_kv_heads(4) * head_dim(128) = 512
+            const int H = 2 * 8192;  // doubled hidden_dim = 16384
+            // Weights: rms1(D), wq(D,D), wk(D,kv), wv(D,kv), wo(D,D),
+            //          rms2(D), w1(H,D), w2(D,H), w3(H,D).
+            wdict[@"@model_path/weights/layer0/rms1.bin"] = entry(make_blob(1, D));
+            wdict[@"@model_path/weights/layer0/wq.bin"]   = entry(make_blob(D, D));
+            wdict[@"@model_path/weights/layer0/wk.bin"]   = entry(make_blob(kv, D));
+            wdict[@"@model_path/weights/layer0/wv.bin"]   = entry(make_blob(kv, D));
+            wdict[@"@model_path/weights/layer0/wo.bin"]   = entry(make_blob(D, D));
+            wdict[@"@model_path/weights/layer0/rms2.bin"] = entry(make_blob(1, D));
+            wdict[@"@model_path/weights/layer0/w1.bin"]   = entry(make_blob(H, D));
+            wdict[@"@model_path/weights/layer0/w2.bin"]   = entry(make_blob(D, H));
+            wdict[@"@model_path/weights/layer0/w3.bin"]   = entry(make_blob(H, D));
+            // Constants: rope tables + causal mask. Shapes match blobs.py.
+            // rope_q: [1, D, 1, s], rope_k: [1, kv, 1, s], perm: [W, W, 1, 1],
+            // causal_mask: [1, 1, s, s].
+            wdict[@"@model_path/constants/rope_q_cos.bin"]  = entry(make_blob(D, s));
+            wdict[@"@model_path/constants/rope_q_sin.bin"]  = entry(make_blob(D, s));
+            wdict[@"@model_path/constants/rope_q_perm.bin"] = entry(make_blob(D, D));
+            wdict[@"@model_path/constants/rope_k_cos.bin"]  = entry(make_blob(kv, s));
+            wdict[@"@model_path/constants/rope_k_sin.bin"]  = entry(make_blob(kv, s));
+            wdict[@"@model_path/constants/rope_k_perm.bin"] = entry(make_blob(kv, kv));
+            wdict[@"@model_path/constants/causal_mask.bin"] = entry(make_blob(s, s));
         }
+        NSDictionary* weight_dict = wdict;
 
         // --- bounded compile (budget guard: delta <= 1) ---
         // Print ABSOLUTE counts before and after, per PRD §14.4 (not just delta).
