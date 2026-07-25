@@ -334,6 +334,63 @@ int main(int argc, char *argv[]) {
             }
         }
 
+        // ---- Determinism check: run the full loop twice, compare bit-identical ----
+        bool deterministic = false;
+        _Float16 *det_output_1 = malloc(PACKED_BYTES);
+        _Float16 *det_output_2 = malloc(PACKED_BYTES);
+        if (!failure && det_output_1 && det_output_2) {
+            // Run 1: full 15-step loop.
+            bool det_ok = true;
+            for (int step = 0; step < DEPTH_STEPS && det_ok; step++) {
+                for (int stage = 0; stage < LAYERS; stage++) {
+                    if (!orion_eval(layer_programs[stage], &chain[stage], 1,
+                                    &chain[stage + 1], 1)) { det_ok = false; break; }
+                }
+                if (det_ok && final_norm_program) {
+                    if (!orion_eval(final_norm_program, &chain[LAYERS], 1,
+                                    &chain[LAYERS + 1], 1)) det_ok = false;
+                }
+            }
+            if (det_ok) {
+                IOSurfaceRef det_surf = final_norm_program ? chain[LAYERS + 1] : chain[LAYERS];
+                orion_tensor_read(det_surf, det_output_1, PACKED_BYTES);
+
+                // Run 2: same input, same programs.
+                IOSurfaceLock(chain[0], 0, NULL);
+                _Float16 *base = (_Float16 *)IOSurfaceGetBaseAddress(chain[0]);
+                for (int i = 0; i < DIM * PACKED_SEQ; i++)
+                    base[i] = (_Float16)((i % 100) * 0.001 - 0.05);
+                IOSurfaceUnlock(chain[0], 0, NULL);
+
+                for (int step = 0; step < DEPTH_STEPS && det_ok; step++) {
+                    for (int stage = 0; stage < LAYERS; stage++) {
+                        if (!orion_eval(layer_programs[stage], &chain[stage], 1,
+                                        &chain[stage + 1], 1)) { det_ok = false; break; }
+                    }
+                    if (det_ok && final_norm_program) {
+                        if (!orion_eval(final_norm_program, &chain[LAYERS], 1,
+                                        &chain[LAYERS + 1], 1)) det_ok = false;
+                    }
+                }
+                if (det_ok) {
+                    orion_tensor_read(det_surf, det_output_2, PACKED_BYTES);
+                    // Compare bit-identical.
+                    int mismatches = 0;
+                    for (int i = 0; i < DIM * PACKED_SEQ; i++) {
+                        // Use memcmp on the fp16 bits for exact determinism.
+                        if (memcmp(&det_output_1[i], &det_output_2[i], sizeof(_Float16)) != 0)
+                            mismatches++;
+                    }
+                    deterministic = (mismatches == 0);
+                    evidence[@"determinism_mismatches"] = @(mismatches);
+                }
+            }
+            if (!det_ok) deterministic = false;
+        }
+        evidence[@"deterministic"] = @(deterministic);
+        free(det_output_1);
+        free(det_output_2);
+
         // ---- Statistics + budget checks ----
         bool depth_budget_passed = false;
         double full_loop_p99 = NAN;
@@ -378,7 +435,7 @@ int main(int argc, char *argv[]) {
         evidence[@"margin_target_ms"] = @(MARGIN_TARGET_MS);
         evidence[@"failure_stage"] = failure ? failure : [NSNull null];
 
-        bool passed = !failure && finite && depth_budget_passed && compile_delta <= MAX_COMPILE_DELTA;
+        bool passed = !failure && finite && deterministic && depth_budget_passed && compile_delta <= MAX_COMPILE_DELTA;
         evidence[@"passed"] = @(passed);
 
         // Write evidence JSON.
