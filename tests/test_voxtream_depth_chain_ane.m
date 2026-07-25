@@ -16,6 +16,7 @@
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurface.h>
 #import <CommonCrypto/CommonDigest.h>
+#include <mach/mach_time.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +31,18 @@
 
 #define MAX_TENSORS 20
 #define MAX_CHANNELS ORION_VOXTREAM_DEPTH_HIDDEN_DIM
+
+static uint64_t monotonic_now(void) {
+    return mach_absolute_time();
+}
+
+static double monotonic_elapsed_ms(uint64_t start) {
+    static mach_timebase_info_data_t timebase;
+    if (timebase.denom == 0) mach_timebase_info(&timebase);
+    uint64_t elapsed = mach_absolute_time() - start;
+    return (double)elapsed * (double)timebase.numer /
+           (double)timebase.denom / 1000000.0;
+}
 
 typedef struct {
     const char* name;       // canonical tensor name shared between stages
@@ -57,26 +70,146 @@ static NSString* sha256_file(NSString* path) {
 }
 
 static NSString* qualified_reference(const char* root, NSString* name,
+                                     int batch_index,
                                      NSString** export_identity) {
     NSString* manifest_path = [@(root) stringByAppendingPathComponent:
         @"depth_export.manifest.json"];
     NSData* data = [NSData dataWithContentsOfFile:manifest_path];
     NSDictionary* manifest = data ? [NSJSONSerialization JSONObjectWithData:data
         options:0 error:nil] : nil;
-    if (![manifest[@"schema_version"] isEqual:@"voxtream.orion.depth-export/1.4"])
+    if (![manifest[@"schema_version"] isEqual:@"voxtream.orion.depth-export/1.5"])
         return nil;
     NSArray* records = manifest[@"ane_references"];
+    if (![records isKindOfClass:[NSArray class]]) return nil;
+    NSString* expected_relative = [NSString stringWithFormat:
+        @"ane_references/%@.batch%d.fp16.bin", name, batch_index];
+    NSString* resolved_root = [[@(root) stringByStandardizingPath]
+        stringByResolvingSymlinksInPath];
+    NSString* root_prefix = [resolved_root stringByAppendingString:@"/"];
+    NSArray* expected_shape = @[@1, @ORION_VOXTREAM_DEPTH_DIM, @1,
+                                @ORION_VOXTREAM_DEPTH_ANE_SEQ];
     for (NSDictionary* record in records) {
-        if (![record[@"name"] isEqual:name] ||
+        id batch = record[@"batch_index"];
+        if (![record isKindOfClass:[NSDictionary class]] ||
+            ![record[@"name"] isEqual:name] ||
             ![record[@"dtype"] isEqual:@"float16-little-endian"] ||
-            [record[@"batch_index"] intValue] != 0) continue;
-        NSString* path = [@(root) stringByAppendingPathComponent:record[@"path"]];
+            ![batch isKindOfClass:[NSNumber class]] ||
+            CFGetTypeID((__bridge CFTypeRef)batch) == CFBooleanGetTypeID() ||
+            [batch intValue] != batch_index ||
+            ![record[@"shape"] isEqual:expected_shape] ||
+            ![record[@"path"] isKindOfClass:[NSString class]] ||
+            ![record[@"path"] isEqual:expected_relative]) continue;
+        NSString* path = [[[resolved_root
+            stringByAppendingPathComponent:record[@"path"]]
+            stringByStandardizingPath] stringByResolvingSymlinksInPath];
+        if (![path hasPrefix:root_prefix]) return nil;
         if (![[sha256_file(path) lowercaseString]
                 isEqual:[record[@"sha256"] lowercaseString]]) return nil;
         if (export_identity) *export_identity = manifest[@"identity_sha256"];
         return path;
     }
     return nil;
+}
+
+static int compare_double(const void* lhs, const void* rhs) {
+    double a = *(const double*)lhs, b = *(const double*)rhs;
+    return (a > b) - (a < b);
+}
+
+static double percentile(const double* values, int count, double fraction) {
+    double* sorted = malloc((size_t)count * sizeof(*sorted));
+    if (!sorted || count <= 0) {
+        free(sorted);
+        return NAN;
+    }
+    memcpy(sorted, values, (size_t)count * sizeof(*sorted));
+    qsort(sorted, (size_t)count, sizeof(*sorted), compare_double);
+    double rank = fraction * (count - 1);
+    int lower = (int)floor(rank), upper = (int)ceil(rank);
+    double result = sorted[lower] + (sorted[upper] - sorted[lower]) * (rank - lower);
+    free(sorted);
+    return result;
+}
+
+static bool injected_failure(const char* stem, const char* point) {
+    const char* stage = getenv("VOXTREAM_DEPTH_CHAIN_FAIL_STAGE");
+    const char* requested = getenv("VOXTREAM_DEPTH_CHAIN_FAIL_POINT");
+    bool matches = stage && requested && strstr(stem, stage) &&
+                   strcmp(requested, point) == 0;
+    return matches;
+}
+
+static bool s_injected_failure_observed = false;
+
+static bool inject_now(const char* stem, const char* point) {
+    bool matches = injected_failure(stem, point);
+    if (matches) s_injected_failure_observed = true;
+    return matches;
+}
+
+static bool failure_injection_requested(void) {
+    const char* stage = getenv("VOXTREAM_DEPTH_CHAIN_FAIL_STAGE");
+    const char* point = getenv("VOXTREAM_DEPTH_CHAIN_FAIL_POINT");
+    return stage && stage[0] && point && point[0];
+}
+
+static NSString* safe_evidence_component(const char* value) {
+    NSMutableString* safe = [NSMutableString string];
+    for (const unsigned char* p = (const unsigned char*)value; p && *p; p++) {
+        if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+            (*p >= '0' && *p <= '9') || *p == '-' || *p == '_') {
+            [safe appendFormat:@"%c", *p];
+        } else {
+            [safe appendString:@"_"];
+        }
+    }
+    return safe;
+}
+
+static bool publish_failure_evidence(const char* root, const char* revision,
+                                     const char* compiler_build,
+                                     int compile_count_start,
+                                     bool cleanup_completed) {
+    if (!failure_injection_requested()) return true;
+    const char* stage = getenv("VOXTREAM_DEPTH_CHAIN_FAIL_STAGE");
+    const char* point = getenv("VOXTREAM_DEPTH_CHAIN_FAIL_POINT");
+    NSDateFormatter* formatter = [[NSDateFormatter alloc] init];
+    formatter.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    formatter.timeZone = [NSTimeZone timeZoneForSecondsFromGMT:0];
+    formatter.dateFormat = @"yyyy-MM-dd'T'HH:mm:ss.SSS'Z'";
+    NSDictionary* evidence = @{
+        @"schema_version": @"orion.voxtream.depth-chain-failure/1.0",
+        @"status": s_injected_failure_observed ? @"pass" : @"fail",
+        @"stage": @(stage),
+        @"point": @(point),
+        @"cleanup_completed": @(cleanup_completed),
+        @"failure_kind": @"host-injected-boundary",
+        @"operating_system": NSProcessInfo.processInfo.operatingSystemVersionString,
+        @"orion_revision": @(revision && revision[0]
+            ? revision : "diagnostic-unqualified"),
+        @"compiler_build": @(compiler_build && compiler_build[0]
+            ? compiler_build : "diagnostic-unqualified"),
+        @"compile_count_delta": @(orion_compile_count() - compile_count_start),
+        @"timestamp_utc": [formatter stringFromDate:[NSDate date]],
+    };
+    NSData* json = [NSJSONSerialization dataWithJSONObject:evidence
+        options:NSJSONWritingPrettyPrinted error:nil];
+    NSString* filename = [NSString stringWithFormat:
+        @"depth_chain_failure.%@.%@.json", safe_evidence_component(stage),
+        safe_evidence_component(point)];
+    NSString* path = [@(root) stringByAppendingPathComponent:filename];
+    if (!json || ![json writeToFile:path atomically:YES]) {
+        fprintf(stderr, "FAIL: unable to publish failure evidence %s\n",
+                path.UTF8String);
+        return false;
+    }
+    return true;
+}
+
+static NSArray* sample_array(const double* samples, int count) {
+    NSMutableArray* values = [NSMutableArray arrayWithCapacity:(NSUInteger)count];
+    for (int i = 0; i < count; i++) [values addObject:@(samples[i])];
+    return values;
 }
 
 static const ChainLink kChain[] = {
@@ -221,11 +354,12 @@ static OrionProgram* compile_donor(OrionFrontendFn frontend, int layer,
         return NULL;
     }
     NSDictionary* wdict = dict_from_plan(plan_out, blob_dir);
+    if (inject_now(stem, "before-compile")) return NULL;
     char error[256];
-    CFAbsoluteTime compile_start = CFAbsoluteTimeGetCurrent();
+    uint64_t compile_start = monotonic_now();
     OrionProgram* program = orion_compile_mil_with_plan(
         mil.UTF8String, plan_out, wdict, stem, error, sizeof(error));
-    *compile_ms_out = (CFAbsoluteTimeGetCurrent() - compile_start) * 1000.0;
+    *compile_ms_out = monotonic_elapsed_ms(compile_start);
     if (!program) {
         fprintf(stderr, "FAIL: %s compile failed (%.2f ms) %s\n",
                 stem, *compile_ms_out, error);
@@ -241,7 +375,9 @@ static bool eval_donor(OrionProgram* program, const OrionBindingPlan* plan,
                        const char* stem,
                        ChainTensor* tensors, int* n_tensors,
                        const char* output_name, int out_channels, int seq,
-                       double* eval_ms_out) {
+                       double* prepare_ms_out, double* eval_ms_out,
+                       double* readback_ms_out, double* total_ms_out) {
+    uint64_t total_start = monotonic_now();
     IOSurfaceRef inputs[3] = {NULL, NULL, NULL};
     IOSurfaceRef output = NULL;
     OrionSurfaceStatus surface_status = ORION_SURFACE_OK;
@@ -262,35 +398,45 @@ static bool eval_donor(OrionProgram* program, const OrionBindingPlan* plan,
                  inputs[i], &plan->inputs[i], tensor->data,
                  plan->inputs[i].packed_prefix_bytes) == ORION_SURFACE_OK;
     }
+    if (ok && inject_now(stem, "after-input-write")) ok = false;
     if (ok) {
         output = orion_tensor_create_for_binding(&plan->outputs[0],
                                                  &surface_status);
         ok = output && surface_status == ORION_SURFACE_OK;
     }
-    CFAbsoluteTime eval_start = CFAbsoluteTimeGetCurrent();
+    if (ok && inject_now(stem, "after-surface-create")) ok = false;
+    *prepare_ms_out = monotonic_elapsed_ms(total_start);
+    uint64_t eval_start = monotonic_now();
     if (ok) {
-        ok = orion_eval_with_plan(program, plan, inputs,
-                                  (int)plan->n_inputs, &output, 1);
+        if (inject_now(stem, "before-eval")) {
+            ok = false;
+        } else {
+            ok = orion_eval_with_plan(program, plan, inputs,
+                                      (int)plan->n_inputs, &output, 1);
+        }
     }
-    *eval_ms_out = (CFAbsoluteTimeGetCurrent() - eval_start) * 1000.0;
+    *eval_ms_out = monotonic_elapsed_ms(eval_start);
 
+    uint64_t readback_start = monotonic_now();
     ChainTensor* out_tensor = NULL;
+    if (ok && inject_now(stem, "after-eval")) ok = false;
     if (ok) {
         out_tensor = find_tensor(tensors, *n_tensors, output_name);
         if (!out_tensor) {
-        if (*n_tensors >= MAX_TENSORS) {
-            ok = false;
-        } else {
-            out_tensor = &tensors[(*n_tensors)++];
+            if (*n_tensors >= MAX_TENSORS) {
+                ok = false;
+            } else {
+                out_tensor = &tensors[(*n_tensors)++];
+            }
+            if (ok) {
+                out_tensor->name = output_name;
+                out_tensor->channels = out_channels;
+                out_tensor->data = calloc((size_t)out_channels * seq,
+                                           sizeof(_Float16));
+            }
         }
-        if (ok) {
-            out_tensor->name = output_name;
-            out_tensor->channels = out_channels;
-            out_tensor->data = calloc((size_t)out_channels * seq,
-                                       sizeof(_Float16));
-        }
-        }
-        ok = out_tensor->data &&
+        if (ok && inject_now(stem, "before-readback")) ok = false;
+        ok = ok && out_tensor->data &&
              orion_tensor_read_for_binding(
                  output, &plan->outputs[0], out_tensor->data,
                  plan->outputs[0].packed_prefix_bytes) == ORION_SURFACE_OK;
@@ -308,6 +454,8 @@ static bool eval_donor(OrionProgram* program, const OrionBindingPlan* plan,
         if (inputs[i]) CFRelease(inputs[i]);
     }
     if (output) CFRelease(output);
+    *readback_ms_out = monotonic_elapsed_ms(readback_start);
+    *total_ms_out = monotonic_elapsed_ms(total_start);
     if (!ok) fprintf(stderr, "FAIL: %s eval/readback failed\n", stem);
     return ok;
 }
@@ -352,8 +500,34 @@ int main(void) {
         OrionProgram* donors[16] = {NULL};
         double total_compile_ms = 0.0;
         double total_patch_load_ms = 0.0;
-        double total_eval_ms = 0.0;
         const int compile_count_start = orion_compile_count();
+        const bool evidence_diagnostic =
+            getenv("VOXTREAM_DEPTH_CHAIN_ONLY_STAGE") != NULL ||
+            getenv("VOXTREAM_DEPTH_CHAIN_REPEAT") != NULL ||
+            getenv("VOXTREAM_DEPTH_CHAIN_INPUT_BIN") != NULL ||
+            failure_injection_requested();
+        const char* batch_env = getenv("VOXTREAM_DEPTH_CHAIN_BATCH");
+        const int batch_index = batch_env ? atoi(batch_env) : 0;
+        if (batch_index < 0 || batch_index > 1) {
+            fprintf(stderr, "FAIL: VOXTREAM_DEPTH_CHAIN_BATCH must be 0 or 1\n");
+            return 1;
+        }
+        const char* samples_env = getenv("VOXTREAM_DEPTH_CHAIN_SAMPLES");
+        const int sample_count = samples_env ? atoi(samples_env) : 30;
+        const char* warmup_env = getenv("VOXTREAM_DEPTH_CHAIN_WARMUP");
+        const int warmup_count = warmup_env ? atoi(warmup_env) : 2;
+        if (sample_count < 1 || sample_count > 100 || warmup_count < 0 || warmup_count > 20) {
+            fprintf(stderr, "FAIL: samples must be 1..100 and warmup 0..20\n");
+            return 1;
+        }
+        if (!evidence_diagnostic && sample_count < 30) {
+            fprintf(stderr, "FAIL: non-diagnostic evidence requires at least 30 samples\n");
+            return 1;
+        }
+        double stage_sum_samples[100] = {0};
+        double prepare_samples[100] = {0};
+        double device_samples[100] = {0};
+        double readback_samples[100] = {0};
 
         // Seed the fixture: batch 0 of prefix-8-guided-step0, logical
         // [S,D] = (token*D + channel + 7)/D, packed channel-major, with zero
@@ -362,7 +536,10 @@ int main(void) {
         hidden->name = "hidden";
         hidden->channels = ORION_VOXTREAM_DEPTH_DIM;
         hidden->data = calloc((size_t)hidden->channels * s, sizeof(_Float16));
+        NSString* input_reference = qualified_reference(
+            blob_dir, @"packed_hidden", batch_index, NULL);
         const char* input_bin = getenv("VOXTREAM_DEPTH_CHAIN_INPUT_BIN");
+        if (!input_bin && input_reference) input_bin = input_reference.UTF8String;
         if (input_bin && input_bin[0]) {
             // Seed hidden from a raw packed [channels, seq] fp16 file (used
             // for per-layer parity checks against exported references).
@@ -486,7 +663,8 @@ int main(void) {
                     cleanup_chain(donors, tensors, n_tensors);
                     return 1;
                 }
-                double compile_ms = 0.0, eval_ms = 0.0;
+                double compile_ms = 0.0, prepare_ms = 0.0, eval_ms = 0.0;
+                double readback_ms = 0.0, stage_total_ms = 0.0;
                 char stem[128];
                 snprintf(stem, sizeof(stem), "layer%d_chain_%s_ane",
                          layer, stage_name);
@@ -503,6 +681,13 @@ int main(void) {
                     donor_mils[link] = donor_mil;
                     if (!donors[link]) {
                         cleanup_chain(donors, tensors, n_tensors);
+                        if (s_injected_failure_observed) {
+                            if (!publish_failure_evidence(
+                                    blob_dir, revision, compiler_build,
+                                    compile_count_start, true)) return 1;
+                            printf("PASS: injected failure observed and resources cleaned up\n");
+                            return 0;
+                        }
                         return 1;
                     }
                     total_compile_ms += compile_ms;
@@ -526,12 +711,11 @@ int main(void) {
                     // recompile is needed and results match a fresh compile.
                     NSDictionary* patched_weights = remapped_dict_from_plan(
                         stage_plan, blob_dir, layer);
-                    CFAbsoluteTime patch_start = CFAbsoluteTimeGetCurrent();
+                    uint64_t patch_start = monotonic_now();
                     stage_program = orion_program_patch_weights(
                         donors[link], donor_mils[link].UTF8String,
                         patched_weights, stem);
-                    total_patch_load_ms +=
-                        (CFAbsoluteTimeGetCurrent() - patch_start) * 1000.0;
+                    total_patch_load_ms += monotonic_elapsed_ms(patch_start);
                     if (!stage_program) {
                         fprintf(stderr,
                                 "FAIL: layer %d stage %s weight patch\n",
@@ -566,22 +750,38 @@ int main(void) {
                     patched = true;
                     total_compile_ms += compile_ms;
                 }
-                if (!eval_donor(stage_program, stage_plan, stem,
-                                tensors, &n_tensors, step->output,
-                                step->out_channels, s, &eval_ms)) {
-                    if (patched) orion_release_program(stage_program);
-                    cleanup_chain(donors, tensors, n_tensors);
-                    return 1;
+                for (int sample = -warmup_count; sample < sample_count; sample++) {
+                    if (!eval_donor(stage_program, stage_plan, stem,
+                                    tensors, &n_tensors, step->output,
+                                    step->out_channels, s, &prepare_ms, &eval_ms,
+                                    &readback_ms, &stage_total_ms)) {
+                        if (patched) orion_release_program(stage_program);
+                        cleanup_chain(donors, tensors, n_tensors);
+                        if (s_injected_failure_observed) {
+                            if (!publish_failure_evidence(
+                                    blob_dir, revision, compiler_build,
+                                    compile_count_start, true)) return 1;
+                            printf("PASS: injected failure observed and resources cleaned up\n");
+                            return 0;
+                        }
+                        return 1;
+                    }
+                    if (sample >= 0) {
+                        prepare_samples[sample] += prepare_ms;
+                        device_samples[sample] += eval_ms;
+                        readback_samples[sample] += readback_ms;
+                        stage_sum_samples[sample] += stage_total_ms;
+                    }
                 }
                 if (patched) orion_release_program(stage_program);
-                total_eval_ms += eval_ms;
                 printf("layer %d stage %-9s eval=%6.2fms\n",
                        layer, stage_name, eval_ms);
             }
         }
 
         if (getenv("VOXTREAM_DEPTH_CHAIN_FINAL_NORM")) {
-            double compile_ms = 0.0, eval_ms = 0.0;
+            double compile_ms = 0.0, prepare_ms = 0.0, eval_ms = 0.0;
+            double readback_ms = 0.0, stage_total_ms = 0.0;
             ChainTensor* prev = find_tensor(tensors, n_tensors, "hidden_out");
             if (!prev) {
                 fprintf(stderr, "FAIL: final norm requires a complete layer output\n");
@@ -600,18 +800,40 @@ int main(void) {
                 donor_mils[norm_slot] = norm_mil;
                 if (!donors[norm_slot]) {
                     cleanup_chain(donors, tensors, n_tensors);
+                    if (s_injected_failure_observed) {
+                        if (!publish_failure_evidence(
+                                blob_dir, revision, compiler_build,
+                                compile_count_start, true)) return 1;
+                        printf("PASS: injected failure observed and resources cleaned up\n");
+                        return 0;
+                    }
                     return 1;
                 }
                 total_compile_ms += compile_ms;
             }
-            if (!eval_donor(donors[norm_slot], &donor_plans[norm_slot],
-                            "chain_final_norm_ane", tensors, &n_tensors,
-                            "final_out", ORION_VOXTREAM_DEPTH_DIM, s,
-                            &eval_ms)) {
-                cleanup_chain(donors, tensors, n_tensors);
-                return 1;
+            for (int sample = -warmup_count; sample < sample_count; sample++) {
+                if (!eval_donor(donors[norm_slot], &donor_plans[norm_slot],
+                                "chain_final_norm_ane", tensors, &n_tensors,
+                                "final_out", ORION_VOXTREAM_DEPTH_DIM, s,
+                                &prepare_ms, &eval_ms, &readback_ms,
+                                &stage_total_ms)) {
+                    cleanup_chain(donors, tensors, n_tensors);
+                    if (s_injected_failure_observed) {
+                        if (!publish_failure_evidence(
+                                blob_dir, revision, compiler_build,
+                                compile_count_start, true)) return 1;
+                        printf("PASS: injected failure observed and resources cleaned up\n");
+                        return 0;
+                    }
+                    return 1;
+                }
+                if (sample >= 0) {
+                    prepare_samples[sample] += prepare_ms;
+                    device_samples[sample] += eval_ms;
+                    readback_samples[sample] += readback_ms;
+                    stage_sum_samples[sample] += stage_total_ms;
+                }
             }
-            total_eval_ms += eval_ms;
             printf("final_norm compile=%7.2fms eval=%6.2fms\n",
                    compile_ms, eval_ms);
         }
@@ -623,6 +845,11 @@ int main(void) {
             printf("PASS: diagnostic stage %s compiled and evaluated\n",
                    only_stage_env);
             cleanup_chain(donors, tensors, n_tensors);
+            if (failure_injection_requested()) {
+                if (!publish_failure_evidence(blob_dir, revision, compiler_build,
+                                              compile_count_start, true)) return 1;
+                return s_injected_failure_observed ? 0 : 1;
+            }
             return 0;
         }
         if (!result) {
@@ -636,13 +863,13 @@ int main(void) {
             ? @"packed_final_norm_output"
             : [NSString stringWithFormat:@"packed_layer_%d_output", n_layers - 1];
         NSString* canonical_reference = qualified_reference(
-            blob_dir, reference_name, &export_identity);
+            blob_dir, reference_name, batch_index, &export_identity);
         const char* reference_path = canonical_reference.UTF8String;
         double max_abs = 0.0;
         double sum_sq = 0.0;
         double ref_sq = 0.0;
         bool compared = false;
-        const bool diagnostic = only_stage_env || repeat_env;
+        const bool diagnostic = evidence_diagnostic;
         if (!reference_path || !reference_path[0]) {
             if (!diagnostic) {
                 fprintf(stderr, "FAIL: validated export lacks canonical %s reference\n",
@@ -727,7 +954,26 @@ int main(void) {
 
         cleanup_chain(donors, tensors, n_tensors);
 
+        if (getenv("VOXTREAM_DEPTH_CHAIN_FAIL_POINT") &&
+            !s_injected_failure_observed) {
+            fprintf(stderr, "FAIL: requested failure injection point was not reached\n");
+            if (!publish_failure_evidence(blob_dir, revision, compiler_build,
+                                          compile_count_start, true)) return 1;
+            return 1;
+        }
+
         double relative_l2 = compared ? sqrt(sum_sq / ref_sq) : 0.0;
+        double stage_sum_p50 = percentile(stage_sum_samples, sample_count, 0.50);
+        double stage_sum_p95 = percentile(stage_sum_samples, sample_count, 0.95);
+        double stage_sum_p99 = percentile(stage_sum_samples, sample_count, 0.99);
+        double prepare_p99 = percentile(prepare_samples, sample_count, 0.99);
+        double device_p99 = percentile(device_samples, sample_count, 0.99);
+        double readback_p99 = percentile(readback_samples, sample_count, 0.99);
+        const bool complete_depth_measurement = n_layers == 4 &&
+            getenv("VOXTREAM_DEPTH_CHAIN_FINAL_NORM") != NULL;
+        double projected_separate_cfg_stage_sum_p99_ms = complete_depth_measurement
+            ? stage_sum_p99 * 15.0 * 2.0 : NAN;
+        const double depth_budget_ms = 60.0;
         const int compile_count_used = orion_compile_count() - compile_count_start;
         const int expected_compiles = n_links +
             (getenv("VOXTREAM_DEPTH_CHAIN_FINAL_NORM") ? 1 : 0);
@@ -736,23 +982,36 @@ int main(void) {
                     expected_compiles, compile_count_used);
             return 1;
         }
-        printf("chain: %d layer(s) x %d stages%s, compiles=%d compile=%.2fms patch_load=%.2fms eval=%.2fms",
+        printf("chain: %d layer(s) x %d stages%s, compiles=%d compile=%.2fms "
+               "patch_load=%.2fms stage_sum_sample0=%.2fms",
                 n_layers, n_links,
                 getenv("VOXTREAM_DEPTH_CHAIN_FINAL_NORM") ? " + final_norm" : "",
-                compile_count_used, total_compile_ms, total_patch_load_ms, total_eval_ms);
+                compile_count_used, total_compile_ms, total_patch_load_ms,
+                stage_sum_samples[0]);
         if (compared && !diagnostic) {
             printf(" max_abs=%.5f relative_l2=%.6f", max_abs, relative_l2);
         }
+        printf(" stage_sum_p50_ms=%.2f stage_sum_p95_ms=%.2f "
+               "stage_sum_p99_ms=%.2f prepare_stage_sum_p99_ms=%.2f "
+               "device_eval_stage_sum_p99_ms=%.2f "
+               "readback_stage_sum_p99_ms=%.2f",
+               stage_sum_p50, stage_sum_p95, stage_sum_p99, prepare_p99,
+               device_p99, readback_p99);
+        if (complete_depth_measurement) {
+            printf(" projected_15step_separate_cfg_stage_sum_p99_ms=%.2f",
+                   projected_separate_cfg_stage_sum_p99_ms);
+        }
         printf("\n");
-        // Parity gates default to the PRD single-layer thresholds
-        // (max_abs 0.03, nrmse 0.005) and may be overridden for documented
-        // fp16-accumulation evidence runs.
-        const char* max_abs_env = getenv("VOXTREAM_DEPTH_CHAIN_MAX_ABS");
-        const char* relative_l2_env = getenv("VOXTREAM_DEPTH_CHAIN_RELATIVE_L2");
-        double max_abs_gate = max_abs_env ? atof(max_abs_env) : 0.03;
-        double relative_l2_gate = relative_l2_env ? atof(relative_l2_env) : 0.005;
-        const bool parity_passed = !compared ||
+        // Only the one-layer PRD parity gates are enforceable here. Four-layer
+        // execution and stage-sum timing remain architectural diagnostics.
+        const double max_abs_gate = 0.03;
+        const double relative_l2_gate = 0.005;
+        const bool one_layer_numerical_passed = !compared ||
             (max_abs <= max_abs_gate && relative_l2 <= relative_l2_gate);
+        const bool enforce_numerical_gate = n_layers == 1;
+        NSString* continuation_decision = complete_depth_measurement
+            ? @"architectural-no-go-diagnostic"
+            : @"pending-complete-depth-measurement";
         if (compared && !diagnostic) {
             NSMutableArray* plans = [NSMutableArray array];
             const int plan_count = n_links +
@@ -764,22 +1023,53 @@ int main(void) {
                 }];
             }
             NSDictionary* result_record = @{
-                @"schema_version": @"orion.voxtream.depth-chain-result/1.0",
-                @"status": parity_passed ? @"pass" : @"fail",
+                @"schema_version": @"orion.voxtream.depth-chain-result/1.1",
+                @"status": @"diagnostic",
+                @"qualification_status": @"diagnostic",
+                @"continuation_decision": continuation_decision,
                 @"export_identity": export_identity ?: @"",
                 @"orion_revision": @(revision),
                 @"compiler_build": @(compiler_build),
                 @"operating_system": NSProcessInfo.processInfo.operatingSystemVersionString,
                 @"layers": @(n_layers),
+                @"batch_index": @(batch_index),
                 @"final_norm": @(getenv("VOXTREAM_DEPTH_CHAIN_FINAL_NORM") != NULL),
                 @"compile_count": @(compile_count_used),
                 @"compile_ms": @(total_compile_ms),
                 @"patch_load_ms": @(total_patch_load_ms),
-                @"eval_ms": @(total_eval_ms),
+                @"samples": @(sample_count),
+                @"warmup": @(warmup_count),
+                @"timing_method": @"sum-of-stage-samples-not-contiguous-chain",
+                @"timing_qualified": @NO,
+                @"stage_sum_samples_ms": sample_array(stage_sum_samples, sample_count),
+                @"prepare_stage_sum_samples_ms": sample_array(prepare_samples, sample_count),
+                @"device_eval_stage_sum_samples_ms": sample_array(device_samples, sample_count),
+                @"readback_stage_sum_samples_ms": sample_array(readback_samples, sample_count),
+                @"stage_sum_p50_ms": @(stage_sum_p50),
+                @"stage_sum_p95_ms": @(stage_sum_p95),
+                @"stage_sum_p99_ms": @(stage_sum_p99),
+                @"prepare_stage_sum_p99_ms": @(prepare_p99),
+                @"device_eval_stage_sum_p99_ms": @(device_p99),
+                @"readback_stage_sum_p99_ms": @(readback_p99),
+                @"projected_15step_separate_cfg_stage_sum_p99_ms":
+                    complete_depth_measurement
+                        ? @(projected_separate_cfg_stage_sum_p99_ms)
+                        : [NSNull null],
+                @"depth_budget_ms": @(depth_budget_ms),
+                @"numerical_passed": enforce_numerical_gate
+                    ? @(one_layer_numerical_passed) : [NSNull null],
+                @"numerical_scope": enforce_numerical_gate
+                    ? @"one-layer-prd-gate"
+                    : @"stateless-four-layer-diagnostic",
+                @"performance_passed": [NSNull null],
                 @"max_abs": @(max_abs),
-                @"max_abs_gate": @(max_abs_gate),
+                @"max_abs_gate": enforce_numerical_gate
+                    ? @(max_abs_gate) : [NSNull null],
                 @"relative_l2": @(relative_l2),
-                @"relative_l2_gate": @(relative_l2_gate),
+                @"relative_l2_definition":
+                    @"sqrt(sum(error^2)/sum(reference^2))",
+                @"relative_l2_gate": enforce_numerical_gate
+                    ? @(relative_l2_gate) : [NSNull null],
                 @"reference_name": reference_name,
                 @"reference_sha256": sha256_file(canonical_reference),
                 @"plans": plans,
@@ -787,17 +1077,19 @@ int main(void) {
             NSData* result_json = [NSJSONSerialization dataWithJSONObject:
                 result_record options:NSJSONWritingPrettyPrinted error:nil];
             NSString* result_path = [@(blob_dir) stringByAppendingPathComponent:
-                @"depth_chain_result.json"];
+                [NSString stringWithFormat:@"depth_chain_result.layers%d.final%d.batch%d.json",
+                    n_layers, getenv("VOXTREAM_DEPTH_CHAIN_FINAL_NORM") != NULL,
+                    batch_index]];
             if (!result_json || ![result_json writeToFile:result_path atomically:YES]) {
                 fprintf(stderr, "FAIL: unable to publish qualification result\n");
                 return 1;
             }
         }
-        if (!parity_passed) {
+        if (enforce_numerical_gate && !one_layer_numerical_passed) {
             fprintf(stderr,
-                    "FAIL: parity gate failed (max_abs %.5f, gate %.5f; "
-                     "relative_l2 %.6f, gate %.6f)\n", max_abs, max_abs_gate,
-                      relative_l2, relative_l2_gate);
+                    "FAIL: one-layer parity gate failed (max_abs %.5f, gate %.5f; "
+                    "relative_l2 %.6f, gate %.6f)\n", max_abs, max_abs_gate,
+                    relative_l2, relative_l2_gate);
             return 1;
         }
         printf("PASS: VoXtream decomposed layer chain\n");
