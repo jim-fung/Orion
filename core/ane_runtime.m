@@ -35,28 +35,58 @@ bool orion_validate_weight_dictionary_for_plan(
 ) {
     char error[256] = {0};
     NSDictionary* dictionary = weight_dict ?: @{};
-    if (!plan || !orion_binding_plan_validate_finalized(plan, error, sizeof(error)) ||
-        dictionary.count != (NSUInteger)plan->n_weights) return false;
+    if (!plan || !orion_binding_plan_validate_finalized(plan, error, sizeof(error))) return false;
+
+    // Group weights by path: single-tensor files have one weight per path,
+    // aggregate multi-chunk files share one path across many weights.
+    NSMutableDictionary* paths_seen = [NSMutableDictionary dictionary];
     for (int i = 0; i < plan->n_weights; i++) {
-        const OrionBindingPlanWeight* weight = &plan->weights[i];
-        NSString* path = [NSString stringWithUTF8String:weight->path];
-        NSDictionary* entry = dictionary[path];
-        if (![entry isKindOfClass:[NSDictionary class]] ||
-            ![entry[@"offset"] isKindOfClass:[NSNumber class]] ||
-            [entry[@"offset"] unsignedLongLongValue] != 0 ||
-            ![entry[@"data"] isKindOfClass:[NSData class]]) return false;
-        NSData* data = entry[@"data"];
-        if (data.length < 128) return false;
-        const uint8_t* bytes = data.bytes;
-        if (bytes[0] != 0x01 || bytes[4] != 0x02 ||
-            bytes[64] != 0xef || bytes[65] != 0xbe ||
-            bytes[66] != 0xad || bytes[67] != 0xde || bytes[68] != 0x01 ||
-            read_le32(bytes + 72) != weight->logical_bytes ||
-            read_le32(bytes + 80) != 128 ||
-            data.length != (NSUInteger)128 + weight->logical_bytes ||
-            ![[sha256_hex(data) lowercaseString] isEqualToString:
-                [[NSString stringWithUTF8String:weight->sha256] lowercaseString]]) return false;
+        @autoreleasepool {
+            const OrionBindingPlanWeight* weight = &plan->weights[i];
+            NSString* path = [NSString stringWithUTF8String:weight->path];
+            NSDictionary* entry = dictionary[path];
+            if (![entry isKindOfClass:[NSDictionary class]] ||
+                ![entry[@"offset"] isKindOfClass:[NSNumber class]] ||
+                [entry[@"offset"] unsignedLongLongValue] != 0 ||
+                ![entry[@"data"] isKindOfClass:[NSData class]]) return false;
+            NSData* data = entry[@"data"];
+            if (data.length < 128) return false;
+            const uint8_t* bytes = data.bytes;
+            if (bytes[0] != 0x01 || bytes[4] != 0x02 ||
+                bytes[64] != 0xef || bytes[65] != 0xbe ||
+                bytes[66] != 0xad || bytes[67] != 0xde || bytes[68] != 0x01 ||
+                read_le32(bytes + 80) != 128) return false;
+
+            if (weight->offset == 64) {
+                // Legacy single-tensor: the file IS this one weight.
+                if (paths_seen[path]) return false;  // duplicate path for single-tensor
+                if (read_le32(bytes + 72) != weight->logical_bytes) return false;
+                if (data.length != (NSUInteger)128 + weight->logical_bytes) return false;
+                if (![[sha256_hex(data) lowercaseString] isEqualToString:
+                      [[NSString stringWithUTF8String:weight->sha256] lowercaseString]])
+                    return false;
+                paths_seen[path] = @YES;
+            } else {
+                // Aggregate multi-chunk: validate this weight's payload at
+                // [offset+64, offset+64+logical_bytes) within the shared file.
+                if (!paths_seen[path]) {
+                    paths_seen[path] = @YES;
+                }
+                static const uint64_t CHUNK_HDR = 64;
+                uint64_t payload_start = weight->offset + CHUNK_HDR;
+                uint64_t payload_end = payload_start + weight->logical_bytes;
+                if (payload_start < 128 || payload_end > data.length) return false;
+                NSRange range = NSMakeRange((NSUInteger)payload_start, weight->logical_bytes);
+                NSData* chunk = [data subdataWithRange:range];
+                if (![[sha256_hex(chunk) lowercaseString] isEqualToString:
+                      [[NSString stringWithUTF8String:weight->sha256] lowercaseString]])
+                    return false;
+                paths_seen[path] = @YES;  // mark as validated
+            }
+        }
     }
+    // Verify every dictionary entry was consumed by at least one weight.
+    if (dictionary.count != paths_seen.count) return false;
     return true;
 }
 

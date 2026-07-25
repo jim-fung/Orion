@@ -223,6 +223,56 @@ static bool validate_blobfile(int fd, size_t logical_bytes) {
     return (uint64_t)statbuf.st_size == (uint64_t)data_offset + payload_size;
 }
 
+// Validate a BLOBFILE header for a weight. Handles three cases:
+// 1. Legacy single-tensor (offset=64, file payload == logical_bytes).
+// 2. Aggregate first-chunk (offset=64, file payload > logical_bytes — multiple chunks).
+// 3. Aggregate subsequent-chunk (offset>64).
+static bool validate_blobfile_for_weight(int fd, uint64_t offset, size_t logical_bytes,
+                                         uint32_t* out_payload_size) {
+    unsigned char header[128];
+    struct stat statbuf;
+    if (fstat(fd, &statbuf) != 0 || !S_ISREG(statbuf.st_mode) ||
+        pread(fd, header, sizeof(header), 0) != (ssize_t)sizeof(header)) return false;
+    uint32_t payload_size = read_le32(header + 72);
+    uint32_t data_offset = read_le32(header + 80);
+    if (out_payload_size) *out_payload_size = payload_size;
+    if (header[0] != 0x01 || header[4] != 0x02 ||
+        memcmp(header + 64, (unsigned char[]){0xef, 0xbe, 0xad, 0xde}, 4) != 0 ||
+        header[68] != 0x01 || data_offset != 128) return false;
+
+    if (offset == 64 && payload_size == logical_bytes &&
+        (uint64_t)statbuf.st_size == (uint64_t)data_offset + payload_size) {
+        return true;
+    }
+    static const uint64_t CHUNK_HDR = 64;
+    uint64_t data_start = offset + CHUNK_HDR;
+    uint64_t data_end = data_start + logical_bytes;
+    if (data_start < data_offset) return false;
+    if (data_end > (uint64_t)data_offset + payload_size) return false;
+    return (uint64_t)statbuf.st_size >= data_end;
+}
+
+// Hash a byte range [offset, offset+length) within an open file descriptor.
+static bool fd_range_sha256(int fd, uint64_t offset, size_t length, char out[65]) {
+    CC_SHA256_CTX context;
+    CC_SHA256_Init(&context);
+    unsigned char buffer[16384];
+    size_t remaining = length;
+    uint64_t pos = offset;
+    while (remaining > 0) {
+        size_t to_read = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
+        ssize_t count = pread(fd, buffer, to_read, (off_t)pos);
+        if (count <= 0) return false;
+        CC_SHA256_Update(&context, buffer, (CC_LONG)count);
+        remaining -= (size_t)count;
+        pos += (uint64_t)count;
+    }
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256_Final(digest, &context);
+    hex_digest(digest, out);
+    return true;
+}
+
 static bool copy_string(char* dst, size_t dst_size, const char* src,
                         const char* field, char* error, size_t error_size) {
     if (!src || !src[0] || strlen(src) >= dst_size) {
@@ -347,8 +397,21 @@ bool orion_binding_plan_generate_with_identity(
         }
         int fd = open_confined_fd(identity->weight_root, weight->path + 12,
                                   error, error_size);
-        bool valid_file = fd >= 0 && validate_blobfile(fd, weight->logical_bytes) &&
-                          fd_sha256(fd, weight->sha256);
+        if (fd < 0) {
+            set_error(error, error_size, "cannot open weight '%s'", weight->name);
+            return false;
+        }
+        // Validate the BLOBFILE header and determine the hash offset.
+        uint32_t payload_size_for_weight = 0;
+        bool valid_file = validate_blobfile_for_weight(fd, weight->offset,
+                                                       weight->logical_bytes,
+                                                       &payload_size_for_weight);
+        if (valid_file) {
+            static const uint64_t CHUNK_HDR = 64;
+            uint64_t hash_offset = weight->offset + CHUNK_HDR;
+            valid_file = fd_range_sha256(fd, hash_offset, weight->logical_bytes,
+                                         weight->sha256);
+        }
         if (fd >= 0) close(fd);
         if (!valid_file) {
             set_error(error, error_size, "cannot hash weight '%s'", weight->name);
@@ -423,13 +486,32 @@ bool orion_binding_plan_validate(const OrionBindingPlan* plan, char* error,
         int order = 0;
         if (!bounded_nonempty(weight->name, sizeof(weight->name)) ||
             !bounded_nonempty(weight->path, sizeof(weight->path)) ||
-            !valid_sha256(weight->sha256, sizeof(weight->sha256)) || weight->offset != 64 ||
+            !valid_sha256(weight->sha256, sizeof(weight->sha256)) || weight->offset < 64 ||
             (i && (!bounded_compare(plan->weights[i - 1].name, weight->name,
                                     sizeof(weight->name), &order) || order >= 0)) ||
             !shape_bytes(weight->shape, weight->dtype, &expected) ||
             weight->logical_bytes != expected) {
             set_error(error, error_size, "binding-plan weight has invalid metadata");
             return false;
+        }
+    }
+    // For multi-chunk aggregate BLOBFILEs: weights sharing the same path must
+    // have non-overlapping byte ranges [offset, offset + logical_bytes). The
+    // legacy single-tensor-per-file layout (offset=64, one weight per path)
+    // trivially satisfies this check.
+    for (int i = 0; i < plan->n_weights; i++) {
+        const OrionBindingPlanWeight* a = &plan->weights[i];
+        for (int j = i + 1; j < plan->n_weights; j++) {
+            const OrionBindingPlanWeight* b = &plan->weights[j];
+            if (strcmp(a->path, b->path) != 0) continue;
+            uint64_t a_end = a->offset + a->logical_bytes;
+            uint64_t b_end = b->offset + b->logical_bytes;
+            if (a->offset < b_end && b->offset < a_end) {
+                set_error(error, error_size,
+                          "binding-plan weights '%s' and '%s' overlap in '%s'",
+                          a->name, b->name, a->path);
+                return false;
+            }
         }
     }
     return true;

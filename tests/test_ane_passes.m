@@ -339,6 +339,112 @@ static bool test_binding_plan_hashes_and_sizes_weights(void) {
         rejects_truncated && rejects_malformed;
 }
 
+// G009: Verify the binding plan accepts a multi-chunk aggregate BLOBFILE
+// where two weights share one physical file at different chunk offsets.
+// Layout matches the diagnostic probe: 64-byte chunk headers between payloads.
+static bool test_binding_plan_accepts_multichunk_aggregate(void) {
+    NSString* root = [NSTemporaryDirectory() stringByAppendingPathComponent:
+        [NSString stringWithFormat:@"orion-aggregate-%@", NSUUID.UUID.UUIDString]];
+    [[NSFileManager defaultManager] createDirectoryAtPath:root
+        withIntermediateDirectories:YES attributes:nil error:nil];
+
+    // Layout: [BLOB_HDR 128][chunk0_hdr 64][payload0 8][chunk1_hdr 64][payload1 8]
+    // Total = 128 + 64 + 8 + 64 + 8 = 272. payload_size = 272 - 128 = 144.
+    NSString* agg_path = [root stringByAppendingPathComponent:@"aggregate.blob"];
+    NSMutableData* data = [NSMutableData dataWithLength:272];
+    uint8_t* bytes = data.mutableBytes;
+    bytes[0] = 0x01; bytes[4] = 0x02;
+    bytes[64] = 0xef; bytes[65] = 0xbe; bytes[66] = 0xad; bytes[67] = 0xde;
+    bytes[68] = 0x01;
+    bytes[72] = 144;  // payload_size
+    bytes[80] = 128;  // data_offset
+    // Chunk 0 header at offset 128, payload at 192.
+    bytes[128] = 0xef; bytes[129] = 0xbe; bytes[130] = 0xad; bytes[131] = 0xde;
+    bytes[132] = 0x01;
+    // Chunk 1 header at offset 200, payload at 264.
+    bytes[200] = 0xef; bytes[201] = 0xbe; bytes[202] = 0xad; bytes[203] = 0xde;
+    bytes[204] = 0x01;
+    // Payloads.
+    for (int i = 0; i < 8; i++) bytes[192 + i] = (uint8_t)(i + 1);
+    for (int i = 0; i < 8; i++) bytes[264 + i] = (uint8_t)(i + 10);
+    [data writeToFile:agg_path atomically:YES];
+
+    OrionGraph* g = orion_graph_create();
+    int input_shape[4] = {1, 2, 1, 16};
+    int weight_shape[4] = {2, 2, 1, 1};
+    int x = orion_gb_input(g, "x", ORION_DTYPE_FP16, input_shape);
+    // Two weights: chunk0 at offset 128, chunk1 at offset 200.
+    int w0 = orion_gb_const_weight(g, "w0", ORION_DTYPE_FP16, weight_shape,
+                                   "@model_path/aggregate.blob", 128);
+    int w1 = orion_gb_const_weight(g, "w1", ORION_DTYPE_FP16, weight_shape,
+                                   "@model_path/aggregate.blob", 200);
+    int conv0 = orion_gb_conv1x1(g, x, w0, -1, "c0", 2, 16);
+    int conv1 = orion_gb_conv1x1(g, conv0, w1, -1, "c1", 2, 16);
+    orion_gb_output(g, conv1, "y");
+
+    OrionBindingPlanIdentity identity = {
+        .orion_revision = "0123456789abcdef0123456789abcdef01234567",
+        .compiler_build = "test-clang",
+        .weight_root = root.fileSystemRepresentation,
+    };
+    OrionBindingPlan plan;
+    char error[256] = {0};
+    bool ok = orion_binding_plan_generate_with_identity(
+        g, "aggregate-test", &identity, &plan, error, sizeof(error));
+    orion_graph_free(g);
+    [[NSFileManager defaultManager] removeItemAtPath:root error:nil];
+    return ok && plan.n_weights == 2 &&
+           plan.weights[0].offset == 128 && plan.weights[1].offset == 200;
+}
+
+// G009: Verify the binding plan rejects two weights that overlap in the same
+// aggregate BLOBFILE.
+static bool test_binding_plan_rejects_overlapping_chunks(void) {
+    NSString* root = [NSTemporaryDirectory() stringByAppendingPathComponent:
+        [NSString stringWithFormat:@"orion-overlap-%@", NSUUID.UUID.UUIDString]];
+    [[NSFileManager defaultManager] createDirectoryAtPath:root
+        withIntermediateDirectories:YES attributes:nil error:nil];
+
+    // Layout with chunk headers: [BLOB_HDR 128][chunk0_hdr 64][payload0 8]
+    // w1 overlaps: its chunk header at 132 means payload at 196, overlapping payload0 at [192,200).
+    NSString* agg_path = [root stringByAppendingPathComponent:@"aggregate.blob"];
+    NSMutableData* data = [NSMutableData dataWithLength:272];
+    uint8_t* bytes = data.mutableBytes;
+    bytes[0] = 0x01; bytes[4] = 0x02;
+    bytes[64] = 0xef; bytes[65] = 0xbe; bytes[66] = 0xad; bytes[67] = 0xde;
+    bytes[68] = 0x01; bytes[72] = 144; bytes[80] = 128;
+    [data writeToFile:agg_path atomically:YES];
+
+    OrionGraph* g = orion_graph_create();
+    int input_shape[4] = {1, 2, 1, 16};
+    int weight_shape[4] = {2, 2, 1, 1};
+    int x = orion_gb_input(g, "x", ORION_DTYPE_FP16, input_shape);
+    // w0 at offset 128, w1 at offset 132 — their payloads (at +64) overlap.
+    int w0 = orion_gb_const_weight(g, "w0", ORION_DTYPE_FP16, weight_shape,
+                                   "@model_path/aggregate.blob", 128);
+    int w1 = orion_gb_const_weight(g, "w1", ORION_DTYPE_FP16, weight_shape,
+                                   "@model_path/aggregate.blob", 132);
+    int conv0 = orion_gb_conv1x1(g, x, w0, -1, "c0", 2, 16);
+    int conv1 = orion_gb_conv1x1(g, conv0, w1, -1, "c1", 2, 16);
+    orion_gb_output(g, conv1, "y");
+
+    OrionBindingPlanIdentity identity = {
+        .orion_revision = "0123456789abcdef0123456789abcdef01234567",
+        .compiler_build = "test-clang",
+        .weight_root = root.fileSystemRepresentation,
+    };
+    OrionBindingPlan plan;
+    char error[256] = {0};
+    // Plan generation should succeed (the generate function builds the plan)
+    // but validation should catch the overlap. Actually, generate calls
+    // validate internally — so this should return false.
+    bool rejects = !orion_binding_plan_generate_with_identity(
+        g, "overlap-test", &identity, &plan, error, sizeof(error));
+    orion_graph_free(g);
+    [[NSFileManager defaultManager] removeItemAtPath:root error:nil];
+    return rejects;
+}
+
 static bool test_graph_validation_rejects_bad_operator_shapes(void) {
     int shape[4] = {1, 4, 1, 4};
     int shape_const_shape[4] = {4, 0, 0, 0};
@@ -493,6 +599,8 @@ int main(int argc __attribute__((unused)), char* argv[] __attribute__((unused)))
         TEST(binding_plan_serializes_deterministically);
         TEST(binding_plan_identity_includes_io_abi);
         TEST(binding_plan_hashes_and_sizes_weights);
+        TEST(binding_plan_accepts_multichunk_aggregate);
+        TEST(binding_plan_rejects_overlapping_chunks);
         TEST(graph_validation_rejects_bad_operator_shapes);
         TEST(binding_plan_rejects_malformed_fixed_strings);
         TEST(validate_finalized_requires_mil_identity);
