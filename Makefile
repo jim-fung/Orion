@@ -128,7 +128,8 @@ TEST_NAMES = \
 	test_voxtream_depth_loop_ane \
 	test_voxtream_probe_channels \
 	test_voxtream_seqpack_plan_verified \
-	test_m5_compile_limit
+	test_m5_compile_limit \
+	test_voxtream_seqpack_timing
 
 # Compiler tests (link with compiler objects, not full library)
 COMPILER_TEST_NAMES = \
