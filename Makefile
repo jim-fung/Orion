@@ -131,7 +131,9 @@ COMPILER_TEST_NAMES = \
 	test_graph_ir \
 	test_passes \
 	test_ane_passes \
-	test_compiler_equiv
+	test_compiler_equiv \
+	test_orion_error \
+	test_orion_ledger
 
 TEST_BINS = $(patsubst %,$(BUILDDIR)/tests/%,$(TEST_NAMES))
 COMPILER_TEST_BINS = $(patsubst %,$(BUILDDIR)/tests/%,$(COMPILER_TEST_NAMES))
@@ -217,6 +219,16 @@ $(BUILDDIR)/tests/test_ane_passes: tests/test_ane_passes.m $(COMPILER_OBJ)
 $(BUILDDIR)/tests/test_compiler_equiv: tests/test_compiler_equiv.m $(COMPILER_OBJ)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -framework Foundation -o $@ $< $(COMPILER_OBJ)
+
+# Standalone pure-C compiler-only tests (ORX-400 / ORX-408): no runtime or
+# compiler object dependencies, link only Foundation.
+$(BUILDDIR)/tests/test_orion_error: tests/test_orion_error.c core/orion_error.c
+	@mkdir -p $(dir $@)
+	$(CC) -O2 -Wall -Wextra -I . -I core -o $@ tests/test_orion_error.c core/orion_error.c -framework Foundation
+
+$(BUILDDIR)/tests/test_orion_ledger: tests/test_orion_ledger.c core/orion_compile_ledger.c
+	@mkdir -p $(dir $@)
+	$(CC) -O2 -Wall -Wextra -I . -I core -o $@ tests/test_orion_ledger.c core/orion_compile_ledger.c -framework Foundation
 
 # Run benchmarks
 bench: orion
