@@ -120,7 +120,8 @@ TEST_NAMES = \
 	test_plan_weight_dict \
 	test_voxtream_depth_ane \
 	test_voxtream_depth_chain_ane \
-	test_voxtream_multichunk_blob_ane
+	test_voxtream_multichunk_blob_ane \
+	test_voxtream_aggregate_layer_ane
 
 # Compiler tests (link with compiler objects, not full library)
 COMPILER_TEST_NAMES = \
