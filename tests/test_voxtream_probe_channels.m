@@ -76,6 +76,8 @@ int main(void) {
             kind_label = @"conv (d×d linear projection)";
         } else if ([kind isEqualToString:@"depth_layer"]) {
             kind_label = @"depth_layer (full channel-packed layer graph)";
+        } else if ([kind isEqualToString:@"seq_pack"]) {
+            kind_label = @"seq_pack (sequence-packed layer graph, 2 branches)";
         } else {
             kind_label = @"identity (weight-free elementwise add)";
         }
@@ -87,6 +89,8 @@ int main(void) {
             graph = orion_frontend_voxtream_depth_probe_conv_adapter(0, 0, NULL);
         } else if ([kind isEqualToString:@"depth_layer"]) {
             graph = orion_frontend_voxtream_depth_probe_depth_layer_adapter(0, 0, NULL);
+        } else if ([kind isEqualToString:@"seq_pack"]) {
+            graph = orion_frontend_voxtream_depth_probe_seq_pack_adapter(0, 0, NULL);
         } else {
             graph = orion_frontend_voxtream_depth_probe_identity_adapter(0, 0, NULL);
         }
@@ -170,6 +174,34 @@ int main(void) {
             wdict[@"@model_path/constants/rope_k_sin.bin"]  = entry(make_blob(kv, s));
             wdict[@"@model_path/constants/rope_k_perm.bin"] = entry(make_blob(kv, kv));
             wdict[@"@model_path/constants/causal_mask.bin"] = entry(make_blob(s, s));
+        } else if ([kind isEqualToString:@"seq_pack"]) {
+            // Sequence-pack uses PRODUCTION dims (d=1024, unchanged). The seq
+            // axis is doubled (default 64 = 2x32) to hold both branches. All
+            // projection weights are production-shaped; only the constants differ
+            // (packed block-diagonal mask + duplicated RoPE tables, _packed.bin).
+            const int D = 1024;  // production dim, NOT doubled
+            const int kv = 256;  // n_kv_heads(2) * head_dim(128)
+            const int H = 8192;  // production hidden_dim
+            const int sp = s;    // packed seq (default 64)
+            // Production weights (reused unchanged per the ORX-103 proof).
+            wdict[@"@model_path/weights/layer0/rms1.bin"] = entry(make_blob(1, D));
+            wdict[@"@model_path/weights/layer0/wq.bin"]   = entry(make_blob(D, D));
+            wdict[@"@model_path/weights/layer0/wk.bin"]   = entry(make_blob(kv, D));
+            wdict[@"@model_path/weights/layer0/wv.bin"]   = entry(make_blob(kv, D));
+            wdict[@"@model_path/weights/layer0/wo.bin"]   = entry(make_blob(D, D));
+            wdict[@"@model_path/weights/layer0/rms2.bin"] = entry(make_blob(1, D));
+            wdict[@"@model_path/weights/layer0/w1.bin"]   = entry(make_blob(H, D));
+            wdict[@"@model_path/weights/layer0/w2.bin"]   = entry(make_blob(D, H));
+            wdict[@"@model_path/weights/layer0/w3.bin"]   = entry(make_blob(H, D));
+            // Packed constants: duplicated RoPE tables + block-diagonal mask.
+            // rope_q_packed: [1, D, 1, sp], rope_k_packed: [1, kv, 1, sp].
+            wdict[@"@model_path/constants/rope_q_cos_packed.bin"]  = entry(make_blob(D, sp));
+            wdict[@"@model_path/constants/rope_q_sin_packed.bin"]  = entry(make_blob(D, sp));
+            wdict[@"@model_path/constants/rope_q_perm.bin"]        = entry(make_blob(D, D));
+            wdict[@"@model_path/constants/rope_k_cos_packed.bin"]  = entry(make_blob(kv, sp));
+            wdict[@"@model_path/constants/rope_k_sin_packed.bin"]  = entry(make_blob(kv, sp));
+            wdict[@"@model_path/constants/rope_k_perm.bin"]        = entry(make_blob(kv, kv));
+            wdict[@"@model_path/constants/causal_mask_packed.bin"] = entry(make_blob(sp, sp));
         }
         NSDictionary* weight_dict = wdict;
 

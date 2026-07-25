@@ -61,6 +61,8 @@ OrionGraph* orion_frontend_voxtream_depth_probe_rms_adapter(
     int layer, int bucket, const OrionModelConfig* config);
 OrionGraph* orion_frontend_voxtream_depth_probe_depth_layer_adapter(
     int layer, int bucket, const OrionModelConfig* config);
+OrionGraph* orion_frontend_voxtream_depth_probe_seq_pack_adapter(
+    int layer, int bucket, const OrionModelConfig* config);
 
 OrionGraph* orion_frontend_voxtream_depth_qperm_adapter(
     int layer, int bucket, const OrionModelConfig* config);
