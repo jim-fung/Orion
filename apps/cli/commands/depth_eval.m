@@ -1,12 +1,21 @@
 // apps/cli/commands/depth_eval.m
 //
-// orion depth-eval — drive the VoXtream 15-step separate-CFG depth loop on the
-// ANE from Python via subprocess. The depth-loop logic is ported verbatim from
-// tests/test_voxtream_depth_loop_ane.m (the proven Epic I harness); this file
-// wraps it with CLI arg parsing, npz/raw-fp16 input, optional fp16 output
-// capture, JSON evidence to file or stdout, a configurable compile-budget
-// guard, and non-zero exit codes mapped onto the Orion native failure taxonomy
-// (core/orion_error.h).
+// orion depth-eval — drive the VoXtream depth loop on the ANE from Python via
+// subprocess. Two modes:
+//
+//   (1) DIAGNOSTIC (default): fixed-input 15-step separate-CFG latency/parity
+//       probe. Reuses the two packed-hidden inputs across all 15 steps; does
+//       NOT sample tokens. Useful only for shape-dependent timing and
+//       layer-0 parity. This is what ORX-005 corrected: it is NOT a real
+//       dependent token loop and does NOT establish the 60ms budget.
+//
+//   (2) RECURRENCE (--recurrence): REAL 15-step autoregressive token loop.
+//       Builds the production prefix [last_hidden, c0_embed, c1_embed, ...],
+//       runs 4 real layer programs + final norm per step, reads the active
+//       position, runs audio_head GEMV (Accelerate cblas_sgemv), CFG combine
+//       (cond*gamma + (1-gamma)*uncond), argmax, looks up the codebook
+//       embedding (audio_embeddings[token + codebook*2050]), and feeds it
+//       back into both CFG branches. Writes tokens.bin (15 LE int32).
 //
 // Usage:
 //   orion depth-eval --export-dir <path>
@@ -15,6 +24,11 @@
 //                    [--evidence <evidence.json>]
 //                    [--max-compile N]
 //                    [--samples N] [--warmup N] [--host-overhead-ms F]
+//                    [--protocol-version N | --protocol-info]
+//                    [--recurrence]
+//                    [--embeddings <audio_embeddings.fp32.bin>]
+//                    [--audio-head <audio_head.fp32.bin>]
+//                    [--c0 N] [--gamma F]
 //
 //   --export-dir     VoXtream v16 export directory (manifest, weights/,
 //                    ane_references/, constants/). Falls back to the
@@ -22,6 +36,9 @@
 //   --input          Either a numpy .npz holding fp16 [1,1024,1,32] members
 //                    `hidden_cond` and `hidden_uncond`, OR a directory
 //                    containing `hidden_cond.fp16.bin` / `hidden_uncond.fp16.bin`.
+//                    In --recurrence mode these are the post-speaker-projection
+//                    last_hidden state per CFG branch (still fp16 [1,1024,1,32];
+//                    slot 0 holds last_hidden, the rest are ignored).
 //                    Omit to use <export-dir>/ane_references/packed_hidden.batch{0,1}.fp16.bin
 //                    (the existing test fixtures).
 //   --output         Directory to receive the captured final-norm output hidden
@@ -35,16 +52,31 @@
 //   --samples        Timed full-loop samples (default 30, max 100).
 //   --warmup         Untimed warmup loops (default 2, max 20).
 //   --host-overhead-ms  External host logits/sampling/embedding estimate (default 0).
+//   --protocol-version N  Advertise a wire-protocol version (default 1). Echoed
+//                    as evidence.protocol_version. Only N=1 is currently
+//                    supported; any other value returns exit 9.
+//   --protocol-info  Print a JSON capabilities object to stdout and exit 0
+//                    without touching the ANE. Used by the Python runner to
+//                    negotiate before invoking.
+//   --recurrence     Enable REAL autoregressive 15-step token production.
+//   --embeddings     Path to audio_embeddings as raw LE fp32, shape [32800,1024]
+//                    row-major. Required for --recurrence.
+//   --audio-head     Path to audio_head as raw LE fp32, shape [15,1024,2050]
+//                    row-major. Default: <export-dir>/audio_head.fp32.bin if present.
+//   --c0             Semantic codebook-0 token (int, 0..2049). Required for --recurrence.
+//   --gamma          Acoustic CFG scale (default 3.0).
 //
-// Weight strategy (2 compiles total, donor-patched layers 1-3):
-//   - Layer 0:      generate aggregate graph, rewrite blob refs, compile once.
-//   - Layers 1-3:   orion_program_patch_weights() from the layer-0 donor (0 compiles).
-//   - Final norm:   compile once via orion_frontend_voxtream_depth_final_norm().
+// Weight strategy (recurrence mode: 5 compiles, no aliasing):
+//   - Each layer 0..3: generate aggregate graph, build real layer-N blob,
+//     compile once (M5 Pro has no practical compile limit).
+//   - Final norm: compile once via orion_frontend_voxtream_depth_final_norm().
+// Diagnostic mode keeps the 2-compile donor-patch path for backward compat.
 //
 // Building this command consumes ZERO ANE compile budget; only invoking it does.
 
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurface.h>
+#import <Accelerate/Accelerate.h>
 #include <mach/mach_time.h>
 #include <math.h>
 #include <stdint.h>
@@ -82,6 +114,20 @@
 #define DEFAULT_SAMPLES 30
 #define DEFAULT_WARMUP 2
 #define MAX_ITERATION_SAMPLES (MAX_SAMPLES * ITERATIONS_PER_SAMPLE)
+
+// -- Recurrence (real token production) --------------------------------------
+// Production depth recurrence emits 15 acoustic tokens. cfg_acoustic=3.0 by
+// default. The audio vocab is 2050 per codebook (2048 Mimi + 2 specials); the
+// embedding table is [num_codebooks(16) * 2050, 1024] = [32800, 1024] fp32.
+#define NUM_CODEBOOKS 16
+#define AUDIO_VOCAB 2050
+#define AUDIO_EMBED_ROWS (NUM_CODEBOOKS * AUDIO_VOCAB)   // 32800
+#define AUDIO_EMBED_DIM DIM                              // 1024
+#define AUDIO_HEAD_STEPS 15                              // codebooks 1..15
+#define DEFAULT_CFG_GAMMA 3.0
+#define PROTOCOL_VERSION 1
+#define RECURRENCE_EMBED_BYTES ((size_t)AUDIO_EMBED_ROWS * AUDIO_EMBED_DIM * sizeof(float))
+#define RECURRENCE_HEAD_BYTES  ((size_t)AUDIO_HEAD_STEPS * DIM * AUDIO_VOCAB * sizeof(float))
 // The execution contract discards padding token slots [16, 32); parity is gated
 // on logical tokens [0, 16) exactly like the aggregate-layer harness.
 #define LOGICAL_TOKENS ORION_VOXTREAM_DEPTH_BUCKET
@@ -273,14 +319,32 @@ static NSData *build_aggregate_blob(NSString *root, int layer) {
 }
 
 // Point every BLOBFILE const in the graph at the aggregate file chunk table.
-static bool rewrite_blob_refs(OrionGraph *g, int *rewritten) {
+// The graph for layer N emits MIL paths `@model_path/weights/layer{N}/...`,
+// so we match against the layer-N-renamed table. Constants under
+// `constants/...` are shared across all layers (same mil_path).
+static bool rewrite_blob_refs(OrionGraph *g, int layer, int *rewritten) {
     *rewritten = 0;
+    // Build the layer-N mil_path table for matching. Weight entries use
+    // `layer{N}`; constant entries keep their fixed `constants/...` path.
+    char layer_mil[32][256];
+    const char *prefix = "weights/layer0/";
+    for (int j = 0; j < kEntryCount; j++) {
+        const char *path = kEntries[j].mil_path;
+        if (strncmp(path + strlen("@model_path/"), prefix,
+                    strlen(prefix)) == 0) {
+            snprintf(layer_mil[j], sizeof(layer_mil[j]),
+                     "@model_path/weights/layer%d/%s", layer,
+                     path + strlen("@model_path/") + strlen(prefix));
+        } else {
+            snprintf(layer_mil[j], sizeof(layer_mil[j]), "%s", path);
+        }
+    }
     for (int i = 0; i < g->n_nodes; i++) {
         OrionNode *node = &g->nodes[i];
         if (node->op != ORION_OP_CONST || !node->attrs.blob_path[0]) continue;
         bool found = false;
         for (int j = 0; j < kEntryCount; j++) {
-            if (strcmp(node->attrs.blob_path, kEntries[j].mil_path) == 0) {
+            if (strcmp(node->attrs.blob_path, layer_mil[j]) == 0) {
                 snprintf(node->attrs.blob_path, sizeof(node->attrs.blob_path),
                          "@model_path/aggregate.bin");
                 node->attrs.blob_offset = kEntries[j].chunk_offset;
@@ -300,7 +364,7 @@ static bool rewrite_blob_refs(OrionGraph *g, int *rewritten) {
 
 // Validate + optimize (production passes) but skip the ANE plan validation
 // that enforces one tensor per file at offset 64, then emit MIL directly.
-static NSString *generate_aggregate_mil(OrionGraph *g, int *rewritten) {
+static NSString *generate_aggregate_mil(OrionGraph *g, int layer, int *rewritten) {
     if (!g) return nil;
     OrionValidationResult vr = orion_graph_validate(g);
     if (!vr.valid) {
@@ -309,7 +373,7 @@ static NSString *generate_aggregate_mil(OrionGraph *g, int *rewritten) {
         return nil;
     }
     orion_pipeline_optimize(g);
-    if (!rewrite_blob_refs(g, rewritten)) {
+    if (!rewrite_blob_refs(g, layer, rewritten)) {
         orion_graph_free(g);
         return nil;
     }
@@ -573,7 +637,8 @@ static void print_depth_eval_help(void) {
     fprintf(stderr,
         "Usage: orion depth-eval --export-dir <path> [options]\n"
         "\n"
-        "Drive the VoXtream 15-step separate-CFG depth loop on the ANE.\n"
+        "Drive the VoXtream depth loop on the ANE. Default mode is a fixed-input\n"
+        "diagnostic latency probe; --recurrence enables real token production.\n"
         "\n"
         "Options:\n"
         "  --export-dir PATH        VoXtream v16 export directory (required, or\n"
@@ -590,7 +655,138 @@ static void print_depth_eval_help(void) {
         "  --samples N              Timed full-loop samples (default 30, max 100).\n"
         "  --warmup N               Untimed warmup loops (default 2, max 20).\n"
         "  --host-overhead-ms F     External host overhead estimate (default 0).\n"
+        "  --protocol-version N     Advertise wire-protocol version (default 1).\n"
+        "  --protocol-info          Print JSON capabilities and exit 0.\n"
+        "  --recurrence             REAL 15-step autoregressive token production.\n"
+        "  --embeddings PATH        audio_embeddings raw LE fp32 [32800,1024]\n"
+        "                           (required for --recurrence).\n"
+        "  --audio-head PATH        audio_head raw LE fp32 [15,1024,2050]\n"
+        "                           (default: <export-dir>/audio_head.fp32.bin).\n"
+        "  --c0 N                   Semantic codebook-0 token (0..2049).\n"
+        "  --gamma F                Acoustic CFG scale (default 3.0).\n"
         "  --help                   Show this help message.\n");
+}
+
+// Emit the protocol-info capabilities object and exit. No ANE touched.
+static int emit_protocol_info(void) {
+    NSDictionary *info = @{
+        @"schema": @"orion.cli.depth-eval-protocol-info/1",
+        @"command": @"depth-eval",
+        @"supported_min": @(1),
+        @"supported_max": @(1),
+        @"default_when_omitted": @(1),
+        @"legacy_omission_supported": @(YES),
+        @"capabilities": @{
+            @"final_norm_outputs": @(YES),
+            @"token_outputs": @(YES),       // when --recurrence is used
+            @"recurrence": @(YES),
+            @"separate_cfg_abi": @(YES),
+            @"sequence_pack_abi": @(NO),    // deferred per ORX-005
+            @"atomic_output_set": @(NO),    // current writer is per-file atomic only
+        },
+    };
+    NSData *j = [NSJSONSerialization dataWithJSONObject:info
+        options:NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys error:nil];
+    NSString *s = [[NSString alloc] initWithBytes:j.bytes length:j.length
+                                          encoding:NSUTF8StringEncoding];
+    printf("%s\n", s.UTF8String);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Recurrence helpers (real token production).
+//
+// The recurrence state per CFG branch is the full prefix in [last_hidden,
+// c0_embed, c1_embed, ..., c{n-1}_embed] order, laid out in the [1,1024,1,32]
+// ANE surface. Slot 0 = last_hidden, slot 1 = c0_embed, slot k+2 = c{k}_embed.
+// Slots beyond the active prefix are zero-padded. The ANE graph has fixed
+// RoPE positions 0..31 and a fixed full causal mask, so feeding the growing
+// prefix at slots 0..prefix_len-1 and reading slot prefix_len-1 reproduces
+// cached decoding exactly (attention is causal, so future padded slots do
+// not affect the active position).
+// ---------------------------------------------------------------------------
+
+// Convert one fp16 hidden row of length DIM to fp32 (for cblas_sgemv).
+static void fp16_row_to_f32(const _Float16 *surface, int slot, float *out) {
+    const _Float16 *row = surface + (size_t)slot * DIM;
+    for (int c = 0; c < DIM; c++) out[c] = (float)row[c];
+}
+
+// audio_head GEMV: logits[V] = hidden[D] @ head[D, V], fp32 accumulation.
+// head is row-major [D, V]. Returns logits in `out` (caller-allocated, V floats).
+static void audio_head_gemv(const float *hidden, const float *head,
+                            int D, int V, float *out) {
+    cblas_sgemv(CblasRowMajor, CblasNoTrans, V, D, 1.0f,
+                head, D, hidden, 1, 0.0f, out, 1);
+}
+
+// CFG combine: out[V] = cond[V]*gamma + uncond[V]*(1-gamma).
+static void cfg_combine(const float *cond, const float *uncond,
+                        int V, float gamma, float *out) {
+    float w1 = (float)gamma;
+    float w2 = 1.0f - w1;
+    vDSP_vsmul(cond, 1, &w1, out, 1, (vDSP_Length)V);
+    vDSP_vsma(uncond, 1, &w2, out, 1, out, 1, (vDSP_Length)V);
+}
+
+// Argmax over V floats, deterministic (first max wins on tie).
+static int argmax_float(const float *v, int V) {
+    int best = 0;
+    float best_val = v[0];
+    for (int i = 1; i < V; i++) {
+        if (v[i] > best_val) { best_val = v[i]; best = i; }
+    }
+    return best;
+}
+
+// Write a row of the prefix into the fp16 surface at the given slot. The row
+// source is fp32 (audio_embeddings are stored fp32); we convert to fp16.
+static void write_prefix_slot_fp32(_Float16 *surface, int slot,
+                                   const float *row_f32, int dim) {
+    _Float16 *dst = surface + (size_t)slot * DIM;
+    for (int c = 0; c < dim; c++) dst[c] = (_Float16)row_f32[c];
+}
+
+// Write a fp16 row (e.g. last_hidden) into the surface at the given slot.
+static void write_prefix_slot_fp16(_Float16 *surface, int slot,
+                                   const _Float16 *row_fp16, int dim) {
+    _Float16 *dst = surface + (size_t)slot * DIM;
+    memcpy(dst, row_fp16, (size_t)dim * sizeof(_Float16));
+}
+
+// Zero the entire [1, DIM, SEQ] surface.
+static void zero_surface(_Float16 *surface) {
+    memset(surface, 0, TENSOR_BYTES);
+}
+
+// Write the 15 sampled tokens as little-endian int32 to <output_dir>/tokens.bin.
+// Returns true on success. Creates the directory if needed.
+static bool write_tokens_bin(NSString *output_dir, const int32_t *tokens,
+                             int count) {
+    if (!output_dir) return false;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL is_dir = NO;
+    if (![fm fileExistsAtPath:output_dir isDirectory:&is_dir] || !is_dir) {
+        NSError *err = nil;
+        if (![fm createDirectoryAtPath:output_dir
+              withIntermediateDirectories:YES attributes:nil error:&err]) {
+            fprintf(stderr, "depth-eval: cannot create output dir %s: %s\n",
+                    output_dir.UTF8String, err.localizedDescription.UTF8String);
+            return false;
+        }
+    }
+    NSString *path = [output_dir stringByAppendingPathComponent:@"tokens.bin"];
+    NSMutableData *data = [NSMutableData dataWithCapacity:(NSUInteger)count * 4];
+    for (int i = 0; i < count; i++) {
+        uint8_t le[4] = {
+            (uint8_t)((uint32_t)tokens[i] & 0xFF),
+            (uint8_t)(((uint32_t)tokens[i] >> 8) & 0xFF),
+            (uint8_t)(((uint32_t)tokens[i] >> 16) & 0xFF),
+            (uint8_t)(((uint32_t)tokens[i] >> 24) & 0xFF),
+        };
+        [data appendBytes:le length:4];
+    }
+    return [data writeToFile:path atomically:YES];
 }
 
 // ---------------------------------------------------------------------------
@@ -603,10 +799,17 @@ int orion_cmd_depth_eval(int argc, const char *argv[]) {
         const char *input_arg = NULL;
         const char *output_arg = NULL;
         const char *evidence_arg = NULL;
+        const char *embeddings_arg = NULL;
+        const char *audio_head_arg = NULL;
         int max_compile = DEFAULT_MAX_COMPILE;
         int sample_count = DEFAULT_SAMPLES;
         int warmup_count = DEFAULT_WARMUP;
         double host_overhead_ms = 0.0;
+        int protocol_version = PROTOCOL_VERSION;
+        int c0_token = -1;
+        double cfg_gamma = DEFAULT_CFG_GAMMA;
+        bool recurrence_mode = false;
+        bool protocol_info_mode = false;
 
         for (int i = 1; i < argc; i++) {
             if (strcmp(argv[i], "--export-dir") == 0 && i + 1 < argc) {
@@ -625,6 +828,20 @@ int orion_cmd_depth_eval(int argc, const char *argv[]) {
                 warmup_count = atoi(argv[++i]);
             } else if (strcmp(argv[i], "--host-overhead-ms") == 0 && i + 1 < argc) {
                 host_overhead_ms = atof(argv[++i]);
+            } else if (strcmp(argv[i], "--protocol-version") == 0 && i + 1 < argc) {
+                protocol_version = atoi(argv[++i]);
+            } else if (strcmp(argv[i], "--protocol-info") == 0) {
+                protocol_info_mode = true;
+            } else if (strcmp(argv[i], "--recurrence") == 0) {
+                recurrence_mode = true;
+            } else if (strcmp(argv[i], "--embeddings") == 0 && i + 1 < argc) {
+                embeddings_arg = argv[++i];
+            } else if (strcmp(argv[i], "--audio-head") == 0 && i + 1 < argc) {
+                audio_head_arg = argv[++i];
+            } else if (strcmp(argv[i], "--c0") == 0 && i + 1 < argc) {
+                c0_token = atoi(argv[++i]);
+            } else if (strcmp(argv[i], "--gamma") == 0 && i + 1 < argc) {
+                cfg_gamma = atof(argv[++i]);
             } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
                 print_depth_eval_help();
                 return 0;
@@ -633,6 +850,21 @@ int orion_cmd_depth_eval(int argc, const char *argv[]) {
                 print_depth_eval_help();
                 return 1;
             }
+        }
+
+        // --protocol-info short-circuits before any ANE or export work.
+        if (protocol_info_mode) {
+            return emit_protocol_info();
+        }
+
+        // Protocol version enforcement: only v1 is supported. Any other value
+        // is an unrecoverable wire mismatch (exit 9, fail-closed).
+        if (protocol_version != PROTOCOL_VERSION) {
+            fprintf(stderr,
+                    "depth-eval: protocol mismatch: requested=%d supported_min=1 "
+                    "supported_max=1\n",
+                    protocol_version);
+            return 9;
         }
 
         if (max_compile < 0) max_compile = 0;
@@ -645,6 +877,22 @@ int orion_cmd_depth_eval(int argc, const char *argv[]) {
             return 1;
         }
         if (host_overhead_ms < 0.0) host_overhead_ms = 0.0;
+        if (cfg_gamma < 0.0) cfg_gamma = DEFAULT_CFG_GAMMA;
+
+        // Recurrence mode requires embeddings + c0.
+        if (recurrence_mode) {
+            if (!embeddings_arg) {
+                fprintf(stderr,
+                        "depth-eval: --recurrence requires --embeddings PATH\n");
+                return 1;
+            }
+            if (c0_token < 0 || c0_token >= AUDIO_VOCAB) {
+                fprintf(stderr,
+                        "depth-eval: --recurrence requires --c0 N (0..%d)\n",
+                        AUDIO_VOCAB - 1);
+                return 1;
+            }
+        }
 
         // Resolve the export directory (arg overrides env).
         const char *root_env = getenv("VOXTREAM_DEPTH_EXPORT");
@@ -735,6 +983,7 @@ int orion_cmd_depth_eval(int argc, const char *argv[]) {
 
         NSMutableDictionary *evidence = [NSMutableDictionary dictionary];
         evidence[@"schema"] = @"orion.cli.depth-eval/1.0";
+        evidence[@"protocol_version"] = @(PROTOCOL_VERSION);
         evidence[@"export_root"] = root;
         evidence[@"input_source"] = input_arg ? @(input_arg) : @"export-dir-default";
         evidence[@"output_dir"] = output_dir ? output_dir : [NSNull null];
@@ -746,6 +995,13 @@ int orion_cmd_depth_eval(int argc, const char *argv[]) {
         evidence[@"samples_requested"] = @(sample_count);
         evidence[@"warmup"] = @(warmup_count);
         evidence[@"max_compile"] = @(max_compile);
+        evidence[@"recurrence_mode"] = @(recurrence_mode);
+        evidence[@"cfg_gamma"] = @(cfg_gamma);
+        if (recurrence_mode) {
+            evidence[@"c0_token"] = @(c0_token);
+            evidence[@"embeddings_source"] = embeddings_arg ? @(embeddings_arg) : [NSNull null];
+            evidence[@"audio_head_source"] = audio_head_arg ? @(audio_head_arg) : @"export-dir-default";
+        }
         evidence[@"operating_system"] =
             [[NSProcessInfo processInfo] operatingSystemVersionString];
         const char *revision = getenv("VOXTREAM_ORION_REVISION");
@@ -754,40 +1010,64 @@ int orion_cmd_depth_eval(int argc, const char *argv[]) {
         evidence[@"compiler_build"] = compiler_build ? @(compiler_build) : @"unspecified";
         evidence[@"compile_count_before"] = @(count_before);
 
-        // ---- Compile programs (2 compiles total) ----------------------------
+        // ---- Compile programs ----------------------------------------------
+        // Recurrence mode: 4 real layer compiles + 1 final norm (no aliasing).
+        // Diagnostic mode: 1 layer-0 compile + 3 donor patches + 1 final norm.
         OrionProgram *layer_programs[LAYERS];
         for (int i = 0; i < LAYERS; i++) layer_programs[i] = nil;
         OrionProgram *final_norm_program = nil;
         int compile_attempts = 0;
         NSString *layer0_mil = nil;
 
-        // Layer 0: one aggregate-layer compile.
-        NSData *aggregate0 = build_aggregate_blob(root, 0);
-        if (!aggregate0) { failure = @"aggregate-build"; }
-        if (!failure) {
-            int rewritten = 0;
-            layer0_mil = generate_aggregate_mil(
-                orion_frontend_voxtream_depth_layer(0), &rewritten);
-            if (!layer0_mil) {
-                failure = @"layer0-mil-generation";
-            } else {
+        if (recurrence_mode) {
+            // Compile each layer with its own real weights.
+            for (int n = 0; n < LAYERS && !failure; n++) {
+                NSData *aggregate_n = build_aggregate_blob(root, n);
+                if (!aggregate_n) { failure = @"aggregate-build"; break; }
+                int rewritten = 0;
+                NSString *mil_n = generate_aggregate_mil(
+                    orion_frontend_voxtream_depth_layer(n), n, &rewritten);
+                if (!mil_n) { failure = @"layer-mil-generation"; break; }
+                if (n == 0) layer0_mil = mil_n;  // retained for diagnostics
+                char tag[32];
+                snprintf(tag, sizeof(tag), "depth-eval-layer%d-real", n);
                 compile_attempts++;
-                layer_programs[0] = orion_compile_mil(layer0_mil.UTF8String,
-                                                      wdict(aggregate0),
-                                                      "depth-eval-layer0");
-                if (!layer_programs[0]) failure = @"layer0-compile";
+                layer_programs[n] = orion_compile_mil(mil_n.UTF8String,
+                                                      wdict(aggregate_n), tag);
+                if (!layer_programs[n]) {
+                    char buf[64];
+                    snprintf(buf, sizeof(buf), "layer%d-compile", n);
+                    failure = @(buf);
+                    break;
+                }
             }
-        }
-
-        // Layers 1-3: weight-patch from the layer-0 donor (zero compiles).
-        for (int n = 1; n < LAYERS && !failure; n++) {
-            NSData *patched = build_aggregate_blob(root, n);
-            if (!patched) { failure = @"aggregate-build"; break; }
-            char tag[32];
-            snprintf(tag, sizeof(tag), "depth-eval-layer%d", n);
-            layer_programs[n] = orion_program_patch_weights(
-                layer_programs[0], layer0_mil.UTF8String, wdict(patched), tag);
-            if (!layer_programs[n]) { failure = @"weight-patch"; break; }
+        } else {
+            // Diagnostic: donor-patch path (2 compiles total).
+            NSData *aggregate0 = build_aggregate_blob(root, 0);
+            if (!aggregate0) { failure = @"aggregate-build"; }
+            if (!failure) {
+                int rewritten = 0;
+                layer0_mil = generate_aggregate_mil(
+                    orion_frontend_voxtream_depth_layer(0), 0, &rewritten);
+                if (!layer0_mil) {
+                    failure = @"layer0-mil-generation";
+                } else {
+                    compile_attempts++;
+                    layer_programs[0] = orion_compile_mil(layer0_mil.UTF8String,
+                                                          wdict(aggregate0),
+                                                          "depth-eval-layer0");
+                    if (!layer_programs[0]) failure = @"layer0-compile";
+                }
+            }
+            for (int n = 1; n < LAYERS && !failure; n++) {
+                NSData *patched = build_aggregate_blob(root, n);
+                if (!patched) { failure = @"aggregate-build"; break; }
+                char tag[32];
+                snprintf(tag, sizeof(tag), "depth-eval-layer%d", n);
+                layer_programs[n] = orion_program_patch_weights(
+                    layer_programs[0], layer0_mil.UTF8String, wdict(patched), tag);
+                if (!layer_programs[n]) { failure = @"weight-patch"; break; }
+            }
         }
 
         // Final norm: one compile.
@@ -982,6 +1262,191 @@ int orion_cmd_depth_eval(int argc, const char *argv[]) {
             timed = !failure && full_loop_count > 0;
         }
 
+        // ---- REAL RECURRENCE LOOP (--recurrence) ---------------------------
+        // Produces 15 real autoregressive tokens. Each step:
+        //   1. Build the full prefix at slots [0, prefix_len).
+        //   2. Zero slots [prefix_len, SEQ).
+        //   3. Run 4 real layer programs + final norm via IOSurface piping.
+        //   4. Read the active position (slot prefix_len-1) from final norm.
+        //   5. GEMV: logits = hidden @ audio_head[codebook-1].
+        //   6. CFG combine cond*gamma + (1-gamma)*uncond.
+        //   7. argmax -> token.
+        //   8. Embedding lookup: row = audio_embeddings[token + codebook*2050].
+        //   9. Append embedding to both branch prefixes for the next step.
+        // One authoritative CFG-combined token sequence; both branches share
+        // the same sampled token from this step onward.
+        int32_t sampled_tokens[DEPTH_STEPS];
+        for (int i = 0; i < DEPTH_STEPS; i++) sampled_tokens[i] = -1;
+        bool recurrence_ok = false;
+        if (!failure && recurrence_mode) {
+            // Load audio_embeddings [32800, 1024] fp32.
+            NSData *emb_data = [NSData dataWithContentsOfFile:@(embeddings_arg)];
+            if (!emb_data || emb_data.length != RECURRENCE_EMBED_BYTES) {
+                fprintf(stderr,
+                        "depth-eval: --embeddings %s missing or wrong size "
+                        "(got %lu bytes, expected %lu)\n",
+                        embeddings_arg, (unsigned long)emb_data.length,
+                        (unsigned long)RECURRENCE_EMBED_BYTES);
+                failure = @"embeddings-load";
+            }
+            // Load audio_head [15, 1024, 2050] fp32.
+            NSData *head_data = nil;
+            NSString *head_path = nil;
+            if (!failure) {
+                head_path = audio_head_arg
+                    ? @(audio_head_arg)
+                    : [root stringByAppendingPathComponent:@"audio_head.fp32.bin"];
+                head_data = [NSData dataWithContentsOfFile:head_path];
+                if (!head_data || head_data.length != RECURRENCE_HEAD_BYTES) {
+                    fprintf(stderr,
+                            "depth-eval: audio_head %s missing or wrong size "
+                            "(got %lu bytes, expected %lu)\n",
+                            head_path.UTF8String, (unsigned long)head_data.length,
+                            (unsigned long)RECURRENCE_HEAD_BYTES);
+                    failure = @"audio-head-load";
+                }
+            }
+            if (!failure) {
+                const float *embeddings = (const float *)emb_data.bytes;
+                const float *audio_head = (const float *)head_data.bytes;
+
+                // Per-branch prefix buffers: [SEQ slots, DIM channels] fp16.
+                _Float16 *prefix[CFG_BRANCHES];
+                float *hidden_cond_f32 = malloc(sizeof(float) * DIM);
+                float *hidden_uncond_f32 = malloc(sizeof(float) * DIM);
+                float *logits_cond = malloc(sizeof(float) * AUDIO_VOCAB);
+                float *logits_uncond = malloc(sizeof(float) * AUDIO_VOCAB);
+                float *combined = malloc(sizeof(float) * AUDIO_VOCAB);
+                prefix[0] = malloc(TENSOR_BYTES);
+                prefix[1] = malloc(TENSOR_BYTES);
+                if (!prefix[0] || !prefix[1] || !hidden_cond_f32 ||
+                    !hidden_uncond_f32 || !logits_cond || !logits_uncond ||
+                    !combined) {
+                    failure = @"recurrence-allocation";
+                }
+
+                if (!failure) {
+                    // Initialize both branches: slot 0 = last_hidden (from
+                    // input slot 0), slot 1 = c0 embedding.
+                    const _Float16 *in_cond = (const _Float16 *)inputs[0].bytes;
+                    const _Float16 *in_uncond = (const _Float16 *)inputs[1].bytes;
+                    zero_surface(prefix[0]);
+                    zero_surface(prefix[1]);
+                    write_prefix_slot_fp16(prefix[0], 0, in_cond, DIM);
+                    write_prefix_slot_fp16(prefix[1], 0, in_uncond, DIM);
+                    const float *c0_embed = embeddings + (size_t)c0_token * AUDIO_EMBED_DIM;
+                    write_prefix_slot_fp32(prefix[0], 1, c0_embed, DIM);
+                    write_prefix_slot_fp32(prefix[1], 1, c0_embed, DIM);
+
+                    int prefix_len = 2;  // slots [0,2) populated after init.
+
+                    for (int step = 0; step < DEPTH_STEPS && !failure; step++) {
+                        // Pack both branches into chain[0]; since the ANE
+                        // graph is per-branch (separate CFG), evaluate each
+                        // branch's prefix separately.
+                        float *hidden_out[2] = {hidden_cond_f32, hidden_uncond_f32};
+                        for (int branch = 0; branch < CFG_BRANCHES && !failure;
+                             branch++) {
+                            // Write the current prefix into chain[0].
+                            orion_tensor_write(chain[0], prefix[branch], TENSOR_BYTES);
+                            // Run 4 layers + final norm.
+                            bool eval_ok = true;
+                            for (int stage = 0; stage < LAYERS; stage++) {
+                                if (!orion_eval(layer_programs[stage],
+                                                &chain[stage], 1,
+                                                &chain[stage + 1], 1)) {
+                                    eval_ok = false; break;
+                                }
+                            }
+                            if (eval_ok && !orion_eval(final_norm_program,
+                                                       &chain[LAYERS], 1,
+                                                       &chain[LAYERS + 1], 1)) {
+                                eval_ok = false;
+                            }
+                            if (!eval_ok) {
+                                failure = @"recurrence-evaluation";
+                                break;
+                            }
+                            // Read the active position's hidden state.
+                            orion_tensor_read(chain[LAYERS + 1], output, TENSOR_BYTES);
+                            int active_slot = prefix_len - 1;
+                            fp16_row_to_f32(output, active_slot, hidden_out[branch]);
+                        }
+                        if (failure) break;
+
+                        // GEMV: logits_branch = hidden_branch @ audio_head[step].
+                        // audio_head is [15, 1024, 2050] row-major, so
+                        // head_row = audio_head + step*DIM*AUDIO_VOCAB.
+                        const float *head_step =
+                            audio_head + (size_t)step * DIM * AUDIO_VOCAB;
+                        audio_head_gemv(hidden_cond_f32, head_step,
+                                        DIM, AUDIO_VOCAB, logits_cond);
+                        audio_head_gemv(hidden_uncond_f32, head_step,
+                                        DIM, AUDIO_VOCAB, logits_uncond);
+
+                        // CFG combine + argmax.
+                        cfg_combine(logits_cond, logits_uncond, AUDIO_VOCAB,
+                                    (float)cfg_gamma, combined);
+                        int token = argmax_float(combined, AUDIO_VOCAB);
+                        sampled_tokens[step] = token;
+
+                        // Embedding lookup + append to both branches.
+                        if (step < DEPTH_STEPS - 1) {
+                            int codebook = step + 1;  // step 0 -> codebook 1
+                            const float *embed_row = embeddings +
+                                (size_t)(token + codebook * AUDIO_VOCAB) * AUDIO_EMBED_DIM;
+                            write_prefix_slot_fp32(prefix[0], prefix_len, embed_row, DIM);
+                            write_prefix_slot_fp32(prefix[1], prefix_len, embed_row, DIM);
+                            prefix_len++;
+                        }
+                    }
+
+                    if (!failure) {
+                        recurrence_ok = true;
+                        // Write tokens.bin to the output dir (or evidence dir's dir).
+                        NSString *token_dir = output_dir;
+                        if (!token_dir && evidence_arg) {
+                            token_dir = [@(evidence_arg) stringByDeletingLastPathComponent];
+                        }
+                        if (token_dir) {
+                            if (write_tokens_bin(token_dir, sampled_tokens, DEPTH_STEPS)) {
+                                fprintf(stderr, "depth-eval: wrote %s/tokens.bin\n",
+                                        token_dir.UTF8String);
+                            } else {
+                                fprintf(stderr,
+                                        "depth-eval: WARNING could not write tokens.bin to %s\n",
+                                        token_dir.UTF8String);
+                            }
+                        } else {
+                            fprintf(stderr,
+                                    "depth-eval: WARNING no --output; tokens not written\n");
+                        }
+                        // Print tokens to stderr for visibility.
+                        fprintf(stderr, "depth-eval tokens:");
+                        for (int i = 0; i < DEPTH_STEPS; i++) {
+                            fprintf(stderr, " %d", sampled_tokens[i]);
+                        }
+                        fprintf(stderr, "\n");
+                    }
+                }
+
+                if (prefix[0]) free(prefix[0]);
+                if (prefix[1]) free(prefix[1]);
+                if (hidden_cond_f32) free(hidden_cond_f32);
+                if (hidden_uncond_f32) free(hidden_uncond_f32);
+                if (logits_cond) free(logits_cond);
+                if (logits_uncond) free(logits_uncond);
+                if (combined) free(combined);
+            }
+        }
+        evidence[@"recurrence_ok"] = @(recurrence_ok);
+        evidence[@"sampled_tokens"] = [NSMutableArray array];
+        if (recurrence_ok) {
+            NSMutableArray *tok = [NSMutableArray arrayWithCapacity:DEPTH_STEPS];
+            for (int i = 0; i < DEPTH_STEPS; i++) [tok addObject:@(sampled_tokens[i])];
+            evidence[@"sampled_tokens"] = tok;
+        }
+
         // ---- Capture final-norm outputs for --output (untimed) -------------
         if (!failure && output_dir) {
             for (int batch = 0; batch < CFG_BRANCHES && !failure; batch++) {
@@ -1046,15 +1511,23 @@ int orion_cmd_depth_eval(int argc, const char *argv[]) {
         evidence[@"host_overhead_ms"] = @(host_overhead_ms);
         evidence[@"host_overhead_basis"] =
             @"external-estimate-not-measured-logits-sampling-embedding";
-        evidence[@"frame_margin_ms"] = @(frame_margin_ms);
+        evidence[@"frame_margin_ms"] = isnan(frame_margin_ms) ? @0 : @(frame_margin_ms);
         evidence[@"margin_target_ms"] = @(MARGIN_TARGET_MS);
         evidence[@"frame_budget_passed"] = @(frame_budget_passed);
 
         const int exit_code = depth_eval_exit_code(failure);
         // `passed` requires parity only when parity references were available.
         const bool parity_ok = parity_run ? parity : true;
-        bool passed = !failure && parity_ok && finite && deterministic &&
-                      depth_budget_passed && compile_delta <= max_compile;
+        // In recurrence mode, success is real token production; the timing
+        // budget gate is informational, not blocking.
+        bool passed;
+        if (recurrence_mode) {
+            passed = !failure && recurrence_ok && finite &&
+                     compile_delta <= max_compile;
+        } else {
+            passed = !failure && parity_ok && finite && deterministic &&
+                     depth_budget_passed && compile_delta <= max_compile;
+        }
         // If a timing gate failed but no lower-level failure occurred, the run
         // still completed; surface the gate miss via evidence + non-zero exit.
         if (!failure && !passed) {
