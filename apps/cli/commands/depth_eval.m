@@ -706,18 +706,25 @@ static int emit_protocol_info(void) {
 // not affect the active position).
 // ---------------------------------------------------------------------------
 
-// Convert one fp16 hidden row of length DIM to fp32 (for cblas_sgemv).
+// Convert one fp16 hidden row of length DIM at the given slot to fp32
+// (for cblas_sgemv). The surface is channel-major [1, DIM, 1, SEQ]:
+// element (channel=c, slot=t) lives at offset c*SEQ + t. So the row for
+// slot `t` is the strided gather surface[c*SEQ + t] for c in [0,DIM).
 static void fp16_row_to_f32(const _Float16 *surface, int slot, float *out) {
-    const _Float16 *row = surface + (size_t)slot * DIM;
-    for (int c = 0; c < DIM; c++) out[c] = (float)row[c];
+    for (int c = 0; c < DIM; c++) {
+        out[c] = (float)surface[(size_t)c * SEQ + slot];
+    }
 }
 
 // audio_head GEMV: logits[V] = hidden[D] @ head[D, V], fp32 accumulation.
-// head is row-major [D, V]. Returns logits in `out` (caller-allocated, V floats).
+// head is stored row-major as [D, V] (i.e. head[d*V + v] = element (d,v)).
+// We compute out[v] = sum_d hidden[d] * head[d,v] = (head.T @ hidden)[v]
+// where head.T is [V, D]. cblas_sgemv with CblasTrans interprets the matrix
+// as (rows=D, cols=V) and computes A.T @ x, giving [V].
 static void audio_head_gemv(const float *hidden, const float *head,
                             int D, int V, float *out) {
-    cblas_sgemv(CblasRowMajor, CblasNoTrans, V, D, 1.0f,
-                head, D, hidden, 1, 0.0f, out, 1);
+    cblas_sgemv(CblasRowMajor, CblasTrans, D, V, 1.0f,
+                head, V, hidden, 1, 0.0f, out, 1);
 }
 
 // CFG combine: out[V] = cond[V]*gamma + uncond[V]*(1-gamma).
@@ -739,24 +746,38 @@ static int argmax_float(const float *v, int V) {
     return best;
 }
 
-// Write a row of the prefix into the fp16 surface at the given slot. The row
-// source is fp32 (audio_embeddings are stored fp32); we convert to fp16.
+// Write a fp32 row (e.g. an audio embedding) into the fp16 surface at the
+// given slot. Channel-major layout: surface[c*SEQ + slot] = row_f32[c].
 static void write_prefix_slot_fp32(_Float16 *surface, int slot,
                                    const float *row_f32, int dim) {
-    _Float16 *dst = surface + (size_t)slot * DIM;
-    for (int c = 0; c < dim; c++) dst[c] = (_Float16)row_f32[c];
+    for (int c = 0; c < dim; c++) {
+        surface[(size_t)c * SEQ + slot] = (_Float16)row_f32[c];
+    }
 }
 
 // Write a fp16 row (e.g. last_hidden) into the surface at the given slot.
+// Source row_fp16 is dense [dim]; surface is channel-major.
 static void write_prefix_slot_fp16(_Float16 *surface, int slot,
                                    const _Float16 *row_fp16, int dim) {
-    _Float16 *dst = surface + (size_t)slot * DIM;
-    memcpy(dst, row_fp16, (size_t)dim * sizeof(_Float16));
+    for (int c = 0; c < dim; c++) {
+        surface[(size_t)c * SEQ + slot] = row_fp16[c];
+    }
 }
 
 // Zero the entire [1, DIM, SEQ] surface.
 static void zero_surface(_Float16 *surface) {
     memset(surface, 0, TENSOR_BYTES);
+}
+
+// Copy one slot column from a channel-major source surface to a slot column
+// of a destination surface. Both are [1, DIM, 1, SEQ]; element (c, t) is at
+// offset c*SEQ + t. Copies DIM elements (one per channel) at the given slots.
+static void copy_slot(_Float16 *dst_surface, int dst_slot,
+                      const _Float16 *src_surface, int src_slot) {
+    for (int c = 0; c < DIM; c++) {
+        dst_surface[(size_t)c * SEQ + dst_slot] =
+            src_surface[(size_t)c * SEQ + src_slot];
+    }
 }
 
 // Write the 15 sampled tokens as little-endian int32 to <output_dir>/tokens.bin.
@@ -1327,13 +1348,13 @@ int orion_cmd_depth_eval(int argc, const char *argv[]) {
 
                 if (!failure) {
                     // Initialize both branches: slot 0 = last_hidden (from
-                    // input slot 0), slot 1 = c0 embedding.
+                    // input slot 0, channel-major), slot 1 = c0 embedding.
                     const _Float16 *in_cond = (const _Float16 *)inputs[0].bytes;
                     const _Float16 *in_uncond = (const _Float16 *)inputs[1].bytes;
                     zero_surface(prefix[0]);
                     zero_surface(prefix[1]);
-                    write_prefix_slot_fp16(prefix[0], 0, in_cond, DIM);
-                    write_prefix_slot_fp16(prefix[1], 0, in_uncond, DIM);
+                    copy_slot(prefix[0], 0, in_cond, 0);
+                    copy_slot(prefix[1], 0, in_uncond, 0);
                     const float *c0_embed = embeddings + (size_t)c0_token * AUDIO_EMBED_DIM;
                     write_prefix_slot_fp32(prefix[0], 1, c0_embed, DIM);
                     write_prefix_slot_fp32(prefix[1], 1, c0_embed, DIM);
