@@ -46,7 +46,8 @@ CLI_SRC = \
 	apps/cli/commands/infer.m \
 	apps/cli/commands/train.m \
 	apps/cli/commands/bench.m \
-	apps/cli/commands/depth_eval.m
+	apps/cli/commands/depth_eval.m \
+	apps/cli/commands/depth_serve.m
 
 # Stage 2: Compiler sources (pure C + ObjC for codegen/adapter)
 COMPILER_C_SRC = \
