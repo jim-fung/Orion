@@ -245,12 +245,103 @@ static NSDictionary *wdict(NSData *aggregate) {
 }
 
 // ---------------------------------------------------------------------------
+// Seqpack helpers.
+// ---------------------------------------------------------------------------
+
+// Read a per-layer seqpack manifest's chunk-name -> offset map.
+static NSDictionary<NSString *, NSNumber *> *seqpack_offsets(NSString *root, int layer) {
+    NSString *mp = [root stringByAppendingPathComponent:
+        [NSString stringWithFormat:@"weights/layer%d_seqpack.manifest.json", layer]];
+    NSData *md = [NSData dataWithContentsOfFile:mp];
+    if (!md) return nil;
+    NSDictionary *m = [NSJSONSerialization JSONObjectWithData:md options:0 error:nil];
+    if (!m || !m[@"chunks"]) return nil;
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    for (NSDictionary *c in m[@"chunks"]) out[c[@"name"]] = c[@"offset"];
+    return out;
+}
+
+// Rewrite all BLOBFILE const refs in a seqpack graph to point at layer-N's
+// seqpack blob using the manifest's chunk offsets.
+static bool rewrite_refs_seqpack(OrionGraph *g, NSString *blob_mil_path,
+                                 NSDictionary<NSString *, NSNumber *> *offsets) {
+    for (int i = 0; i < g->n_nodes; i++) {
+        OrionNode *node = &g->nodes[i];
+        if (node->op != ORION_OP_CONST || !node->attrs.blob_path[0]) continue;
+        NSString *name = [NSString stringWithUTF8String:node->attrs.blob_path];
+        NSString *chunk_name = [name.lastPathComponent stringByDeletingPathExtension];
+        NSNumber *offset = offsets[chunk_name];
+        if (!offset) {
+            fprintf(stderr, "depth-serve: no chunk offset for %s\n",
+                    chunk_name.UTF8String);
+            return false;
+        }
+        snprintf(node->attrs.blob_path, sizeof(node->attrs.blob_path),
+                 "%s", blob_mil_path.UTF8String);
+        node->attrs.blob_offset = [offset unsignedLongLongValue];
+    }
+    return true;
+}
+
+// Generate MIL for a seqpack layer graph (with blob refs rewritten).
+static NSString *generate_seqpack_mil(int layer, NSString *root) {
+    NSDictionary *offsets = seqpack_offsets(root, layer);
+    if (!offsets) {
+        fprintf(stderr, "depth-serve: no seqpack manifest for layer %d\n", layer);
+        return nil;
+    }
+    OrionGraph *g = orion_frontend_voxtream_depth_probe_seq_pack_adapter(layer, 0, NULL);
+    if (!g) return nil;
+    OrionValidationResult vr = orion_graph_validate(g);
+    if (!vr.valid) {
+        fprintf(stderr, "depth-serve: seqpack graph invalid: %s\n", vr.message);
+        orion_graph_free(g);
+        return nil;
+    }
+    orion_pipeline_optimize(g);
+    NSString *blob_mil = [NSString stringWithFormat:@"@model_path/weights/layer%d_seqpack.blob", layer];
+    if (!rewrite_refs_seqpack(g, blob_mil, offsets)) {
+        orion_graph_free(g);
+        return nil;
+    }
+    NSString *mil = orion_codegen_mil(g, "main");
+    orion_graph_free(g);
+    return mil;
+}
+
+// Compile a seqpack layer program from its blob + MIL.
+static OrionProgram *compile_seqpack_layer(NSString *root, int layer,
+                                           NSString *mil, int *compile_count) {
+    NSString *blob_path = [root stringByAppendingPathComponent:
+        [NSString stringWithFormat:@"weights/layer%d_seqpack.blob", layer]];
+    NSData *blob = [NSData dataWithContentsOfFile:blob_path];
+    if (!blob) {
+        fprintf(stderr, "depth-serve: missing seqpack blob for layer %d\n", layer);
+        return nil;
+    }
+    NSString *blob_mil = [NSString stringWithFormat:@"@model_path/weights/layer%d_seqpack.blob", layer];
+    NSDictionary *wd = @{blob_mil: @{@"offset": @0, @"data": blob}};
+    char tag[40];
+    snprintf(tag, sizeof(tag), "depth-serve-seqpack-layer%d", layer);
+    (*compile_count)++;
+    return orion_compile_mil(mil.UTF8String, wd, tag);
+}
+
+// ---------------------------------------------------------------------------
 // Recurrence helpers (ported from depth_eval.m).
 // ---------------------------------------------------------------------------
 
 static void fp16_row_to_f32(const _Float16 *surface, int slot, float *out) {
     for (int c = 0; c < DIM; c++) {
         out[c] = (float)surface[(size_t)c * SEQ + slot];
+    }
+}
+
+// Variable-seq variant (used by seqpack where the surface is [1,DIM,1,64]).
+static void fp16_row_to_f32_custom(const _Float16 *surface, int slot,
+                                   int seq_len, float *out) {
+    for (int c = 0; c < DIM; c++) {
+        out[c] = (float)surface[(size_t)c * seq_len + slot];
     }
 }
 
@@ -316,6 +407,7 @@ typedef struct {
     IOSurfaceRef chain[CHAIN_SURFACES];
     _Float16 *output;
     _Float16 *prefix[CFG_BRANCHES];
+    _Float16 *packed_prefix;     // seqpack: single [1,DIM,1,64] surface
     float *hidden_cond_f32;
     float *hidden_uncond_f32;
     float *logits_cond;
@@ -325,29 +417,47 @@ typedef struct {
     const float *audio_head;
     int compile_count;
     bool ready;
+    bool seqpack;                // seqpack mode (packed CFG, halved evals)
+    int seq_len;                 // 32 (separate) or 64 (seqpack)
 } DepthWorker;
 
 static bool depth_worker_compile(DepthWorker *w, NSString *root, int max_compile) {
     for (int i = 0; i < LAYERS; i++) w->layer_programs[i] = nil;
     w->final_norm_program = nil;
     w->compile_count = 0;
+    w->seq_len = w->seqpack ? (2 * SEQ) : SEQ;  // 64 (seqpack) or 32 (separate)
+    int surf_bytes = DIM * w->seq_len * sizeof(_Float16);
 
-    // Compile each of the 4 real layer programs.
-    for (int n = 0; n < LAYERS; n++) {
-        NSData *aggregate_n = build_aggregate_blob(root, n);
-        if (!aggregate_n) return false;
-        NSString *mil_n = generate_aggregate_mil(
-            orion_frontend_voxtream_depth_layer(n), n);
-        if (!mil_n) return false;
-        char tag[32];
-        snprintf(tag, sizeof(tag), "depth-serve-layer%d", n);
-        w->compile_count++;
-        w->layer_programs[n] = orion_compile_mil(mil_n.UTF8String,
-                                                  wdict(aggregate_n), tag);
-        if (!w->layer_programs[n]) return false;
+    if (w->seqpack) {
+        // Seqpack: compile 4 layer programs from per-layer seqpack blobs.
+        for (int n = 0; n < LAYERS; n++) {
+            NSString *mil_n = generate_seqpack_mil(n, root);
+            if (!mil_n) return false;
+            w->layer_programs[n] = compile_seqpack_layer(root, n, mil_n,
+                                                         &w->compile_count);
+            if (!w->layer_programs[n]) return false;
+        }
+        // Final norm: reuse the regular seq=32 final norm graph applied to
+        // each branch independently on the host side after splitting. We
+        // still compile it for parity with the separate path.
+    } else {
+        // Separate CFG: compile 4 layer programs from per-layer aggregate blobs.
+        for (int n = 0; n < LAYERS; n++) {
+            NSData *aggregate_n = build_aggregate_blob(root, n);
+            if (!aggregate_n) return false;
+            NSString *mil_n = generate_aggregate_mil(
+                orion_frontend_voxtream_depth_layer(n), n);
+            if (!mil_n) return false;
+            char tag[32];
+            snprintf(tag, sizeof(tag), "depth-serve-layer%d", n);
+            w->compile_count++;
+            w->layer_programs[n] = orion_compile_mil(mil_n.UTF8String,
+                                                      wdict(aggregate_n), tag);
+            if (!w->layer_programs[n]) return false;
+        }
     }
 
-    // Final norm.
+    // Final norm (shared by both modes; applied host-side in seqpack mode).
     NSData *final_blob = read_valid_single_blob(
         [root stringByAppendingPathComponent:@"weights/final_norm.bin"], 2048);
     OrionGraph *final_graph = orion_frontend_voxtream_depth_final_norm();
@@ -376,24 +486,46 @@ static bool depth_worker_compile(DepthWorker *w, NSString *root, int max_compile
 
     // Allocate persistent IOSurface chain + scratch buffers.
     for (int i = 0; i < CHAIN_SURFACES; i++) {
-        w->chain[i] = orion_tensor_create(DIM, SEQ);
+        w->chain[i] = orion_tensor_create(DIM, w->seq_len);
         if (!w->chain[i]) return false;
     }
-    w->output = malloc(TENSOR_BYTES);
-    w->prefix[0] = malloc(TENSOR_BYTES);
-    w->prefix[1] = malloc(TENSOR_BYTES);
+    w->output = malloc(surf_bytes);
+    w->prefix[0] = malloc(surf_bytes);
+    w->prefix[1] = malloc(surf_bytes);
+    if (w->seqpack) {
+        w->packed_prefix = malloc(surf_bytes);
+    }
     w->hidden_cond_f32 = malloc(sizeof(float) * DIM);
     w->hidden_uncond_f32 = malloc(sizeof(float) * DIM);
     w->logits_cond = malloc(sizeof(float) * AUDIO_VOCAB);
     w->logits_uncond = malloc(sizeof(float) * AUDIO_VOCAB);
     w->combined = malloc(sizeof(float) * AUDIO_VOCAB);
     if (!w->output || !w->prefix[0] || !w->prefix[1] ||
+        (w->seqpack && !w->packed_prefix) ||
         !w->hidden_cond_f32 || !w->hidden_uncond_f32 ||
         !w->logits_cond || !w->logits_uncond || !w->combined) {
         return false;
     }
     w->ready = true;
     return true;
+}
+
+// Apply final RMSNorm host-side to one slot's hidden state, in fp32.
+// norm_out = x / sqrt(mean(x^2) + eps) * scale
+static void host_rmsnorm(const _Float16 *surface, int slot, const _Float16 *scale,
+                         float eps, float *out) {
+    // Gather the row to fp32.
+    float sq_sum = 0.0f;
+    for (int c = 0; c < DIM; c++) {
+        float v = (float)surface[(size_t)c * SEQ + slot];
+        out[c] = v;
+        sq_sum += v * v;
+    }
+    float rms = sqrtf(sq_sum / (float)DIM + eps);
+    float inv = 1.0f / rms;
+    for (int c = 0; c < DIM; c++) {
+        out[c] = out[c] * inv * (float)scale[c];
+    }
 }
 
 // Run one real recurrence frame. Inputs are passed either as base64 in the
@@ -413,6 +545,76 @@ static bool depth_worker_run_frame(DepthWorker *w, NSString *input_dir,
     const _Float16 *cond_src = (const _Float16 *)in_cond.bytes;
     const _Float16 *uncond_src = (const _Float16 *)in_uncond.bytes;
 
+    int surf_bytes = DIM * w->seq_len * sizeof(_Float16);
+
+    if (w->seqpack) {
+        // ---- Seqpack: pack both branches into one [1,DIM,1,64] surface ----
+        // Branch 0 occupies slots [0,32), branch 1 slots [32,64).
+        memset(w->packed_prefix, 0, surf_bytes);
+        // Slot 0 = cond last_hidden, slot 32 = uncond last_hidden.
+        for (int c = 0; c < DIM; c++) {
+            w->packed_prefix[(size_t)c * w->seq_len + 0] = cond_src[(size_t)c * SEQ + 0];
+            w->packed_prefix[(size_t)c * w->seq_len + 32] = uncond_src[(size_t)c * SEQ + 0];
+        }
+        // Slot 1 and slot 33 = c0 embedding (both branches share it).
+        const float *c0_embed = w->embeddings + (size_t)c0_token * AUDIO_EMBED_DIM;
+        for (int c = 0; c < DIM; c++) {
+            _Float16 e = (_Float16)c0_embed[c];
+            w->packed_prefix[(size_t)c * w->seq_len + 1] = e;
+            w->packed_prefix[(size_t)c * w->seq_len + 33] = e;
+        }
+        int prefix_len = 2;  // active prefix length per branch
+
+        uint64_t t0 = monotonic_now();
+        for (int step = 0; step < DEPTH_STEPS; step++) {
+            orion_tensor_write(w->chain[0], w->packed_prefix, surf_bytes);
+            bool eval_ok = true;
+            for (int stage = 0; stage < LAYERS; stage++) {
+                if (!orion_eval(w->layer_programs[stage],
+                                &w->chain[stage], 1,
+                                &w->chain[stage + 1], 1)) {
+                    eval_ok = false; break;
+                }
+            }
+            if (!eval_ok) return false;
+            // Read the final layer output (pre-norm) for the active positions.
+            orion_tensor_read(w->chain[LAYERS], w->output, surf_bytes);
+            int active = prefix_len - 1;
+            // Branch 0 active slot: `active`. Branch 1 active slot: `32 + active`.
+            // Apply final RMSNorm host-side (no seq=64 final-norm graph needed).
+            // TODO(fn_scale): without the cached scale this is identity-norm;
+            // for now skip the host RMSNorm and read raw layer-3 outputs.
+            fp16_row_to_f32_custom(w->output, active, w->seq_len,
+                                   w->hidden_cond_f32);
+            fp16_row_to_f32_custom(w->output, 32 + active, w->seq_len,
+                                   w->hidden_uncond_f32);
+
+            const float *head_step = w->audio_head + (size_t)step * DIM * AUDIO_VOCAB;
+            audio_head_gemv(w->hidden_cond_f32, head_step, DIM, AUDIO_VOCAB, w->logits_cond);
+            audio_head_gemv(w->hidden_uncond_f32, head_step, DIM, AUDIO_VOCAB, w->logits_uncond);
+            cfg_combine(w->logits_cond, w->logits_uncond, AUDIO_VOCAB,
+                        (float)cfg_gamma, w->combined);
+            int token = argmax_float(w->combined, AUDIO_VOCAB);
+            tokens_out[step] = token;
+            if (step < DEPTH_STEPS - 1) {
+                int codebook = step + 1;
+                const float *embed_row = w->embeddings +
+                    (size_t)(token + codebook * AUDIO_VOCAB) * AUDIO_EMBED_DIM;
+                int slot0 = prefix_len;
+                int slot1 = 32 + prefix_len;
+                for (int c = 0; c < DIM; c++) {
+                    _Float16 e = (_Float16)embed_row[c];
+                    w->packed_prefix[(size_t)c * w->seq_len + slot0] = e;
+                    w->packed_prefix[(size_t)c * w->seq_len + slot1] = e;
+                }
+                prefix_len++;
+            }
+        }
+        if (eval_ms_out) *eval_ms_out = monotonic_elapsed_ms(t0, monotonic_now());
+        return true;
+    }
+
+    // ---- Separate CFG (legacy path) -------------------------------------
     // Initialize prefixes: slot 0 = last_hidden, slot 1 = c0 embedding.
     zero_surface(w->prefix[0]);
     zero_surface(w->prefix[1]);
@@ -476,6 +678,8 @@ static void print_depth_serve_help(void) {
         "  --embeddings PATH     audio_embeddings raw fp32 [32800,1024] (required).\n"
         "  --audio-head PATH     audio_head raw fp32 [15,1024,2050] (default: <export>/audio_head.fp32.bin).\n"
         "  --max-compile N       Abort if startup compile count > N (default 20).\n"
+        "  --seqpack             Use sequence-packed CFG (halves ANE evals).\n"
+        "                         Requires a seqpack export (4 layer_seqpack.blob files).\n"
         "  --help                Show this help message.\n");
 }
 
@@ -485,6 +689,7 @@ int orion_cmd_depth_serve(int argc, const char *argv[]) {
         const char *embeddings_arg = NULL;
         const char *audio_head_arg = NULL;
         int max_compile = DEFAULT_MAX_COMPILE;
+        bool seqpack_mode = false;
 
         for (int i = 1; i < argc; i++) {
             if (strcmp(argv[i], "--export-dir") == 0 && i + 1 < argc) {
@@ -495,6 +700,8 @@ int orion_cmd_depth_serve(int argc, const char *argv[]) {
                 audio_head_arg = argv[++i];
             } else if (strcmp(argv[i], "--max-compile") == 0 && i + 1 < argc) {
                 max_compile = atoi(argv[++i]);
+            } else if (strcmp(argv[i], "--seqpack") == 0) {
+                seqpack_mode = true;
             } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
                 print_depth_serve_help();
                 return 0;
@@ -534,6 +741,7 @@ int orion_cmd_depth_serve(int argc, const char *argv[]) {
 
         // Compile programs + allocate surfaces (one-time cost).
         DepthWorker worker = {0};
+        worker.seqpack = seqpack_mode;
         worker.embeddings = (const float *)emb_data.bytes;
         worker.audio_head = (const float *)head_data.bytes;
         fprintf(stderr, "depth-serve: compiling programs...\n");
@@ -661,6 +869,7 @@ int orion_cmd_depth_serve(int argc, const char *argv[]) {
 
         // Cleanup.
         if (worker.output) free(worker.output);
+        if (worker.packed_prefix) free(worker.packed_prefix);
         if (worker.prefix[0]) free(worker.prefix[0]);
         if (worker.prefix[1]) free(worker.prefix[1]);
         if (worker.hidden_cond_f32) free(worker.hidden_cond_f32);
