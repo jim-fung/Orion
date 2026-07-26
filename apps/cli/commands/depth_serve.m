@@ -396,20 +396,16 @@ static bool depth_worker_compile(DepthWorker *w, NSString *root, int max_compile
     return true;
 }
 
-// Run one real recurrence frame. Inputs read from input_dir/hidden_*.fp16.bin
-// (channel-major, slot 0 = last_hidden). Tokens written to output_dir/tokens.bin.
+// Run one real recurrence frame. Inputs are passed either as base64 in the
+// request ("hidden_cond_b64"/"hidden_uncond_b64") OR via input_dir files
+// (legacy). Base64 avoids the temp-dir file round-trip (~ms/frame).
 // Returns the 15 sampled tokens in `tokens_out` (caller-allocated, 15 ints).
 // Returns true on success.
 static bool depth_worker_run_frame(DepthWorker *w, NSString *input_dir,
+                                   NSData *in_cond, NSData *in_uncond,
                                    int c0_token, double cfg_gamma,
                                    int32_t *tokens_out, double *eval_ms_out) {
     if (!w->ready) return false;
-
-    // Read input hidden states.
-    NSData *in_cond = [NSData dataWithContentsOfFile:
-        [input_dir stringByAppendingPathComponent:@"hidden_cond.fp16.bin"]];
-    NSData *in_uncond = [NSData dataWithContentsOfFile:
-        [input_dir stringByAppendingPathComponent:@"hidden_uncond.fp16.bin"]];
     if (!in_cond || !in_uncond ||
         in_cond.length != TENSOR_BYTES || in_uncond.length != TENSOR_BYTES) {
         return false;
@@ -555,8 +551,12 @@ int orion_cmd_depth_serve(int argc, const char *argv[]) {
         fflush(stdout);
 
         // Frame request loop: read JSON lines from stdin, respond on stdout.
-        char line[8192];
-        while (fgets(line, sizeof(line), stdin)) {
+        // Frame requests carry base64 hidden states (~178KB per request), so
+        // use getline() which dynamically grows the buffer. NULL init lets
+        // getline allocate; we free at the end.
+        char *line = NULL;
+        size_t line_cap = 0;
+        while (getline(&line, &line_cap, stdin) != -1) {
             // Strip trailing newline.
             size_t len = strlen(line);
             while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
@@ -586,8 +586,31 @@ int orion_cmd_depth_serve(int argc, const char *argv[]) {
             double gamma = req[@"gamma"] ? [req[@"gamma"] doubleValue] : DEFAULT_CFG_GAMMA;
             int frame_id_int = frame_id ? [frame_id intValue] : -1;
 
-            if (!input_dir || !c0_num) {
-                printf("{\"ok\":false,\"frame_id\":%d,\"error\":\"missing-input_dir-or-c0\"}\n",
+            if (!c0_num) {
+                printf("{\"ok\":false,\"frame_id\":%d,\"error\":\"missing-c0\"}\n",
+                       frame_id_int);
+                fflush(stdout);
+                continue;
+            }
+
+            // Resolve input hidden states: prefer base64 in the request
+            // (no file I/O); fall back to input_dir files.
+            NSData *in_cond = nil;
+            NSData *in_uncond = nil;
+            NSString *cond_b64 = req[@"hidden_cond_b64"];
+            NSString *uncond_b64 = req[@"hidden_uncond_b64"];
+            if (cond_b64 && uncond_b64) {
+                in_cond = [[NSData alloc] initWithBase64EncodedString:cond_b64
+                    options:NSDataBase64DecodingIgnoreUnknownCharacters];
+                in_uncond = [[NSData alloc] initWithBase64EncodedString:uncond_b64
+                    options:NSDataBase64DecodingIgnoreUnknownCharacters];
+            } else if (input_dir) {
+                in_cond = [NSData dataWithContentsOfFile:
+                    [input_dir stringByAppendingPathComponent:@"hidden_cond.fp16.bin"]];
+                in_uncond = [NSData dataWithContentsOfFile:
+                    [input_dir stringByAppendingPathComponent:@"hidden_uncond.fp16.bin"]];
+            } else {
+                printf("{\"ok\":false,\"frame_id\":%d,\"error\":\"no-hidden-inputs\"}\n",
                        frame_id_int);
                 fflush(stdout);
                 continue;
@@ -596,6 +619,7 @@ int orion_cmd_depth_serve(int argc, const char *argv[]) {
             int32_t tokens[DEPTH_STEPS];
             double eval_ms = 0.0;
             bool ok = depth_worker_run_frame(&worker, input_dir,
+                                             in_cond, in_uncond,
                                              [c0_num intValue], gamma,
                                              tokens, &eval_ms);
             if (!ok) {
@@ -652,6 +676,7 @@ int orion_cmd_depth_serve(int argc, const char *argv[]) {
         }
         if (worker.final_norm_program) orion_release_program(worker.final_norm_program);
 
+        if (line) free(line);
         return 0;
     }
 }
