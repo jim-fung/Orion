@@ -415,6 +415,7 @@ typedef struct {
     float *combined;
     const float *embeddings;
     const float *audio_head;
+    const _Float16 *final_norm_scale;  // [DIM] fp16, for seqpack host RMSNorm
     int compile_count;
     bool ready;
     bool seqpack;                // seqpack mode (packed CFG, halved evals)
@@ -478,6 +479,24 @@ static bool depth_worker_compile(DepthWorker *w, NSString *root, int max_compile
         "depth-serve-final-norm");
     if (!w->final_norm_program) return false;
 
+    // Cache the final-norm scale for seqpack host-side RMSNorm. The scale is
+    // the dep_former.norm.scale weights: 1024 fp16 values at payload offset
+    // 128 (past the BLOBFILE header) of weights/final_norm.bin.
+    {
+        NSData *fn_data = [NSData dataWithContentsOfFile:
+            [root stringByAppendingPathComponent:@"weights/final_norm.bin"]];
+        if (fn_data && fn_data.length >= 128 + DIM * sizeof(_Float16)) {
+            w->final_norm_scale = (const _Float16 *)((const uint8_t *)fn_data.bytes + 128);
+            // Retain the NSData for the worker's lifetime by leaking it
+            // (depth-serve is short-lived; acceptable for now).
+            CFRetain((__bridge CFTypeRef)fn_data);
+        } else {
+            fprintf(stderr, "depth-serve: WARNING no final_norm.bin scale; "
+                    "seqpack host RMSNorm will be identity\n");
+            w->final_norm_scale = NULL;
+        }
+    }
+
     if (w->compile_count > max_compile) {
         fprintf(stderr, "depth-serve: compile count %d > max %d\n",
                 w->compile_count, max_compile);
@@ -518,6 +537,22 @@ static void host_rmsnorm(const _Float16 *surface, int slot, const _Float16 *scal
     float sq_sum = 0.0f;
     for (int c = 0; c < DIM; c++) {
         float v = (float)surface[(size_t)c * SEQ + slot];
+        out[c] = v;
+        sq_sum += v * v;
+    }
+    float rms = sqrtf(sq_sum / (float)DIM + eps);
+    float inv = 1.0f / rms;
+    for (int c = 0; c < DIM; c++) {
+        out[c] = out[c] * inv * (float)scale[c];
+    }
+}
+
+// Variable-seq variant for seqpack surfaces [1, DIM, 1, seq_len].
+static void host_rmsnorm_custom(const _Float16 *surface, int slot, int seq_len,
+                                const _Float16 *scale, float eps, float *out) {
+    float sq_sum = 0.0f;
+    for (int c = 0; c < DIM; c++) {
+        float v = (float)surface[(size_t)c * seq_len + slot];
         out[c] = v;
         sq_sum += v * v;
     }
@@ -581,13 +616,22 @@ static bool depth_worker_run_frame(DepthWorker *w, NSString *input_dir,
             orion_tensor_read(w->chain[LAYERS], w->output, surf_bytes);
             int active = prefix_len - 1;
             // Branch 0 active slot: `active`. Branch 1 active slot: `32 + active`.
-            // Apply final RMSNorm host-side (no seq=64 final-norm graph needed).
-            // TODO(fn_scale): without the cached scale this is identity-norm;
-            // for now skip the host RMSNorm and read raw layer-3 outputs.
-            fp16_row_to_f32_custom(w->output, active, w->seq_len,
-                                   w->hidden_cond_f32);
-            fp16_row_to_f32_custom(w->output, 32 + active, w->seq_len,
-                                   w->hidden_uncond_f32);
+            // Apply final RMSNorm host-side (the seq32 final-norm graph is
+            // incompatible with seq64 surfaces, so we read layer-3 raw output
+            // and normalize on the CPU: out = x/rms(x) * scale).
+            if (w->final_norm_scale) {
+                host_rmsnorm_custom(w->output, active, w->seq_len,
+                                    w->final_norm_scale, ORION_VOXTREAM_DEPTH_RMS_EPS,
+                                    w->hidden_cond_f32);
+                host_rmsnorm_custom(w->output, 32 + active, w->seq_len,
+                                    w->final_norm_scale, ORION_VOXTREAM_DEPTH_RMS_EPS,
+                                    w->hidden_uncond_f32);
+            } else {
+                fp16_row_to_f32_custom(w->output, active, w->seq_len,
+                                       w->hidden_cond_f32);
+                fp16_row_to_f32_custom(w->output, 32 + active, w->seq_len,
+                                       w->hidden_uncond_f32);
+            }
 
             const float *head_step = w->audio_head + (size_t)step * DIM * AUDIO_VOCAB;
             audio_head_gemv(w->hidden_cond_f32, head_step, DIM, AUDIO_VOCAB, w->logits_cond);
