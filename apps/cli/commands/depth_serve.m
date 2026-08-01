@@ -8,18 +8,22 @@
 // eliminating the ~3s/frame subprocess + recompile overhead of one-shot
 // `depth-eval` invocations.
 //
-// Wire protocol (one JSON object per line):
+// Wire protocol v1 (one JSON object per line; protocol_version is required):
 //
-//   REQUEST:  {"input_dir": "<path>", "output_dir": "<path>", "c0": 42,
-//              "gamma": 3.0, "frame_id": 0}
+//   REQUEST:  {"protocol_version": 1, "input_dir": "<path>",
+//              "output_dir": "<existing-path>", "c0": 42, "gamma": 3.0,
+//              "frame_id": 0}
 //     input_dir contains hidden_cond.fp16.bin + hidden_uncond.fp16.bin
 //     ([1,1024,1,32] fp16, channel-major). output_dir receives tokens.bin.
+//     Alternatively, provide both hidden_cond_b64 and hidden_uncond_b64 instead
+//     of input_dir. The decoded payloads must each be exactly 65536 bytes.
 //
-//   RESPONSE: {"ok": true, "frame_id": 0, "tokens": [t1,...,t15],
-//              "eval_ms": 12.3, "compile_count": 5}
-//     On error: {"ok": false, "frame_id": 0, "error": "..."}
+//   RESPONSE: {"protocol_version": 1, "ok": true, "frame_id": 0,
+//              "tokens": [t1,...,t15], "eval_ms": 12.3, "compile_count": 5}
+//     Errors and the readiness response are likewise versioned.
 //
-//   SHUTDOWN: {"cmd": "shutdown"}  ->  {"ok": true, "shutdown": true}, then exit.
+//   SHUTDOWN: {"protocol_version": 1, "cmd": "shutdown"}
+//       -> {"protocol_version": 1, "ok": true, "shutdown": true}, then exit.
 //
 // Usage:
 //   orion depth-serve --export-dir <path>
@@ -33,16 +37,22 @@
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurface.h>
 #import <Accelerate/Accelerate.h>
+#include <errno.h>
+#include <limits.h>
 #include <mach/mach_time.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
+#include "apps/cli/commands/depth_canonical.h"
+#include "apps/cli/commands/depth_serve_support.h"
 #include "core/ane_runtime.h"
 #include "core/iosurface_tensor.h"
 #include "core/orion_error.h"
+#include "core/orion_compile_ledger.h"
 #include "compiler/codegen.h"
 #include "compiler/frontends/voxtream_depth.h"
 #include "compiler/pipeline.h"
@@ -52,9 +62,6 @@
 #define SEQ ORION_VOXTREAM_DEPTH_ANE_SEQ
 #define ELEMENTS ((size_t)DIM * SEQ)
 #define TENSOR_BYTES (ELEMENTS * sizeof(_Float16))
-#define BLOB_HEADER_BYTES 128
-#define CHUNK_HEADER_BYTES 64
-#define FIRST_CHUNK_OFFSET 64
 #define DEPTH_STEPS 15
 #define CFG_BRANCHES 2
 #define LAYERS ORION_VOXTREAM_DEPTH_LAYERS
@@ -66,42 +73,14 @@
 #define AUDIO_HEAD_STEPS 15
 #define DEFAULT_CFG_GAMMA 3.0
 #define DEFAULT_MAX_COMPILE 20
+#define DEPTH_PROTOCOL_VERSION 1
+#define MAX_REQUEST_BYTES (1024u * 1024u)
 #define RECURRENCE_EMBED_BYTES ((size_t)AUDIO_EMBED_ROWS * AUDIO_EMBED_DIM * sizeof(float))
 #define RECURRENCE_HEAD_BYTES  ((size_t)AUDIO_HEAD_STEPS * DIM * AUDIO_VOCAB * sizeof(float))
 
 // ---------------------------------------------------------------------------
-// Aggregate blob chunk table (same as depth_eval.m).
-// ---------------------------------------------------------------------------
-
-typedef struct {
-    const char *relative_path;
-    const char *mil_path;
-    size_t payload_bytes;
-    uint64_t chunk_offset;
-} AggregateEntry;
-
-static AggregateEntry kEntries[] = {
-    {"weights/layer0/rms1.bin", "@model_path/weights/layer0/rms1.bin", 2048, 0},
-    {"weights/layer0/wq.bin", "@model_path/weights/layer0/wq.bin", 2097152, 0},
-    {"weights/layer0/wk.bin", "@model_path/weights/layer0/wk.bin", 524288, 0},
-    {"weights/layer0/wv.bin", "@model_path/weights/layer0/wv.bin", 524288, 0},
-    {"weights/layer0/wo.bin", "@model_path/weights/layer0/wo.bin", 2097152, 0},
-    {"weights/layer0/rms2.bin", "@model_path/weights/layer0/rms2.bin", 2048, 0},
-    {"weights/layer0/w1.bin", "@model_path/weights/layer0/w1.bin", 16777216, 0},
-    {"weights/layer0/w2.bin", "@model_path/weights/layer0/w2.bin", 16777216, 0},
-    {"weights/layer0/w3.bin", "@model_path/weights/layer0/w3.bin", 16777216, 0},
-    {"constants/rope_q_cos.bin", "@model_path/constants/rope_q_cos.bin", 65536, 0},
-    {"constants/rope_q_sin.bin", "@model_path/constants/rope_q_sin.bin", 65536, 0},
-    {"constants/rope_q_perm.bin", "@model_path/constants/rope_q_perm.bin", 2097152, 0},
-    {"constants/rope_k_cos.bin", "@model_path/constants/rope_k_cos.bin", 16384, 0},
-    {"constants/rope_k_sin.bin", "@model_path/constants/rope_k_sin.bin", 16384, 0},
-    {"constants/rope_k_perm.bin", "@model_path/constants/rope_k_perm.bin", 131072, 0},
-    {"constants/causal_mask.bin", "@model_path/constants/causal_mask.bin", 2048, 0},
-};
-static const int kEntryCount = sizeof(kEntries) / sizeof(kEntries[0]);
-
-// ---------------------------------------------------------------------------
-// Byte helpers (ported from depth_eval.m).
+// Byte helpers. write_le32 emits little-endian int32 for tokens.bin. The
+// canonical aggregate loader lives in the shared depth_canonical.{h,m} TU.
 // ---------------------------------------------------------------------------
 
 static void write_le32(uint8_t *dst, uint32_t value) {
@@ -109,139 +88,6 @@ static void write_le32(uint8_t *dst, uint32_t value) {
     dst[1] = (uint8_t)(value >> 8);
     dst[2] = (uint8_t)(value >> 16);
     dst[3] = (uint8_t)(value >> 24);
-}
-
-static uint32_t read_le32(const uint8_t *src) {
-    return (uint32_t)src[0] | ((uint32_t)src[1] << 8) |
-           ((uint32_t)src[2] << 16) | ((uint32_t)src[3] << 24);
-}
-
-static size_t align64(size_t value) {
-    return (value + 63u) & ~(size_t)63u;
-}
-
-static NSData *read_valid_single_blob(NSString *path, size_t expected_payload) {
-    NSData *data = [NSData dataWithContentsOfFile:path];
-    if (!data || data.length != BLOB_HEADER_BYTES + expected_payload) return nil;
-    const uint8_t *bytes = data.bytes;
-    if (bytes[0] != 1 || bytes[4] != 2 ||
-        bytes[64] != 0xef || bytes[65] != 0xbe ||
-        bytes[66] != 0xad || bytes[67] != 0xde || bytes[68] != 1 ||
-        read_le32(bytes + 72) != (uint32_t)expected_payload || read_le32(bytes + 80) != 128) {
-        return nil;
-    }
-    return data;
-}
-
-static void write_chunk_header(uint8_t *bytes, size_t chunk_offset,
-                               size_t payload_bytes, size_t payload_offset) {
-    bytes[chunk_offset] = 0xef;
-    bytes[chunk_offset + 1] = 0xbe;
-    bytes[chunk_offset + 2] = 0xad;
-    bytes[chunk_offset + 3] = 0xde;
-    bytes[chunk_offset + 4] = 1;
-    write_le32(bytes + chunk_offset + 8, (uint32_t)payload_bytes);
-    write_le32(bytes + chunk_offset + 16, (uint32_t)payload_offset);
-}
-
-static void relative_path_for_layer(int index, int layer, char *buffer, size_t size) {
-    const char *prefix = "weights/layer0/";
-    const char *path = kEntries[index].relative_path;
-    if (strncmp(path, prefix, strlen(prefix)) == 0) {
-        snprintf(buffer, size, "weights/layer%d/%s", layer, path + strlen(prefix));
-    } else {
-        snprintf(buffer, size, "%s", path);
-    }
-}
-
-static NSData *build_aggregate_blob(NSString *root, int layer) {
-    NSData *payloads[32];
-    char relative[256];
-    size_t total = BLOB_HEADER_BYTES;
-    for (int i = 0; i < kEntryCount; i++) {
-        relative_path_for_layer(i, layer, relative, sizeof(relative));
-        payloads[i] = read_valid_single_blob(
-            [root stringByAppendingPathComponent:@(relative)],
-            kEntries[i].payload_bytes);
-        if (!payloads[i]) {
-            fprintf(stderr, "depth-serve: cannot read validated blob %s\n", relative);
-            return nil;
-        }
-        size_t header_offset = i == 0 ? FIRST_CHUNK_OFFSET : align64(total);
-        kEntries[i].chunk_offset = (uint64_t)header_offset;
-        total = header_offset + CHUNK_HEADER_BYTES + kEntries[i].payload_bytes;
-    }
-    NSMutableData *aggregate = [NSMutableData dataWithLength:total];
-    uint8_t *out = aggregate.mutableBytes;
-    out[0] = 1;
-    out[4] = 2;
-    for (int i = 0; i < kEntryCount; i++) {
-        size_t header_offset = (size_t)kEntries[i].chunk_offset;
-        size_t payload_offset = header_offset + CHUNK_HEADER_BYTES;
-        write_chunk_header(out, header_offset, kEntries[i].payload_bytes,
-                           payload_offset);
-        memcpy(out + payload_offset,
-               (const uint8_t *)[payloads[i] bytes] + BLOB_HEADER_BYTES,
-               kEntries[i].payload_bytes);
-    }
-    return aggregate;
-}
-
-static bool rewrite_blob_refs(OrionGraph *g, int layer) {
-    char layer_mil[32][256];
-    const char *prefix = "weights/layer0/";
-    for (int j = 0; j < kEntryCount; j++) {
-        const char *path = kEntries[j].mil_path;
-        if (strncmp(path + strlen("@model_path/"), prefix, strlen(prefix)) == 0) {
-            snprintf(layer_mil[j], sizeof(layer_mil[j]),
-                     "@model_path/weights/layer%d/%s", layer,
-                     path + strlen("@model_path/") + strlen(prefix));
-        } else {
-            snprintf(layer_mil[j], sizeof(layer_mil[j]), "%s", path);
-        }
-    }
-    for (int i = 0; i < g->n_nodes; i++) {
-        OrionNode *node = &g->nodes[i];
-        if (node->op != ORION_OP_CONST || !node->attrs.blob_path[0]) continue;
-        bool found = false;
-        for (int j = 0; j < kEntryCount; j++) {
-            if (strcmp(node->attrs.blob_path, layer_mil[j]) == 0) {
-                snprintf(node->attrs.blob_path, sizeof(node->attrs.blob_path),
-                         "@model_path/aggregate.bin");
-                node->attrs.blob_offset = kEntries[j].chunk_offset;
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            fprintf(stderr, "depth-serve: graph references unaggregated blob %s\n",
-                    node->attrs.blob_path);
-            return false;
-        }
-    }
-    return true;
-}
-
-static NSString *generate_aggregate_mil(OrionGraph *g, int layer) {
-    if (!g) return nil;
-    OrionValidationResult vr = orion_graph_validate(g);
-    if (!vr.valid) {
-        fprintf(stderr, "depth-serve: graph validation: %s\n", vr.message);
-        orion_graph_free(g);
-        return nil;
-    }
-    orion_pipeline_optimize(g);
-    if (!rewrite_blob_refs(g, layer)) {
-        orion_graph_free(g);
-        return nil;
-    }
-    NSString *mil = orion_codegen_mil(g, "main");
-    orion_graph_free(g);
-    return mil;
-}
-
-static NSDictionary *wdict(NSData *aggregate) {
-    return @{@"@model_path/aggregate.bin": @{@"offset": @0, @"data": aggregate}};
 }
 
 // ---------------------------------------------------------------------------
@@ -311,7 +157,8 @@ static NSString *generate_seqpack_mil(int layer, NSString *root) {
 
 // Compile a seqpack layer program from its blob + MIL.
 static OrionProgram *compile_seqpack_layer(NSString *root, int layer,
-                                           NSString *mil, int *compile_count) {
+                                           NSString *mil, int *compile_count,
+                                           OrionCompileLedger *ledger) {
     NSString *blob_path = [root stringByAppendingPathComponent:
         [NSString stringWithFormat:@"weights/layer%d_seqpack.blob", layer]];
     NSData *blob = [NSData dataWithContentsOfFile:blob_path];
@@ -319,12 +166,19 @@ static OrionProgram *compile_seqpack_layer(NSString *root, int layer,
         fprintf(stderr, "depth-serve: missing seqpack blob for layer %d\n", layer);
         return nil;
     }
+    if (orion_ledger_exhausted(ledger)) {
+        fprintf(stderr, "depth-serve: compile ledger exhausted before seqpack layer %d\n",
+                layer);
+        return nil;
+    }
     NSString *blob_mil = [NSString stringWithFormat:@"@model_path/weights/layer%d_seqpack.blob", layer];
     NSDictionary *wd = @{blob_mil: @{@"offset": @0, @"data": blob}};
     char tag[40];
     snprintf(tag, sizeof(tag), "depth-serve-seqpack-layer%d", layer);
-    (*compile_count)++;
-    return orion_compile_mil(mil.UTF8String, wd, tag);
+    OrionProgram *program = orion_compile_mil(mil.UTF8String, wd, tag);
+    orion_ledger_record_compile(ledger, program != nil, /*cached=*/0);
+    if (program) (*compile_count)++;
+    return program;
 }
 
 // ---------------------------------------------------------------------------
@@ -334,14 +188,6 @@ static OrionProgram *compile_seqpack_layer(NSString *root, int layer,
 static void fp16_row_to_f32(const _Float16 *surface, int slot, float *out) {
     for (int c = 0; c < DIM; c++) {
         out[c] = (float)surface[(size_t)c * SEQ + slot];
-    }
-}
-
-// Variable-seq variant (used by seqpack where the surface is [1,DIM,1,64]).
-static void fp16_row_to_f32_custom(const _Float16 *surface, int slot,
-                                   int seq_len, float *out) {
-    for (int c = 0; c < DIM; c++) {
-        out[c] = (float)surface[(size_t)c * seq_len + slot];
     }
 }
 
@@ -403,7 +249,10 @@ static double monotonic_elapsed_ms(uint64_t start, uint64_t end) {
 
 typedef struct {
     OrionProgram *layer_programs[LAYERS];
+    OrionBindingPlan layer_plans[LAYERS];   // separate-CFG canonical layer plans
     OrionProgram *final_norm_program;
+    OrionBindingPlan final_norm_plan;       // separate-CFG canonical final-norm plan
+    bool final_norm_plan_ready;
     IOSurfaceRef chain[CHAIN_SURFACES];
     _Float16 *output;
     _Float16 *prefix[CFG_BRANCHES];
@@ -416,104 +265,245 @@ typedef struct {
     const float *embeddings;
     const float *audio_head;
     const _Float16 *final_norm_scale;  // [DIM] fp16, for seqpack host RMSNorm
+    NSData *final_norm_data;           // owned backing storage for final_norm_scale
+    OrionCompileLedger compile_ledger;
     int compile_count;
     bool ready;
     bool seqpack;                // seqpack mode (packed CFG, halved evals)
     int seq_len;                 // 32 (separate) or 64 (seqpack)
 } DepthWorker;
 
-static bool depth_worker_compile(DepthWorker *w, NSString *root, int max_compile) {
-    for (int i = 0; i < LAYERS; i++) w->layer_programs[i] = nil;
-    w->final_norm_program = nil;
+static void depth_worker_cleanup(DepthWorker *w) {
+    if (!w) return;
+    w->ready = false;
+    for (int i = 0; i < LAYERS; i++) {
+        if (w->layer_programs[i]) {
+            orion_release_program(w->layer_programs[i]);
+            w->layer_programs[i] = nil;
+        }
+    }
+    if (w->final_norm_program) {
+        orion_release_program(w->final_norm_program);
+        w->final_norm_program = nil;
+    }
+    for (int i = 0; i < LAYERS; i++) w->layer_plans[i] = (OrionBindingPlan){0};
+    w->final_norm_plan = (OrionBindingPlan){0};
+    w->final_norm_plan_ready = false;
+    for (int i = 0; i < CHAIN_SURFACES; i++) {
+        if (w->chain[i]) {
+            orion_tensor_release(w->chain[i]);
+            w->chain[i] = NULL;
+        }
+    }
+    free(w->output); w->output = NULL;
+    free(w->prefix[0]); w->prefix[0] = NULL;
+    free(w->prefix[1]); w->prefix[1] = NULL;
+    free(w->packed_prefix); w->packed_prefix = NULL;
+    free(w->hidden_cond_f32); w->hidden_cond_f32 = NULL;
+    free(w->hidden_uncond_f32); w->hidden_uncond_f32 = NULL;
+    free(w->logits_cond); w->logits_cond = NULL;
+    free(w->logits_uncond); w->logits_uncond = NULL;
+    free(w->combined); w->combined = NULL;
+    w->final_norm_scale = NULL;
+    w->final_norm_data = nil;
     w->compile_count = 0;
-    w->seq_len = w->seqpack ? (2 * SEQ) : SEQ;  // 64 (seqpack) or 32 (separate)
-    int surf_bytes = DIM * w->seq_len * sizeof(_Float16);
+    memset(&w->compile_ledger, 0, sizeof(w->compile_ledger));
+    w->seq_len = 0;
+}
 
-    if (w->seqpack) {
-        // Seqpack: compile 4 layer programs from per-layer seqpack blobs.
-        for (int n = 0; n < LAYERS; n++) {
-            NSString *mil_n = generate_seqpack_mil(n, root);
-            if (!mil_n) return false;
-            w->layer_programs[n] = compile_seqpack_layer(root, n, mil_n,
-                                                         &w->compile_count);
-            if (!w->layer_programs[n]) return false;
-        }
-        // Final norm: reuse the regular seq=32 final norm graph applied to
-        // each branch independently on the host side after splitting. We
-        // still compile it for parity with the separate path.
-    } else {
-        // Separate CFG: compile 4 layer programs from per-layer aggregate blobs.
-        for (int n = 0; n < LAYERS; n++) {
-            NSData *aggregate_n = build_aggregate_blob(root, n);
-            if (!aggregate_n) return false;
-            NSString *mil_n = generate_aggregate_mil(
-                orion_frontend_voxtream_depth_layer(n), n);
-            if (!mil_n) return false;
-            char tag[32];
-            snprintf(tag, sizeof(tag), "depth-serve-layer%d", n);
-            w->compile_count++;
-            w->layer_programs[n] = orion_compile_mil(mil_n.UTF8String,
-                                                      wdict(aggregate_n), tag);
-            if (!w->layer_programs[n]) return false;
-        }
-    }
-
-    // Final norm (shared by both modes; applied host-side in seqpack mode).
-    NSData *final_blob = read_valid_single_blob(
-        [root stringByAppendingPathComponent:@"weights/final_norm.bin"], 2048);
-    OrionGraph *final_graph = orion_frontend_voxtream_depth_final_norm();
-    NSString *final_mil = nil;
-    if (final_blob && final_graph) {
-        OrionValidationResult fvr = orion_graph_validate(final_graph);
-        if (fvr.valid) {
-            orion_pipeline_optimize(final_graph);
-            final_mil = orion_codegen_mil(final_graph, "main");
-        }
-    }
-    if (final_graph) orion_graph_free(final_graph);
-    if (!final_mil) return false;
-    w->compile_count++;
-    w->final_norm_program = orion_compile_mil(final_mil.UTF8String,
-        @{@"@model_path/weights/final_norm.bin":
-            @{@"offset": @0, @"data": final_blob}},
-        "depth-serve-final-norm");
-    if (!w->final_norm_program) return false;
-
-    // Cache the final-norm scale for seqpack host-side RMSNorm. The scale is
-    // the dep_former.norm.scale weights: 1024 fp16 values at payload offset
-    // 128 (past the BLOBFILE header) of weights/final_norm.bin.
-    {
-        NSData *fn_data = [NSData dataWithContentsOfFile:
-            [root stringByAppendingPathComponent:@"weights/final_norm.bin"]];
-        if (fn_data && fn_data.length >= 128 + DIM * sizeof(_Float16)) {
-            w->final_norm_scale = (const _Float16 *)((const uint8_t *)fn_data.bytes + 128);
-            // Retain the NSData for the worker's lifetime by leaking it
-            // (depth-serve is short-lived; acceptable for now).
-            CFRetain((__bridge CFTypeRef)fn_data);
-        } else {
-            fprintf(stderr, "depth-serve: WARNING no final_norm.bin scale; "
-                    "seqpack host RMSNorm will be identity\n");
-            w->final_norm_scale = NULL;
-        }
-    }
-
-    if (w->compile_count > max_compile) {
-        fprintf(stderr, "depth-serve: compile count %d > max %d\n",
-                w->compile_count, max_compile);
+static bool depth_worker_compile(DepthWorker *w, NSString *root, int max_compile) {
+    const int planned_compiles = w->seqpack ? LAYERS : LAYERS + 1;
+    NSString *final_norm_path =
+        [root stringByAppendingPathComponent:@"weights/final_norm.bin"];
+    w->compile_count = 0;
+    w->seq_len = w->seqpack ? (2 * SEQ) : SEQ;
+    w->compile_ledger = orion_ledger_init(planned_compiles, max_compile);
+    if (max_compile <= 0 || planned_compiles > max_compile) {
+        fprintf(stderr, "depth-serve: compile preflight planned=%d exceeds max=%d\n",
+                planned_compiles, max_compile);
+        depth_worker_cleanup(w);
         return false;
     }
 
-    // Allocate persistent IOSurface chain + scratch buffers.
+    // Final norm is mandatory. Validate its framing and every scale value before
+    // a compile is attempted or readiness becomes observable.
+    w->final_norm_data = [NSData dataWithContentsOfFile:final_norm_path];
+    OrionDepthServeSupportStatus norm_status = orion_depth_serve_final_norm_scale(
+        w->final_norm_data, DIM, &w->final_norm_scale);
+    if (norm_status != ORION_DEPTH_SERVE_SUPPORT_OK) {
+        fprintf(stderr, "depth-serve: invalid final norm %s: %s\n",
+                final_norm_path.UTF8String,
+                orion_depth_serve_support_status_string(norm_status));
+        depth_worker_cleanup(w);
+        return false;
+    }
+    for (int c = 0; c < DIM; c++) {
+        if (!isfinite((float)w->final_norm_scale[c])) {
+            fprintf(stderr, "depth-serve: nonfinite final norm scale %s at channel %d\n",
+                    final_norm_path.UTF8String, c);
+            depth_worker_cleanup(w);
+            return false;
+        }
+    }
+
+    if (w->seqpack) {
+        // Seqpack uses checked CPU RMSNorm on seq64 output; compile exactly four layers.
+        for (int n = 0; n < LAYERS; n++) {
+            NSString *mil_n = generate_seqpack_mil(n, root);
+            if (!mil_n) {
+                depth_worker_cleanup(w);
+                return false;
+            }
+            w->layer_programs[n] = compile_seqpack_layer(root, n, mil_n,
+                                                         &w->compile_count,
+                                                         &w->compile_ledger);
+            if (!w->layer_programs[n]) {
+                depth_worker_cleanup(w);
+                return false;
+            }
+        }
+    } else {
+        // Separate-CFG: every layer is compiled from its exporter-published
+        // canonical v1.5 aggregate blob via a finalized, plan-verified compile
+        // (orion_compile_mil_with_plan). The legacy in-memory aggregate builder
+        // (build_aggregate_blob) has been removed: an incomplete or non-canonical
+        // export fails closed with canonical-aggregate-artifacts-unavailable
+        // rather than reconstructing aggregates from raw per-weight blobs.
+        const char *revision = getenv("VOXTREAM_ORION_REVISION");
+        const char *compiler_build = getenv("VOXTREAM_COMPILER_BUILD");
+        OrionBindingPlanIdentity identity = {
+            .orion_revision = revision ?: "depth-serve-canonical-artifact",
+            .compiler_build = compiler_build ?: "depth-serve-canonical-artifact",
+            .weight_root = root.fileSystemRepresentation,
+        };
+
+        // Preflight the full canonical contract before any compile is attempted
+        // or readiness becomes observable. Older / partly-produced exports never
+        // reach graph construction or any legacy fallback path.
+        for (int layer = 0; layer < LAYERS; layer++) {
+            CanonicalLayerArtifact artifact;
+            NSString *artifact_failure = nil;
+            if (!depth_canonical_load_layer_artifact(root, layer, &artifact,
+                                                     &artifact_failure)) {
+                fprintf(stderr,
+                        "depth-serve: canonical-aggregate-artifacts-unavailable "
+                        "for layer%d: %s\n", layer,
+                        artifact_failure.UTF8String ?: "unknown");
+                depth_worker_cleanup(w);
+                return false;
+            }
+        }
+
+        for (int n = 0; n < LAYERS; n++) {
+            NSString *artifact_failure = nil;
+            NSString *layer_mil = nil;
+            NSDictionary *layer_wdict = nil;
+            char program_name[64];
+            snprintf(program_name, sizeof(program_name), "depth-serve-layer%d", n);
+            if (!depth_canonical_build_layer(root, n, program_name, &identity,
+                    &w->layer_plans[n], &layer_mil, &layer_wdict,
+                    &artifact_failure)) {
+                fprintf(stderr,
+                        "depth-serve: canonical-aggregate-artifacts-unavailable "
+                        "layer%d: %s\n", n, artifact_failure.UTF8String ?: "unknown");
+                depth_worker_cleanup(w);
+                return false;
+            }
+            if (orion_ledger_exhausted(&w->compile_ledger)) {
+                fprintf(stderr, "depth-serve: compile ledger exhausted before layer %d\n", n);
+                depth_worker_cleanup(w);
+                return false;
+            }
+            char tag[48], compile_error[512] = {0};
+            snprintf(tag, sizeof(tag), "depth-serve-layer%d-canonical", n);
+            w->layer_programs[n] = orion_compile_mil_with_plan(layer_mil.UTF8String,
+                &w->layer_plans[n], layer_wdict, tag,
+                compile_error, sizeof(compile_error));
+            orion_ledger_record_compile(&w->compile_ledger,
+                                        w->layer_programs[n] != nil, /*cached=*/0);
+            if (!w->layer_programs[n]) {
+                fprintf(stderr, "depth-serve: layer%d plan-verified compile: %s\n", n,
+                        compile_error[0] ? compile_error : "compiler rejected MIL");
+                depth_worker_cleanup(w);
+                return false;
+            }
+            w->compile_count++;
+        }
+
+        // Final norm: separate canonical single-chunk artifact, plan-verified.
+        NSString *final_failure = nil;
+        NSString *final_mil = nil;
+        if (!depth_canonical_build_final_norm(w->final_norm_data, "depth-serve-final-norm",
+                &identity, &w->final_norm_plan, &final_mil, &final_failure)) {
+            fprintf(stderr,
+                    "depth-serve: canonical-aggregate-artifacts-unavailable "
+                    "final-norm: %s\n", final_failure.UTF8String ?: "unknown");
+            depth_worker_cleanup(w);
+            return false;
+        }
+        w->final_norm_plan_ready = true;
+        if (orion_ledger_exhausted(&w->compile_ledger)) {
+            fprintf(stderr, "depth-serve: compile ledger exhausted before final norm\n");
+            depth_worker_cleanup(w);
+            return false;
+        }
+        char final_error[512] = {0};
+        w->final_norm_program = orion_compile_mil_with_plan(final_mil.UTF8String,
+            &w->final_norm_plan,
+            @{@"@model_path/weights/final_norm.bin":
+                @{@"offset": @0, @"data": w->final_norm_data}},
+            "depth-serve-final-norm", final_error, sizeof(final_error));
+        orion_ledger_record_compile(&w->compile_ledger,
+                                    w->final_norm_program != nil, /*cached=*/0);
+        if (!w->final_norm_program) {
+            fprintf(stderr, "depth-serve: final-norm plan-verified compile: %s\n",
+                    final_error[0] ? final_error : "compiler rejected MIL");
+            depth_worker_cleanup(w);
+            return false;
+        }
+        w->compile_count++;
+    }
+
+    if (w->compile_count != planned_compiles ||
+        w->compile_ledger.planned != planned_compiles ||
+        w->compile_ledger.successful != planned_compiles) {
+        fprintf(stderr, "depth-serve: compile ledger mismatch planned=%d count=%d ledger-planned=%d successful=%d\n",
+                planned_compiles, w->compile_count, w->compile_ledger.planned,
+                w->compile_ledger.successful);
+        depth_worker_cleanup(w);
+        return false;
+    }
+
+    int surf_bytes = DIM * w->seq_len * sizeof(_Float16);
     for (int i = 0; i < CHAIN_SURFACES; i++) {
-        w->chain[i] = orion_tensor_create(DIM, w->seq_len);
-        if (!w->chain[i]) return false;
+        OrionSurfaceStatus surface_status = ORION_SURFACE_OK;
+        if (w->seqpack) {
+            // Seqpack has no canonical plans; allocate the fixed [DIM, seq64]
+            // surface directly.
+            w->chain[i] = orion_tensor_create(DIM, w->seq_len);
+        } else if (i == 0) {
+            w->chain[i] = orion_tensor_create_for_binding(
+                &w->layer_plans[0].inputs[0], &surface_status);
+        } else if (i < LAYERS) {
+            w->chain[i] = orion_tensor_create_for_binding(
+                &w->layer_plans[i - 1].outputs[0], &surface_status);
+        } else if (i == LAYERS) {
+            w->chain[i] = orion_tensor_create_for_binding(
+                &w->layer_plans[LAYERS - 1].outputs[0], &surface_status);
+        } else {
+            w->chain[i] = orion_tensor_create_for_binding(
+                &w->final_norm_plan.outputs[0], &surface_status);
+        }
+        if (!w->chain[i] || (!w->seqpack && surface_status != ORION_SURFACE_OK)) {
+            fprintf(stderr, "depth-serve: surface allocation failed at chain[%d]\n", i);
+            depth_worker_cleanup(w);
+            return false;
+        }
     }
     w->output = malloc(surf_bytes);
     w->prefix[0] = malloc(surf_bytes);
     w->prefix[1] = malloc(surf_bytes);
-    if (w->seqpack) {
-        w->packed_prefix = malloc(surf_bytes);
-    }
+    if (w->seqpack) w->packed_prefix = malloc(surf_bytes);
     w->hidden_cond_f32 = malloc(sizeof(float) * DIM);
     w->hidden_uncond_f32 = malloc(sizeof(float) * DIM);
     w->logits_cond = malloc(sizeof(float) * AUDIO_VOCAB);
@@ -523,44 +513,12 @@ static bool depth_worker_compile(DepthWorker *w, NSString *root, int max_compile
         (w->seqpack && !w->packed_prefix) ||
         !w->hidden_cond_f32 || !w->hidden_uncond_f32 ||
         !w->logits_cond || !w->logits_uncond || !w->combined) {
+        fprintf(stderr, "depth-serve: allocation failed during worker startup\n");
+        depth_worker_cleanup(w);
         return false;
     }
     w->ready = true;
     return true;
-}
-
-// Apply final RMSNorm host-side to one slot's hidden state, in fp32.
-// norm_out = x / sqrt(mean(x^2) + eps) * scale
-static void host_rmsnorm(const _Float16 *surface, int slot, const _Float16 *scale,
-                         float eps, float *out) {
-    // Gather the row to fp32.
-    float sq_sum = 0.0f;
-    for (int c = 0; c < DIM; c++) {
-        float v = (float)surface[(size_t)c * SEQ + slot];
-        out[c] = v;
-        sq_sum += v * v;
-    }
-    float rms = sqrtf(sq_sum / (float)DIM + eps);
-    float inv = 1.0f / rms;
-    for (int c = 0; c < DIM; c++) {
-        out[c] = out[c] * inv * (float)scale[c];
-    }
-}
-
-// Variable-seq variant for seqpack surfaces [1, DIM, 1, seq_len].
-static void host_rmsnorm_custom(const _Float16 *surface, int slot, int seq_len,
-                                const _Float16 *scale, float eps, float *out) {
-    float sq_sum = 0.0f;
-    for (int c = 0; c < DIM; c++) {
-        float v = (float)surface[(size_t)c * seq_len + slot];
-        out[c] = v;
-        sq_sum += v * v;
-    }
-    float rms = sqrtf(sq_sum / (float)DIM + eps);
-    float inv = 1.0f / rms;
-    for (int c = 0; c < DIM; c++) {
-        out[c] = out[c] * inv * (float)scale[c];
-    }
 }
 
 // Run one real recurrence frame. Inputs are passed either as base64 in the
@@ -619,18 +577,26 @@ static bool depth_worker_run_frame(DepthWorker *w, NSString *input_dir,
             // Apply final RMSNorm host-side (the seq32 final-norm graph is
             // incompatible with seq64 surfaces, so we read layer-3 raw output
             // and normalize on the CPU: out = x/rms(x) * scale).
-            if (w->final_norm_scale) {
-                host_rmsnorm_custom(w->output, active, w->seq_len,
-                                    w->final_norm_scale, ORION_VOXTREAM_DEPTH_RMS_EPS,
-                                    w->hidden_cond_f32);
-                host_rmsnorm_custom(w->output, 32 + active, w->seq_len,
-                                    w->final_norm_scale, ORION_VOXTREAM_DEPTH_RMS_EPS,
-                                    w->hidden_uncond_f32);
-            } else {
-                fp16_row_to_f32_custom(w->output, active, w->seq_len,
-                                       w->hidden_cond_f32);
-                fp16_row_to_f32_custom(w->output, 32 + active, w->seq_len,
-                                       w->hidden_uncond_f32);
+            // Apply the checked CPU RMSNorm to each branch (seq32 ANE norm graph
+            // is incompatible with seq64 surfaces). Any helper failure fails the
+            // frame: no identity/pre-norm fallback is permitted.
+            OrionDepthServeSupportStatus cond_norm_status =
+                orion_depth_serve_host_rmsnorm_checked(
+                    w->output, DIM, w->seq_len, (size_t)active,
+                    w->final_norm_scale, ORION_VOXTREAM_DEPTH_RMS_EPS,
+                    w->hidden_cond_f32);
+            OrionDepthServeSupportStatus uncond_norm_status =
+                orion_depth_serve_host_rmsnorm_checked(
+                    w->output, DIM, w->seq_len, (size_t)(32 + active),
+                    w->final_norm_scale, ORION_VOXTREAM_DEPTH_RMS_EPS,
+                    w->hidden_uncond_f32);
+            if (cond_norm_status != ORION_DEPTH_SERVE_SUPPORT_OK ||
+                uncond_norm_status != ORION_DEPTH_SERVE_SUPPORT_OK) {
+                fprintf(stderr, "depth-serve: seqpack final RMSNorm failed at step %d (%s/%s)\n",
+                        step,
+                        orion_depth_serve_support_status_string(cond_norm_status),
+                        orion_depth_serve_support_status_string(uncond_norm_status));
+                return false;
             }
 
             const float *head_step = w->audio_head + (size_t)step * DIM * AUDIO_VOCAB;
@@ -676,15 +642,17 @@ static bool depth_worker_run_frame(DepthWorker *w, NSString *input_dir,
             orion_tensor_write(w->chain[0], w->prefix[branch], TENSOR_BYTES);
             bool eval_ok = true;
             for (int stage = 0; stage < LAYERS; stage++) {
-                if (!orion_eval(w->layer_programs[stage],
-                                &w->chain[stage], 1,
-                                &w->chain[stage + 1], 1)) {
+                if (!orion_eval_with_plan(w->layer_programs[stage],
+                                          &w->layer_plans[stage],
+                                          &w->chain[stage], 1,
+                                          &w->chain[stage + 1], 1)) {
                     eval_ok = false; break;
                 }
             }
-            if (eval_ok && !orion_eval(w->final_norm_program,
-                                       &w->chain[LAYERS], 1,
-                                       &w->chain[LAYERS + 1], 1)) {
+            if (eval_ok && !orion_eval_with_plan(w->final_norm_program,
+                                                 &w->final_norm_plan,
+                                                 &w->chain[LAYERS], 1,
+                                                 &w->chain[LAYERS + 1], 1)) {
                 eval_ok = false;
             }
             if (!eval_ok) return false;
@@ -709,6 +677,145 @@ static bool depth_worker_run_frame(DepthWorker *w, NSString *input_dir,
     }
     if (eval_ms_out) *eval_ms_out = monotonic_elapsed_ms(t0, monotonic_now());
     return true;
+}
+
+static void emit_depth_response(NSDictionary *response) {
+    NSMutableDictionary *versioned = [response mutableCopy];
+    versioned[@"protocol_version"] = @(DEPTH_PROTOCOL_VERSION);
+    NSError *error = nil;
+    NSData *json = [NSJSONSerialization dataWithJSONObject:versioned options:0 error:&error];
+    if (json) {
+        fwrite(json.bytes, 1, json.length, stdout);
+        fputc('\n', stdout);
+    } else {
+        // This is a fixed, valid protocol error fallback; never emit diagnostics
+        // to stdout, which is reserved exclusively for JSONL responses.
+        fprintf(stdout, "{\"protocol_version\":1,\"ok\":false,\"error\":\"response-encode-failed\"}\n");
+    }
+    fflush(stdout);
+}
+
+static void emit_depth_error(NSNumber *frame_id, NSString *error) {
+    NSMutableDictionary *response = [@{ @"ok": @NO, @"error": error } mutableCopy];
+    if (frame_id) response[@"frame_id"] = frame_id;
+    emit_depth_response(response);
+}
+
+static bool is_json_number(id value) {
+    return [value isKindOfClass:[NSNumber class]] &&
+           CFGetTypeID((__bridge CFTypeRef)value) != CFBooleanGetTypeID();
+}
+
+static bool json_exact_integer(id value, int64_t min, int64_t max, int64_t *out) {
+    if (!is_json_number(value)) return false;
+    double number = [value doubleValue];
+    if (!isfinite(number) || trunc(number) != number ||
+        number < (double)min || number > (double)max) {
+        return false;
+    }
+    if (out) *out = (int64_t)number;
+    return true;
+}
+
+static bool json_finite_number_in_range(id value, double min, double max,
+                                        double *out) {
+    if (!is_json_number(value)) return false;
+    double number = [value doubleValue];
+    if (!isfinite(number) || number < min || number > max) return false;
+    if (out) *out = number;
+    return true;
+}
+
+static bool strict_base64_tensor(NSString *encoded, NSData **decoded_out) {
+    if (![encoded isKindOfClass:[NSString class]]) return false;
+    NSData *decoded = [[NSData alloc] initWithBase64EncodedString:encoded options:0];
+    if (!decoded || decoded.length != TENSOR_BYTES) return false;
+    // Require canonical base64 so whitespace, ignored characters, and malformed
+    // padding cannot be silently accepted by Foundation's decoder.
+    if (![[decoded base64EncodedStringWithOptions:0] isEqualToString:encoded]) return false;
+    if (decoded_out) *decoded_out = decoded;
+    return true;
+}
+
+static bool existing_directory(NSString *path) {
+    if (![path isKindOfClass:[NSString class]] || path.length == 0) return false;
+    BOOL is_dir = NO;
+    return [[NSFileManager defaultManager] fileExistsAtPath:path isDirectory:&is_dir] && is_dir;
+}
+
+// Check the entry's type and size before Foundation reads it, preventing a
+// request from making the worker ingest a device, FIFO, directory, or huge file.
+static bool regular_file_with_exact_size(NSString *path, size_t expected_size) {
+    if (![path isKindOfClass:[NSString class]] || path.length == 0) return false;
+    struct stat st;
+    const char *fs_path = path.fileSystemRepresentation;
+    if (!fs_path || stat(fs_path, &st) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_size < 0 || (uintmax_t)st.st_size != (uintmax_t)expected_size) {
+        return false;
+    }
+    return true;
+}
+
+static bool request_has_exact_keys(NSDictionary *request, NSArray<NSString *> *keys) {
+    if (request.count != keys.count) return false;
+    for (NSString *key in keys) {
+        if (request[key] == nil) return false;
+    }
+    return true;
+}
+
+static bool parse_max_compile(const char *text, int *out) {
+    if (!text || !*text || !out) return false;
+    errno = 0;
+    char *end = NULL;
+    long value = strtol(text, &end, 10);
+    if (errno == ERANGE || end == text || *end != '\0' ||
+        value < 1 || value > INT_MAX) {
+        return false;
+    }
+    *out = (int)value;
+    return true;
+}
+
+// Write exactly one complete tokens.bin into an already existing output directory.
+static bool write_tokens_bin_checked(NSString *output_dir, const int32_t *tokens) {
+    if (!existing_directory(output_dir) || !tokens) return false;
+    uint8_t bytes[DEPTH_STEPS * sizeof(int32_t)];
+    for (int i = 0; i < DEPTH_STEPS; i++) {
+        write_le32(bytes + (size_t)i * sizeof(int32_t), (uint32_t)tokens[i]);
+    }
+    NSError *error = nil;
+    NSString *path = [output_dir stringByAppendingPathComponent:@"tokens.bin"];
+    return [[NSData dataWithBytes:bytes length:sizeof(bytes)] writeToFile:path
+        options:NSDataWritingAtomic error:&error];
+}
+
+static void discard_stdin_line_remainder(void) {
+    int ch;
+    while ((ch = fgetc(stdin)) != '\n' && ch != EOF) {}
+}
+
+// Returns 0 at clean EOF, 1 for a complete request, 2 after discarding an
+// overlong request, or 3 for a non-empty unterminated EOF request. `length`
+// excludes the newline delimiter.
+static int read_bounded_request_line(uint8_t *buffer, size_t *length) {
+    size_t len = 0;
+    int ch;
+    while ((ch = fgetc(stdin)) != EOF) {
+        if (ch == '\n') {
+            *length = len;
+            return 1;
+        }
+        // Allow one extra byte only for CR in a CRLF-delimited max-size line.
+        if (len == MAX_REQUEST_BYTES + 1u) {
+            discard_stdin_line_remainder();
+            return 2;
+        }
+        buffer[len++] = (uint8_t)ch;
+    }
+    if (len == 0) return 0;
+    *length = len;
+    return 3;
 }
 
 static void print_depth_serve_help(void) {
@@ -743,7 +850,11 @@ int orion_cmd_depth_serve(int argc, const char *argv[]) {
             } else if (strcmp(argv[i], "--audio-head") == 0 && i + 1 < argc) {
                 audio_head_arg = argv[++i];
             } else if (strcmp(argv[i], "--max-compile") == 0 && i + 1 < argc) {
-                max_compile = atoi(argv[++i]);
+                if (!parse_max_compile(argv[++i], &max_compile)) {
+                    fprintf(stderr, "depth-serve: --max-compile must be an integer from 1 to %d\n",
+                            INT_MAX);
+                    return 1;
+                }
             } else if (strcmp(argv[i], "--seqpack") == 0) {
                 seqpack_mode = true;
             } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -783,6 +894,14 @@ int orion_cmd_depth_serve(int argc, const char *argv[]) {
             return 1;
         }
 
+        // Allocate the bounded request buffer before readiness, so a ready
+        // worker always has the storage required to accept a request.
+        uint8_t *line = malloc(MAX_REQUEST_BYTES + 1u);  // plus an optional CR
+        if (!line) {
+            fprintf(stderr, "depth-serve: cannot allocate request buffer\n");
+            return 1;
+        }
+
         // Compile programs + allocate surfaces (one-time cost).
         DepthWorker worker = {0};
         worker.seqpack = seqpack_mode;
@@ -792,6 +911,8 @@ int orion_cmd_depth_serve(int argc, const char *argv[]) {
         uint64_t t0 = monotonic_now();
         if (!depth_worker_compile(&worker, root, max_compile)) {
             fprintf(stderr, "depth-serve: compilation failed\n");
+            depth_worker_cleanup(&worker);
+            free(line);
             return 1;
         }
         fprintf(stderr, "depth-serve: ready, %d compiles in %.0f ms\n",
@@ -799,135 +920,172 @@ int orion_cmd_depth_serve(int argc, const char *argv[]) {
                 monotonic_elapsed_ms(t0, monotonic_now()));
 
         // Signal readiness on stdout (the Python side waits for this).
-        printf("{\"ready\":true,\"compile_count\":%d}\n", worker.compile_count);
-        fflush(stdout);
+        emit_depth_response(@{ @"ready": @YES,
+                               @"compile_count": @(worker.compile_count) });
 
-        // Frame request loop: read JSON lines from stdin, respond on stdout.
-        // Frame requests carry base64 hidden states (~178KB per request), so
-        // use getline() which dynamically grows the buffer. NULL init lets
-        // getline allocate; we free at the end.
-        char *line = NULL;
-        size_t line_cap = 0;
-        while (getline(&line, &line_cap, stdin) != -1) {
-            // Strip trailing newline.
-            size_t len = strlen(line);
-            while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
-                line[--len] = '\0';
+        // Read bounded JSONL requests. Discard an oversized line completely so
+        // malformed input never desynchronizes recovery of later requests.
+        size_t len = 0;
+        int line_status = 0;
+        while ((line_status = read_bounded_request_line(line, &len)) != 0) {
+            @autoreleasepool {
+                @try {
+            if (line_status == 3) {
+                emit_depth_error(nil, @"unterminated-request");
+                break;
             }
-            if (len == 0) continue;
-
-            NSData *line_data = [NSData dataWithBytes:line length:len];
-            NSDictionary *req = [NSJSONSerialization JSONObjectWithData:line_data
-                options:0 error:nil];
-            if (!req || ![req isKindOfClass:[NSDictionary class]]) {
-                printf("{\"ok\":false,\"error\":\"invalid-json\"}\n");
-                fflush(stdout);
+            if (line_status == 2) {
+                emit_depth_error(nil, @"request-too-large");
+                continue;
+            }
+            if (len > 0 && line[len - 1] == '\r') len--;
+            if (len > MAX_REQUEST_BYTES) {
+                emit_depth_error(nil, @"request-too-large");
+                continue;
+            }
+            if (len == 0) {
+                emit_depth_error(nil, @"empty-request");
                 continue;
             }
 
-            // Shutdown command.
-            if ([req[@"cmd"] isEqualToString:@"shutdown"]) {
-                printf("{\"ok\":true,\"shutdown\":true}\n");
-                fflush(stdout);
+            id parsed = [NSJSONSerialization JSONObjectWithData:
+                [NSData dataWithBytes:line length:len] options:0 error:nil];
+            if (![parsed isKindOfClass:[NSDictionary class]]) {
+                emit_depth_error(nil, @"invalid-json-object");
+                continue;
+            }
+            NSDictionary *req = parsed;
+
+            // Every request, including shutdown, must explicitly negotiate v1.
+            int64_t protocol_version = 0;
+            if (!json_exact_integer(req[@"protocol_version"], DEPTH_PROTOCOL_VERSION,
+                                    DEPTH_PROTOCOL_VERSION, &protocol_version)) {
+                emit_depth_error(nil, @"unsupported-protocol-version");
+                continue;
+            }
+
+            id cmd = req[@"cmd"];
+            if (cmd) {
+                if (![cmd isKindOfClass:[NSString class]] ||
+                    ![(NSString *)cmd isEqualToString:@"shutdown"] ||
+                    !request_has_exact_keys(req, @[@"protocol_version", @"cmd"])) {
+                    emit_depth_error(nil, @"invalid-command");
+                    continue;
+                }
+                emit_depth_response(@{ @"ok": @YES, @"shutdown": @YES });
                 break;
             }
 
-            NSString *input_dir = req[@"input_dir"];
-            NSNumber *c0_num = req[@"c0"];
-            NSNumber *frame_id = req[@"frame_id"];
-            double gamma = req[@"gamma"] ? [req[@"gamma"] doubleValue] : DEFAULT_CFG_GAMMA;
-            int frame_id_int = frame_id ? [frame_id intValue] : -1;
-
-            if (!c0_num) {
-                printf("{\"ok\":false,\"frame_id\":%d,\"error\":\"missing-c0\"}\n",
-                       frame_id_int);
-                fflush(stdout);
+            bool has_input_dir = req[@"input_dir"] != nil;
+            bool has_cond_b64 = req[@"hidden_cond_b64"] != nil;
+            bool has_uncond_b64 = req[@"hidden_uncond_b64"] != nil;
+            bool has_b64_pair = has_cond_b64 && has_uncond_b64;
+            if ((has_input_dir && (has_cond_b64 || has_uncond_b64)) ||
+                (!has_input_dir && !has_b64_pair) ||
+                (has_cond_b64 != has_uncond_b64)) {
+                emit_depth_error(nil, @"invalid-hidden-input-method");
+                continue;
+            }
+            NSArray<NSString *> *frame_keys = has_input_dir
+                ? @[@"protocol_version", @"input_dir", @"output_dir", @"c0", @"gamma", @"frame_id"]
+                : @[@"protocol_version", @"hidden_cond_b64", @"hidden_uncond_b64",
+                    @"output_dir", @"c0", @"gamma", @"frame_id"];
+            if (!request_has_exact_keys(req, frame_keys)) {
+                emit_depth_error(nil, @"invalid-request-schema");
                 continue;
             }
 
-            // Resolve input hidden states: prefer base64 in the request
-            // (no file I/O); fall back to input_dir files.
+            int64_t frame_id_value = 0;
+            if (!json_exact_integer(req[@"frame_id"], INT32_MIN, INT32_MAX,
+                                    &frame_id_value)) {
+                emit_depth_error(nil, @"invalid-frame-id");
+                continue;
+            }
+            NSNumber *frame_id = @((int32_t)frame_id_value);
+
+            int64_t c0 = 0;
+            if (!json_exact_integer(req[@"c0"], 0, AUDIO_VOCAB - 1, &c0)) {
+                emit_depth_error(frame_id, @"invalid-c0");
+                continue;
+            }
+
+            double gamma = 0.0;
+            if (!json_finite_number_in_range(req[@"gamma"], 0.0, 100.0, &gamma)) {
+                emit_depth_error(frame_id, @"invalid-gamma");
+                continue;
+            }
+
+            NSString *output_dir = req[@"output_dir"];
+            if (!existing_directory(output_dir)) {
+                emit_depth_error(frame_id, @"invalid-output-dir");
+                continue;
+            }
+
+            id input_dir_value = req[@"input_dir"];
+            id cond_b64_value = req[@"hidden_cond_b64"];
+            id uncond_b64_value = req[@"hidden_uncond_b64"];
+
+            NSString *input_dir = nil;
             NSData *in_cond = nil;
             NSData *in_uncond = nil;
-            NSString *cond_b64 = req[@"hidden_cond_b64"];
-            NSString *uncond_b64 = req[@"hidden_uncond_b64"];
-            if (cond_b64 && uncond_b64) {
-                in_cond = [[NSData alloc] initWithBase64EncodedString:cond_b64
-                    options:NSDataBase64DecodingIgnoreUnknownCharacters];
-                in_uncond = [[NSData alloc] initWithBase64EncodedString:uncond_b64
-                    options:NSDataBase64DecodingIgnoreUnknownCharacters];
-            } else if (input_dir) {
-                in_cond = [NSData dataWithContentsOfFile:
-                    [input_dir stringByAppendingPathComponent:@"hidden_cond.fp16.bin"]];
-                in_uncond = [NSData dataWithContentsOfFile:
-                    [input_dir stringByAppendingPathComponent:@"hidden_uncond.fp16.bin"]];
-            } else {
-                printf("{\"ok\":false,\"frame_id\":%d,\"error\":\"no-hidden-inputs\"}\n",
-                       frame_id_int);
-                fflush(stdout);
+            if (has_input_dir) {
+                if (!existing_directory(input_dir_value)) {
+                    emit_depth_error(frame_id, @"invalid-input-dir");
+                    continue;
+                }
+                input_dir = input_dir_value;
+                NSString *cond_path = [input_dir stringByAppendingPathComponent:
+                    @"hidden_cond.fp16.bin"];
+                NSString *uncond_path = [input_dir stringByAppendingPathComponent:
+                    @"hidden_uncond.fp16.bin"];
+                if (!regular_file_with_exact_size(cond_path, TENSOR_BYTES) ||
+                    !regular_file_with_exact_size(uncond_path, TENSOR_BYTES)) {
+                    emit_depth_error(frame_id, @"invalid-hidden-tensor-files");
+                    continue;
+                }
+                in_cond = [NSData dataWithContentsOfFile:cond_path];
+                in_uncond = [NSData dataWithContentsOfFile:uncond_path];
+                if (in_cond.length != TENSOR_BYTES || in_uncond.length != TENSOR_BYTES) {
+                    emit_depth_error(frame_id, @"invalid-hidden-tensor-files");
+                    continue;
+                }
+            } else if (!strict_base64_tensor(cond_b64_value, &in_cond) ||
+                       !strict_base64_tensor(uncond_b64_value, &in_uncond)) {
+                emit_depth_error(frame_id, @"invalid-hidden-tensor-base64");
                 continue;
             }
 
             int32_t tokens[DEPTH_STEPS];
             double eval_ms = 0.0;
-            bool ok = depth_worker_run_frame(&worker, input_dir,
-                                             in_cond, in_uncond,
-                                             [c0_num intValue], gamma,
-                                             tokens, &eval_ms);
-            if (!ok) {
-                printf("{\"ok\":false,\"frame_id\":%d,\"error\":\"eval-failed\"}\n",
-                       frame_id_int);
-                fflush(stdout);
+            if (!depth_worker_run_frame(&worker, input_dir, in_cond, in_uncond,
+                                        (int)c0, gamma, tokens, &eval_ms)) {
+                emit_depth_error(frame_id, @"eval-failed");
+                continue;
+            }
+            if (!write_tokens_bin_checked(output_dir, tokens)) {
+                emit_depth_error(frame_id, @"output-write-failed");
                 continue;
             }
 
-            // Write tokens.bin to input_dir (so the Python side knows where to find it).
-            NSString *tokens_path = [input_dir stringByAppendingPathComponent:@"tokens.bin"];
-            NSMutableData *tdata = [NSMutableData dataWithCapacity:DEPTH_STEPS * 4];
-            for (int i = 0; i < DEPTH_STEPS; i++) {
-                uint8_t le[4] = {
-                    (uint8_t)((uint32_t)tokens[i] & 0xFF),
-                    (uint8_t)(((uint32_t)tokens[i] >> 8) & 0xFF),
-                    (uint8_t)(((uint32_t)tokens[i] >> 16) & 0xFF),
-                    (uint8_t)(((uint32_t)tokens[i] >> 24) & 0xFF),
-                };
-                [tdata appendBytes:le length:4];
-            }
-            [tdata writeToFile:tokens_path atomically:YES];
-
-            // Build response with token array.
             NSMutableArray *tok_arr = [NSMutableArray arrayWithCapacity:DEPTH_STEPS];
             for (int i = 0; i < DEPTH_STEPS; i++) [tok_arr addObject:@(tokens[i])];
-            NSDictionary *resp = @{
-                @"ok": @(YES),
-                @"frame_id": @(frame_id_int),
+            emit_depth_response(@{
+                @"ok": @YES,
+                @"frame_id": frame_id,
                 @"tokens": tok_arr,
                 @"eval_ms": @(eval_ms),
                 @"compile_count": @(worker.compile_count),
-            };
-            NSData *j = [NSJSONSerialization dataWithJSONObject:resp
-                options:0 error:nil];
-            printf("%.*s\n", (int)j.length, (const char *)j.bytes);
-            fflush(stdout);
+            });
+                } @catch (NSException *exception) {
+                    (void)exception;
+                    emit_depth_error(nil, @"request-handler-failed");
+                }
+            }
         }
 
-        // Cleanup.
-        if (worker.output) free(worker.output);
-        if (worker.packed_prefix) free(worker.packed_prefix);
-        if (worker.prefix[0]) free(worker.prefix[0]);
-        if (worker.prefix[1]) free(worker.prefix[1]);
-        if (worker.hidden_cond_f32) free(worker.hidden_cond_f32);
-        if (worker.hidden_uncond_f32) free(worker.hidden_uncond_f32);
-        if (worker.logits_cond) free(worker.logits_cond);
-        if (worker.logits_uncond) free(worker.logits_uncond);
-        if (worker.combined) free(worker.combined);
-        for (int i = 0; i < CHAIN_SURFACES; i++) {
-            if (worker.chain[i]) CFRelease(worker.chain[i]);
-        }
-        for (int i = 0; i < LAYERS; i++) {
-            if (worker.layer_programs[i]) orion_release_program(worker.layer_programs[i]);
-        }
-        if (worker.final_norm_program) orion_release_program(worker.final_norm_program);
+        // Cleanup: release programs/surfaces/buffers through the shared helper
+        // so the normal path uses the same release sequence as startup failures.
+        depth_worker_cleanup(&worker);
 
         if (line) free(line);
         return 0;

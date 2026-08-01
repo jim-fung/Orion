@@ -48,7 +48,7 @@
 //                    each tensor is a raw fp16 buffer (np.fromfile).
 //   --evidence       Write the timing/parity/compile JSON evidence here.
 //                    Omit to write the JSON to stdout (human summary -> stderr).
-//   --max-compile    Abort if the compile-count delta exceeds N (default 3).
+//   --max-compile    Abort if the compile-count delta exceeds N (default 5).
 //   --samples        Timed full-loop samples (default 30, max 100).
 //   --warmup         Untimed warmup loops (default 2, max 20).
 //   --host-overhead-ms  External host logits/sampling/embedding estimate (default 0).
@@ -66,11 +66,9 @@
 //   --c0             Semantic codebook-0 token (int, 0..2049). Required for --recurrence.
 //   --gamma          Acoustic CFG scale (default 3.0).
 //
-// Weight strategy (recurrence mode: 5 compiles, no aliasing):
-//   - Each layer 0..3: generate aggregate graph, build real layer-N blob,
-//     compile once (M5 Pro has no practical compile limit).
-//   - Final norm: compile once via orion_frontend_voxtream_depth_final_norm().
-// Diagnostic mode keeps the 2-compile donor-patch path for backward compat.
+// Weight strategy: five plan-verified compiles (layers 0..3 plus final norm).
+// Each depth layer consumes its canonical v1.5 aggregate BLOBFILE and v1.1
+// sidecar; raw assembly and unverified donor patching are not operational paths.
 //
 // Building this command consumes ZERO ANE compile budget; only invoking it does.
 
@@ -84,21 +82,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "apps/cli/commands/depth_canonical.h"
 #include "core/ane_runtime.h"
 #include "core/iosurface_tensor.h"
 #include "core/orion_error.h"
-#include "compiler/codegen.h"
 #include "compiler/frontends/voxtream_depth.h"
-#include "compiler/pipeline.h"
-#include "compiler/validate.h"
 
 #define DIM ORION_VOXTREAM_DEPTH_DIM
 #define SEQ ORION_VOXTREAM_DEPTH_ANE_SEQ
 #define ELEMENTS ((size_t)DIM * SEQ)
 #define TENSOR_BYTES (ELEMENTS * sizeof(_Float16))
-#define BLOB_HEADER_BYTES 128
-#define CHUNK_HEADER_BYTES 64
-#define FIRST_CHUNK_OFFSET 64
 #define MAX_ABS_GATE 0.03
 #define REL_L2_GATE 0.005
 #define DEPTH_STEPS 15
@@ -109,7 +102,7 @@
 #define DEPTH_BUDGET_MS 60.0
 #define FRAME_BUDGET_MS 80.0
 #define MARGIN_TARGET_MS 20.0
-#define DEFAULT_MAX_COMPILE 3
+#define DEFAULT_MAX_COMPILE 5
 #define MAX_SAMPLES 100
 #define DEFAULT_SAMPLES 30
 #define DEFAULT_WARMUP 2
@@ -133,47 +126,6 @@
 #define LOGICAL_TOKENS ORION_VOXTREAM_DEPTH_BUCKET
 
 // ---------------------------------------------------------------------------
-// Aggregate BLOBFILE chunk table (identical to the depth-loop test).
-// ---------------------------------------------------------------------------
-
-typedef struct {
-    const char *relative_path;
-    const char *mil_path;
-    size_t payload_bytes;
-    uint64_t chunk_offset;
-} AggregateEntry;
-
-static AggregateEntry kEntries[] = {
-    {"weights/layer0/rms1.bin", "@model_path/weights/layer0/rms1.bin", 2048, 0},
-    {"weights/layer0/wq.bin", "@model_path/weights/layer0/wq.bin", 2097152, 0},
-    {"weights/layer0/wk.bin", "@model_path/weights/layer0/wk.bin", 524288, 0},
-    {"weights/layer0/wv.bin", "@model_path/weights/layer0/wv.bin", 524288, 0},
-    {"weights/layer0/wo.bin", "@model_path/weights/layer0/wo.bin", 2097152, 0},
-    {"weights/layer0/rms2.bin", "@model_path/weights/layer0/rms2.bin", 2048, 0},
-    {"weights/layer0/w1.bin", "@model_path/weights/layer0/w1.bin", 16777216, 0},
-    {"weights/layer0/w2.bin", "@model_path/weights/layer0/w2.bin", 16777216, 0},
-    {"weights/layer0/w3.bin", "@model_path/weights/layer0/w3.bin", 16777216, 0},
-    {"constants/rope_q_cos.bin", "@model_path/constants/rope_q_cos.bin", 65536, 0},
-    {"constants/rope_q_sin.bin", "@model_path/constants/rope_q_sin.bin", 65536, 0},
-    {"constants/rope_q_perm.bin", "@model_path/constants/rope_q_perm.bin", 2097152, 0},
-    {"constants/rope_k_cos.bin", "@model_path/constants/rope_k_cos.bin", 16384, 0},
-    {"constants/rope_k_sin.bin", "@model_path/constants/rope_k_sin.bin", 16384, 0},
-    {"constants/rope_k_perm.bin", "@model_path/constants/rope_k_perm.bin", 131072, 0},
-    {"constants/causal_mask.bin", "@model_path/constants/causal_mask.bin", 2048, 0},
-};
-static const int kEntryCount = sizeof(kEntries) / sizeof(kEntries[0]);
-
-// ---------------------------------------------------------------------------
-// Byte + timing helpers (ported from the depth-loop test).
-// ---------------------------------------------------------------------------
-
-static void write_le32(uint8_t *dst, uint32_t value) {
-    dst[0] = (uint8_t)value;
-    dst[1] = (uint8_t)(value >> 8);
-    dst[2] = (uint8_t)(value >> 16);
-    dst[3] = (uint8_t)(value >> 24);
-}
-
 static uint32_t read_le32(const uint8_t *src) {
     return (uint32_t)src[0] | ((uint32_t)src[1] << 8) |
            ((uint32_t)src[2] << 16) | ((uint32_t)src[3] << 24);
@@ -183,20 +135,13 @@ static uint16_t read_le16(const uint8_t *src) {
     return (uint16_t)((uint16_t)src[0] | ((uint16_t)src[1] << 8));
 }
 
-static size_t align64(size_t value) {
-    return (value + 63u) & ~(size_t)63u;
-}
-
-static uint64_t monotonic_now(void) {
-    return mach_absolute_time();
-}
+static uint64_t monotonic_now(void) { return mach_absolute_time(); }
 
 static double monotonic_elapsed_ms(uint64_t start, uint64_t end) {
     static mach_timebase_info_data_t info;
     static dispatch_once_t once;
     dispatch_once(&once, ^{ mach_timebase_info(&info); });
-    return (double)(end - start) * (double)info.numer /
-           (double)info.denom / 1e6;
+    return (double)(end - start) * (double)info.numer / (double)info.denom / 1e6;
 }
 
 static int compare_double(const void *lhs, const void *rhs) {
@@ -207,11 +152,9 @@ static int compare_double(const void *lhs, const void *rhs) {
 static double percentile_sorted(const double *sorted, int count, double fraction) {
     if (count == 1) return sorted[0];
     double pos = fraction * (double)(count - 1);
-    int lo = (int)pos;
-    int hi = lo + 1;
+    int lo = (int)pos, hi = lo + 1;
     if (hi >= count) hi = count - 1;
-    double frac = pos - lo;
-    return sorted[lo] * (1.0 - frac) + sorted[hi] * frac;
+    return sorted[lo] * (1.0 - (pos - lo)) + sorted[hi] * (pos - lo);
 }
 
 static NSArray *sample_array(const double *samples, int count) {
@@ -220,170 +163,35 @@ static NSArray *sample_array(const double *samples, int count) {
     return array;
 }
 
-// mean / p50 / p95 / p99 over an arbitrary sample array. The scratch buffer is
-// fixed at MAX_ITERATION_SAMPLES so no VLA is needed.
 static NSDictionary *stats_dict(const double *samples, int count) {
-    if (count <= 0) {
-        return @{@"count": @(0)};
-    }
+    if (count <= 0) return @{@"count": @(0)};
     double sorted[MAX_ITERATION_SAMPLES];
     memcpy(sorted, samples, sizeof(double) * (size_t)count);
     qsort(sorted, (size_t)count, sizeof(double), compare_double);
     double sum = 0.0;
     for (int i = 0; i < count; i++) sum += samples[i];
-    double mean = sum / (double)count;
-    return @{
-        @"count": @(count),
-        @"mean_ms": @(mean),
-        @"p50_ms": @(percentile_sorted(sorted, count, 0.50)),
-        @"p95_ms": @(percentile_sorted(sorted, count, 0.95)),
-        @"p99_ms": @(percentile_sorted(sorted, count, 0.99)),
-        @"min_ms": @(sorted[0]),
-        @"max_ms": @(sorted[count - 1]),
-        @"samples_ms": sample_array(samples, count),
-    };
+    return @{@"count": @(count), @"mean_ms": @(sum / count),
+             @"p50_ms": @(percentile_sorted(sorted, count, 0.50)),
+             @"p95_ms": @(percentile_sorted(sorted, count, 0.95)),
+             @"p99_ms": @(percentile_sorted(sorted, count, 0.99)),
+             @"min_ms": @(sorted[0]), @"max_ms": @(sorted[count - 1]),
+             @"samples_ms": sample_array(samples, count)};
 }
 
 // ---------------------------------------------------------------------------
-// Aggregate-blob assembly + MIL generation (ported from the depth-loop test).
+// Canonical VoXtream v1.5 aggregate artifacts.
+//
+// The artifact-loading + plan-aware build helpers (load_canonical_layer_artifact,
+// build_canonical_layer, build_canonical_final_norm) live in the shared
+// apps/cli/commands/depth_canonical.{h,m} TU, used by both depth-eval and
+// depth-serve. See that header for the contract. depth-eval never reconstructs
+// aggregates from individual legacy blobs and has no raw-compile / donor-patch
+// path: the canonical artifacts are a hard contract.
 // ---------------------------------------------------------------------------
 
-static NSData *read_valid_single_blob(NSString *path, size_t expected_payload) {
-    NSData *data = [NSData dataWithContentsOfFile:path];
-    if (!data || data.length != BLOB_HEADER_BYTES + expected_payload) return nil;
-    const uint8_t *bytes = data.bytes;
-    if (bytes[0] != 1 || bytes[4] != 2 ||
-        bytes[64] != 0xef || bytes[65] != 0xbe ||
-        bytes[66] != 0xad || bytes[67] != 0xde || bytes[68] != 1 ||
-        read_le32(bytes + 72) != expected_payload || read_le32(bytes + 80) != 128) {
-        return nil;
-    }
-    return data;
-}
-
-static void write_chunk_header(uint8_t *bytes, size_t chunk_offset,
-                               size_t payload_bytes, size_t payload_offset) {
-    bytes[chunk_offset] = 0xef;
-    bytes[chunk_offset + 1] = 0xbe;
-    bytes[chunk_offset + 2] = 0xad;
-    bytes[chunk_offset + 3] = 0xde;
-    bytes[chunk_offset + 4] = 1;
-    write_le32(bytes + chunk_offset + 8, (uint32_t)payload_bytes);
-    write_le32(bytes + chunk_offset + 16, (uint32_t)payload_offset);
-}
-
-static void relative_path_for_layer(int index, int layer, char *buffer, size_t size) {
-    const char *prefix = "weights/layer0/";
-    const char *path = kEntries[index].relative_path;
-    if (strncmp(path, prefix, strlen(prefix)) == 0) {
-        snprintf(buffer, size, "weights/layer%d/%s", layer, path + strlen(prefix));
-    } else {
-        snprintf(buffer, size, "%s", path);
-    }
-}
-
-// Build one physical BLOBFILE containing every entry at its own chunk offset.
-// The chunk layout is identical for every layer so one MIL text serves all
-// layers through weight patching.
-static NSData *build_aggregate_blob(NSString *root, int layer) {
-    NSData *payloads[32];
-    char relative[256];
-    size_t total = BLOB_HEADER_BYTES;
-    for (int i = 0; i < kEntryCount; i++) {
-        relative_path_for_layer(i, layer, relative, sizeof(relative));
-        payloads[i] = read_valid_single_blob(
-            [root stringByAppendingPathComponent:@(relative)],
-            kEntries[i].payload_bytes);
-        if (!payloads[i]) {
-            fprintf(stderr, "depth-eval: cannot read validated blob %s\n", relative);
-            return nil;
-        }
-        size_t header_offset = i == 0 ? FIRST_CHUNK_OFFSET : align64(total);
-        kEntries[i].chunk_offset = (uint64_t)header_offset;
-        total = header_offset + CHUNK_HEADER_BYTES + kEntries[i].payload_bytes;
-    }
-    NSMutableData *aggregate = [NSMutableData dataWithLength:total];
-    uint8_t *out = aggregate.mutableBytes;
-    out[0] = 1;
-    out[4] = 2;
-    for (int i = 0; i < kEntryCount; i++) {
-        size_t header_offset = (size_t)kEntries[i].chunk_offset;
-        size_t payload_offset = header_offset + CHUNK_HEADER_BYTES;
-        write_chunk_header(out, header_offset, kEntries[i].payload_bytes,
-                           payload_offset);
-        memcpy(out + payload_offset,
-               (const uint8_t *)[payloads[i] bytes] + BLOB_HEADER_BYTES,
-               kEntries[i].payload_bytes);
-    }
-    return aggregate;
-}
-
-// Point every BLOBFILE const in the graph at the aggregate file chunk table.
-// The graph for layer N emits MIL paths `@model_path/weights/layer{N}/...`,
-// so we match against the layer-N-renamed table. Constants under
-// `constants/...` are shared across all layers (same mil_path).
-static bool rewrite_blob_refs(OrionGraph *g, int layer, int *rewritten) {
-    *rewritten = 0;
-    // Build the layer-N mil_path table for matching. Weight entries use
-    // `layer{N}`; constant entries keep their fixed `constants/...` path.
-    char layer_mil[32][256];
-    const char *prefix = "weights/layer0/";
-    for (int j = 0; j < kEntryCount; j++) {
-        const char *path = kEntries[j].mil_path;
-        if (strncmp(path + strlen("@model_path/"), prefix,
-                    strlen(prefix)) == 0) {
-            snprintf(layer_mil[j], sizeof(layer_mil[j]),
-                     "@model_path/weights/layer%d/%s", layer,
-                     path + strlen("@model_path/") + strlen(prefix));
-        } else {
-            snprintf(layer_mil[j], sizeof(layer_mil[j]), "%s", path);
-        }
-    }
-    for (int i = 0; i < g->n_nodes; i++) {
-        OrionNode *node = &g->nodes[i];
-        if (node->op != ORION_OP_CONST || !node->attrs.blob_path[0]) continue;
-        bool found = false;
-        for (int j = 0; j < kEntryCount; j++) {
-            if (strcmp(node->attrs.blob_path, layer_mil[j]) == 0) {
-                snprintf(node->attrs.blob_path, sizeof(node->attrs.blob_path),
-                         "@model_path/aggregate.bin");
-                node->attrs.blob_offset = kEntries[j].chunk_offset;
-                found = true;
-                (*rewritten)++;
-                break;
-            }
-        }
-        if (!found) {
-            fprintf(stderr, "depth-eval: graph references unaggregated blob %s\n",
-                    node->attrs.blob_path);
-            return false;
-        }
-    }
-    return true;
-}
-
-// Validate + optimize (production passes) but skip the ANE plan validation
-// that enforces one tensor per file at offset 64, then emit MIL directly.
-static NSString *generate_aggregate_mil(OrionGraph *g, int layer, int *rewritten) {
-    if (!g) return nil;
-    OrionValidationResult vr = orion_graph_validate(g);
-    if (!vr.valid) {
-        fprintf(stderr, "depth-eval: graph validation: %s\n", vr.message);
-        orion_graph_free(g);
-        return nil;
-    }
-    orion_pipeline_optimize(g);
-    if (!rewrite_blob_refs(g, layer, rewritten)) {
-        orion_graph_free(g);
-        return nil;
-    }
-    NSString *mil = orion_codegen_mil(g, "main");
-    orion_graph_free(g);
-    return mil;
-}
-
-static NSDictionary *wdict(NSData *aggregate) {
-    return @{@"@model_path/aggregate.bin": @{@"offset": @0, @"data": aggregate}};
+static bool eval_depth_layer(OrionProgram *program, const OrionBindingPlan *plan,
+                             IOSurfaceRef input, IOSurfaceRef output) {
+    return orion_eval_with_plan(program, plan, &input, 1, &output, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -573,8 +381,14 @@ static bool write_output_dir(NSString *out_dir, const _Float16 *cond_out,
     }
     NSString *p_cond = [out_dir stringByAppendingPathComponent:@"final_norm_cond.fp16.bin"];
     NSString *p_uncond = [out_dir stringByAppendingPathComponent:@"final_norm_uncond.fp16.bin"];
-    [[NSData dataWithBytes:cond_out length:bytes] writeToFile:p_cond atomically:YES];
-    [[NSData dataWithBytes:uncond_out length:bytes] writeToFile:p_uncond atomically:YES];
+    if (![[NSData dataWithBytes:cond_out length:bytes] writeToFile:p_cond atomically:YES]) {
+        fprintf(stderr, "depth-eval: cannot write output file %s\n", p_cond.UTF8String);
+        return false;
+    }
+    if (![[NSData dataWithBytes:uncond_out length:bytes] writeToFile:p_uncond atomically:YES]) {
+        fprintf(stderr, "depth-eval: cannot write output file %s\n", p_uncond.UTF8String);
+        return false;
+    }
 
     NSMutableDictionary *idx = [NSMutableDictionary dictionary];
     idx[@"schema"] = @"orion.cli.depth-eval-output/1.0";
@@ -601,8 +415,11 @@ static bool write_output_dir(NSString *out_dir, const _Float16 *cond_out,
                                                 options:NSJSONWritingPrettyPrinted |
                                                         NSJSONWritingSortedKeys
                                                   error:nil];
-    [j writeToFile:[out_dir stringByAppendingPathComponent:@"index.json"]
-        atomically:YES];
+    NSString *p_index = [out_dir stringByAppendingPathComponent:@"index.json"];
+    if (!j || ![j writeToFile:p_index atomically:YES]) {
+        fprintf(stderr, "depth-eval: cannot write output file %s\n", p_index.UTF8String);
+        return false;
+    }
     return true;
 }
 
@@ -615,7 +432,7 @@ static int depth_eval_exit_code(NSString *failure) {
     if ([failure isEqualToString:@"evaluation"]) return ORION_ERR_EVAL_FAILED;
     if ([failure isEqualToString:@"surface-allocation"] ||
         [failure isEqualToString:@"host-allocation"]) return ORION_ERR_SURFACE_INVALID;
-    if ([failure hasPrefix:@"aggregate"] || [failure hasPrefix:@"layer0"] ||
+    if ([failure hasPrefix:@"canonical"] || [failure hasPrefix:@"aggregate"] || [failure hasPrefix:@"layer0"] ||
         [failure hasPrefix:@"final"] || [failure hasPrefix:@"weight"]) {
         return ORION_ERR_COMPILE_FAILED;
     }
@@ -651,7 +468,7 @@ static void print_depth_eval_help(void) {
         "                           output hidden states as raw fp16 .bin + index.json.\n"
         "  --evidence PATH          Write timing/parity/compile JSON here.\n"
         "                           Default: write JSON to stdout.\n"
-        "  --max-compile N          Abort if compile-count delta > N (default 3).\n"
+        "  --max-compile N          Abort if compile-count delta > N (default 5).\n"
         "  --samples N              Timed full-loop samples (default 30, max 100).\n"
         "  --warmup N               Untimed warmup loops (default 2, max 20).\n"
         "  --host-overhead-ms F     External host overhead estimate (default 0).\n"
@@ -752,15 +569,6 @@ static void write_prefix_slot_fp32(_Float16 *surface, int slot,
                                    const float *row_f32, int dim) {
     for (int c = 0; c < dim; c++) {
         surface[(size_t)c * SEQ + slot] = (_Float16)row_f32[c];
-    }
-}
-
-// Write a fp16 row (e.g. last_hidden) into the surface at the given slot.
-// Source row_fp16 is dense [dim]; surface is channel-major.
-static void write_prefix_slot_fp16(_Float16 *surface, int slot,
-                                   const _Float16 *row_fp16, int dim) {
-    for (int c = 0; c < dim; c++) {
-        surface[(size_t)c * SEQ + slot] = row_fp16[c];
     }
 }
 
@@ -932,6 +740,22 @@ int orion_cmd_depth_eval(int argc, const char *argv[]) {
             return 1;
         }
 
+        // Preflight the full canonical contract before allocating input data or
+        // touching ANE. Older exports and partly-produced v1.5 exports never
+        // reach graph construction or any legacy fallback path.
+        for (int layer = 0; layer < LAYERS; layer++) {
+            CanonicalLayerArtifact artifact;
+            NSString *artifact_failure = nil;
+            if (!depth_canonical_load_layer_artifact(root, layer, &artifact,
+                                                     &artifact_failure)) {
+                fprintf(stderr,
+                        "depth-eval: canonical v1.5 aggregate contract unavailable "
+                        "for layer%d: %s\n", layer,
+                        artifact_failure.UTF8String ?: "unknown");
+                return ORION_ERR_COMPILE_FAILED;
+            }
+        }
+
         if (!orion_ane_init()) {
             fprintf(stderr, "depth-eval: ANE runtime unavailable (orion_ane_init failed)\n");
             return 1;
@@ -1012,7 +836,8 @@ int orion_cmd_depth_eval(int argc, const char *argv[]) {
         evidence[@"cfg_branches"] = @(CFG_BRANCHES);
         evidence[@"iterations_per_sample"] = @(ITERATIONS_PER_SAMPLE);
         evidence[@"layers"] = @(LAYERS);
-        evidence[@"weight_patches"] = @(LAYERS - 1);
+        evidence[@"artifact_contract"] = @"canonical-voxtream-v1.5-aggregate-plan-verified";
+        evidence[@"weight_patches"] = @(0);
         evidence[@"samples_requested"] = @(sample_count);
         evidence[@"warmup"] = @(warmup_count);
         evidence[@"max_compile"] = @(max_compile);
@@ -1031,89 +856,86 @@ int orion_cmd_depth_eval(int argc, const char *argv[]) {
         evidence[@"compiler_build"] = compiler_build ? @(compiler_build) : @"unspecified";
         evidence[@"compile_count_before"] = @(count_before);
 
-        // ---- Compile programs ----------------------------------------------
-        // Recurrence mode: 4 real layer compiles + 1 final norm (no aliasing).
-        // Diagnostic mode: 1 layer-0 compile + 3 donor patches + 1 final norm.
+        // ---- Compile canonical plan-bound programs --------------------------
+        // Every operational layer is compiled from its exporter-published
+        // aggregate blob and finalized binding plan.  Deliberately no raw
+        // compile or donor patch path remains: canonical artifacts are a hard
+        // contract, rather than an optional acceleration.
         OrionProgram *layer_programs[LAYERS];
-        for (int i = 0; i < LAYERS; i++) layer_programs[i] = nil;
+        OrionBindingPlan layer_plans[LAYERS];
+        NSString *layer_mils[LAYERS];
+        NSDictionary *layer_wdicts[LAYERS];
+        for (int i = 0; i < LAYERS; i++) {
+            layer_programs[i] = nil;
+            layer_plans[i] = (OrionBindingPlan){0};
+            layer_mils[i] = nil;
+            layer_wdicts[i] = nil;
+        }
         OrionProgram *final_norm_program = nil;
+        OrionBindingPlan final_norm_plan = {0};
         int compile_attempts = 0;
-        NSString *layer0_mil = nil;
-
-        if (recurrence_mode) {
-            // Compile each layer with its own real weights.
-            for (int n = 0; n < LAYERS && !failure; n++) {
-                NSData *aggregate_n = build_aggregate_blob(root, n);
-                if (!aggregate_n) { failure = @"aggregate-build"; break; }
-                int rewritten = 0;
-                NSString *mil_n = generate_aggregate_mil(
-                    orion_frontend_voxtream_depth_layer(n), n, &rewritten);
-                if (!mil_n) { failure = @"layer-mil-generation"; break; }
-                if (n == 0) layer0_mil = mil_n;  // retained for diagnostics
-                char tag[32];
-                snprintf(tag, sizeof(tag), "depth-eval-layer%d-real", n);
-                compile_attempts++;
-                layer_programs[n] = orion_compile_mil(mil_n.UTF8String,
-                                                      wdict(aggregate_n), tag);
-                if (!layer_programs[n]) {
-                    char buf[64];
-                    snprintf(buf, sizeof(buf), "layer%d-compile", n);
-                    failure = @(buf);
-                    break;
-                }
+        OrionBindingPlanIdentity layer_identity = {
+            .orion_revision = revision ?: "depth-eval-canonical-artifact",
+            .compiler_build = compiler_build ?: "depth-eval-canonical-artifact",
+            .weight_root = root.fileSystemRepresentation,
+        };
+        for (int n = 0; n < LAYERS && !failure; n++) {
+            NSString *artifact_failure = nil;
+            NSString *layer_mil = nil;
+            NSDictionary *layer_wdict = nil;
+            char program_name[64];
+            snprintf(program_name, sizeof(program_name), "depth-eval-layer%d", n);
+            if (!depth_canonical_build_layer(root, n, program_name, &layer_identity,
+                    &layer_plans[n], &layer_mil, &layer_wdict, &artifact_failure)) {
+                fprintf(stderr, "depth-eval: canonical layer%d contract failed: %s\n", n,
+                        artifact_failure.UTF8String ?: "unknown");
+                failure = [@"canonical-" stringByAppendingString:
+                    artifact_failure ?: @"layer-artifact"];
+                break;
             }
-        } else {
-            // Diagnostic: donor-patch path (2 compiles total).
-            NSData *aggregate0 = build_aggregate_blob(root, 0);
-            if (!aggregate0) { failure = @"aggregate-build"; }
-            if (!failure) {
-                int rewritten = 0;
-                layer0_mil = generate_aggregate_mil(
-                    orion_frontend_voxtream_depth_layer(0), 0, &rewritten);
-                if (!layer0_mil) {
-                    failure = @"layer0-mil-generation";
-                } else {
-                    compile_attempts++;
-                    layer_programs[0] = orion_compile_mil(layer0_mil.UTF8String,
-                                                          wdict(aggregate0),
-                                                          "depth-eval-layer0");
-                    if (!layer_programs[0]) failure = @"layer0-compile";
-                }
-            }
-            for (int n = 1; n < LAYERS && !failure; n++) {
-                NSData *patched = build_aggregate_blob(root, n);
-                if (!patched) { failure = @"aggregate-build"; break; }
-                char tag[32];
-                snprintf(tag, sizeof(tag), "depth-eval-layer%d", n);
-                layer_programs[n] = orion_program_patch_weights(
-                    layer_programs[0], layer0_mil.UTF8String, wdict(patched), tag);
-                if (!layer_programs[n]) { failure = @"weight-patch"; break; }
+            layer_mils[n] = layer_mil;
+            layer_wdicts[n] = layer_wdict;
+            char tag[48], compile_error[512] = {0};
+            snprintf(tag, sizeof(tag), "depth-eval-layer%d-canonical", n);
+            compile_attempts++;
+            layer_programs[n] = orion_compile_mil_with_plan(layer_mils[n].UTF8String,
+                &layer_plans[n], layer_wdicts[n], tag, compile_error, sizeof(compile_error));
+            if (!layer_programs[n]) {
+                fprintf(stderr, "depth-eval: layer%d plan-verified compile: %s\n", n,
+                        compile_error[0] ? compile_error : "compiler rejected MIL");
+                failure = [NSString stringWithFormat:@"layer%d-compile", n];
             }
         }
 
-        // Final norm: one compile.
+        // Final norm remains a separate canonical single-chunk artifact.
         if (!failure) {
-            NSData *final_blob = read_valid_single_blob(
-                [root stringByAppendingPathComponent:@"weights/final_norm.bin"], 2048);
-            OrionGraph *final_graph = orion_frontend_voxtream_depth_final_norm();
+            NSData *final_blob = [NSData dataWithContentsOfFile:
+                [root stringByAppendingPathComponent:@"weights/final_norm.bin"]];
+            OrionBindingPlanIdentity identity = {
+                .orion_revision = revision ?: "depth-eval-final-norm",
+                .compiler_build = compiler_build ?: "depth-eval-final-norm",
+                .weight_root = root.fileSystemRepresentation,
+            };
             NSString *final_mil = nil;
-            if (final_blob && final_graph) {
-                OrionValidationResult fvr = orion_graph_validate(final_graph);
-                if (fvr.valid) {
-                    orion_pipeline_optimize(final_graph);
-                    final_mil = orion_codegen_mil(final_graph, "main");
-                }
-            }
-            if (final_graph) orion_graph_free(final_graph);
-            if (!final_mil) {
-                failure = @"final-norm-mil";
+            NSString *final_failure = nil;
+            if (!depth_canonical_build_final_norm(final_blob, "depth-eval-final-norm",
+                    &identity, &final_norm_plan, &final_mil, &final_failure)) {
+                fprintf(stderr, "depth-eval: final-norm canonical contract failed: %s\n",
+                        final_failure.UTF8String ?: "unknown");
+                failure = @"final-norm-plan";
             } else {
                 compile_attempts++;
-                final_norm_program = orion_compile_mil(final_mil.UTF8String,
+                char compile_error[512] = {0};
+                final_norm_program = orion_compile_mil_with_plan(
+                    final_mil.UTF8String, &final_norm_plan,
                     @{@"@model_path/weights/final_norm.bin":
                         @{@"offset": @0, @"data": final_blob}},
-                    "depth-eval-final-norm");
-                if (!final_norm_program) failure = @"final-norm-compile";
+                    "depth-eval-final-norm", compile_error, sizeof(compile_error));
+                if (!final_norm_program) {
+                    fprintf(stderr, "depth-eval: final-norm plan-verified compile: %s\n",
+                            compile_error);
+                    failure = @"final-norm-compile";
+                }
             }
         }
 
@@ -1147,8 +969,24 @@ int orion_cmd_depth_eval(int argc, const char *argv[]) {
 
         if (!failure) {
             for (int i = 0; i < CHAIN_SURFACES; i++) {
-                chain[i] = orion_tensor_create(DIM, SEQ);
-                if (!chain[i]) { failure = @"surface-allocation"; break; }
+                OrionSurfaceStatus surface_status = ORION_SURFACE_OK;
+                if (i == 0) {
+                    chain[i] = orion_tensor_create_for_binding(
+                        &layer_plans[0].inputs[0], &surface_status);
+                } else if (i < LAYERS) {
+                    chain[i] = orion_tensor_create_for_binding(
+                        &layer_plans[i - 1].outputs[0], &surface_status);
+                } else if (i == LAYERS) {
+                    chain[i] = orion_tensor_create_for_binding(
+                        &layer_plans[LAYERS - 1].outputs[0], &surface_status);
+                } else {
+                    chain[i] = orion_tensor_create_for_binding(
+                        &final_norm_plan.outputs[0], &surface_status);
+                }
+                if (!chain[i] || surface_status != ORION_SURFACE_OK) {
+                    failure = @"surface-allocation";
+                    break;
+                }
             }
             output = malloc(TENSOR_BYTES);
             repeat = malloc(TENSOR_BYTES);
@@ -1166,7 +1004,7 @@ int orion_cmd_depth_eval(int argc, const char *argv[]) {
         if (!failure && parity_run) {
             for (int batch = 0; batch < CFG_BRANCHES && !failure; batch++) {
                 orion_tensor_write(chain[0], inputs[batch].bytes, TENSOR_BYTES);
-                if (!orion_eval(layer_programs[0], &chain[0], 1, &chain[1], 1)) {
+                if (!eval_depth_layer(layer_programs[0], &layer_plans[0], chain[0], chain[1])) {
                     failure = @"evaluation";
                     break;
                 }
@@ -1195,22 +1033,22 @@ int orion_cmd_depth_eval(int argc, const char *argv[]) {
             orion_tensor_write(chain[0], inputs[0].bytes, TENSOR_BYTES);
             bool eval_ok = true;
             for (int stage = 0; stage < LAYERS; stage++) {
-                if (!orion_eval(layer_programs[stage], &chain[stage], 1,
-                                &chain[stage + 1], 1)) { eval_ok = false; break; }
+                if (!eval_depth_layer(layer_programs[stage], &layer_plans[stage],
+                                      chain[stage], chain[stage + 1])) { eval_ok = false; break; }
             }
-            if (eval_ok && !orion_eval(final_norm_program, &chain[LAYERS], 1,
-                                       &chain[LAYERS + 1], 1)) eval_ok = false;
+            if (eval_ok && !orion_eval_with_plan(final_norm_program, &final_norm_plan,
+                                       &chain[LAYERS], 1, &chain[LAYERS + 1], 1)) eval_ok = false;
             if (!eval_ok) {
                 failure = @"evaluation";
             } else {
                 orion_tensor_read(chain[LAYERS + 1], output, TENSOR_BYTES);
                 orion_tensor_write(chain[0], inputs[0].bytes, TENSOR_BYTES);
                 for (int stage = 0; stage < LAYERS && eval_ok; stage++) {
-                    if (!orion_eval(layer_programs[stage], &chain[stage], 1,
-                                    &chain[stage + 1], 1)) { eval_ok = false; }
+                    if (!eval_depth_layer(layer_programs[stage], &layer_plans[stage],
+                                      chain[stage], chain[stage + 1])) { eval_ok = false; }
                 }
-                if (eval_ok && !orion_eval(final_norm_program, &chain[LAYERS], 1,
-                                           &chain[LAYERS + 1], 1)) eval_ok = false;
+                if (eval_ok && !orion_eval_with_plan(final_norm_program, &final_norm_plan,
+                                           &chain[LAYERS], 1, &chain[LAYERS + 1], 1)) eval_ok = false;
                 if (!eval_ok) {
                     failure = @"evaluation";
                 } else {
@@ -1247,12 +1085,12 @@ int orion_cmd_depth_eval(int argc, const char *argv[]) {
                         uint64_t after_write = monotonic_now();
                         bool eval_ok = true;
                         for (int stage = 0; stage < LAYERS; stage++) {
-                            if (!orion_eval(layer_programs[stage], &chain[stage], 1,
-                                            &chain[stage + 1], 1)) {
+                            if (!eval_depth_layer(layer_programs[stage], &layer_plans[stage],
+                                          chain[stage], chain[stage + 1])) {
                                 eval_ok = false; break;
                             }
                         }
-                        if (eval_ok && !orion_eval(final_norm_program,
+                        if (eval_ok && !orion_eval_with_plan(final_norm_program, &final_norm_plan,
                                                    &chain[LAYERS], 1,
                                                    &chain[LAYERS + 1], 1)) eval_ok = false;
                         if (!eval_ok) { failure = @"evaluation"; break; }
@@ -1373,13 +1211,12 @@ int orion_cmd_depth_eval(int argc, const char *argv[]) {
                             // Run 4 layers + final norm.
                             bool eval_ok = true;
                             for (int stage = 0; stage < LAYERS; stage++) {
-                                if (!orion_eval(layer_programs[stage],
-                                                &chain[stage], 1,
-                                                &chain[stage + 1], 1)) {
+                                if (!eval_depth_layer(layer_programs[stage], &layer_plans[stage],
+                                                chain[stage], chain[stage + 1])) {
                                     eval_ok = false; break;
                                 }
                             }
-                            if (eval_ok && !orion_eval(final_norm_program,
+                            if (eval_ok && !orion_eval_with_plan(final_norm_program, &final_norm_plan,
                                                        &chain[LAYERS], 1,
                                                        &chain[LAYERS + 1], 1)) {
                                 eval_ok = false;
@@ -1435,8 +1272,9 @@ int orion_cmd_depth_eval(int argc, const char *argv[]) {
                                         token_dir.UTF8String);
                             } else {
                                 fprintf(stderr,
-                                        "depth-eval: WARNING could not write tokens.bin to %s\n",
+                                        "depth-eval: cannot write tokens.bin to %s\n",
                                         token_dir.UTF8String);
+                                failure = @"tokens-write";
                             }
                         } else {
                             fprintf(stderr,
@@ -1474,18 +1312,19 @@ int orion_cmd_depth_eval(int argc, const char *argv[]) {
                 orion_tensor_write(chain[0], inputs[batch].bytes, TENSOR_BYTES);
                 bool eval_ok = true;
                 for (int stage = 0; stage < LAYERS; stage++) {
-                    if (!orion_eval(layer_programs[stage], &chain[stage], 1,
-                                    &chain[stage + 1], 1)) { eval_ok = false; break; }
+                    if (!eval_depth_layer(layer_programs[stage], &layer_plans[stage],
+                                      chain[stage], chain[stage + 1])) { eval_ok = false; break; }
                 }
-                if (eval_ok && !orion_eval(final_norm_program, &chain[LAYERS], 1,
-                                           &chain[LAYERS + 1], 1)) eval_ok = false;
+                if (eval_ok && !orion_eval_with_plan(final_norm_program, &final_norm_plan,
+                                           &chain[LAYERS], 1, &chain[LAYERS + 1], 1)) eval_ok = false;
                 if (!eval_ok) { failure = @"evaluation"; break; }
                 _Float16 *dst = batch == 0 ? cond_out : uncond_out;
                 orion_tensor_read(chain[LAYERS + 1], dst, TENSOR_BYTES);
             }
-            if (!failure) {
-                write_output_dir(output_dir, cond_out, uncond_out, TENSOR_BYTES,
-                                 @"batch0=cond, batch1=uncond");
+            if (!failure &&
+                !write_output_dir(output_dir, cond_out, uncond_out, TENSOR_BYTES,
+                                  @"batch0=cond, batch1=uncond")) {
+                failure = @"output-write";
             }
         }
 
@@ -1536,7 +1375,7 @@ int orion_cmd_depth_eval(int argc, const char *argv[]) {
         evidence[@"margin_target_ms"] = @(MARGIN_TARGET_MS);
         evidence[@"frame_budget_passed"] = @(frame_budget_passed);
 
-        const int exit_code = depth_eval_exit_code(failure);
+        int exit_code = depth_eval_exit_code(failure);
         // `passed` requires parity only when parity references were available.
         const bool parity_ok = parity_run ? parity : true;
         // In recurrence mode, success is real token production; the timing
@@ -1563,15 +1402,22 @@ int orion_cmd_depth_eval(int argc, const char *argv[]) {
         NSData *json = [NSJSONSerialization dataWithJSONObject:evidence
             options:NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys error:nil];
         if (evidence_arg) {
-            [json writeToFile:@(evidence_arg) atomically:YES];
+            if (!json || ![json writeToFile:@(evidence_arg) atomically:YES]) {
+                fprintf(stderr, "depth-eval: cannot write evidence file %s\n", evidence_arg);
+                // The serialized evidence predates this publication failure, so do
+                // not claim that it records the failure stage.
+                failure = @"evidence-write";
+                exit_code = depth_eval_exit_code(failure);
+                passed = false;
+            }
         } else {
             printf("%.*s\n", (int)json.length, (const char *)json.bytes);
         }
 
         // ---- Console summary (stderr keeps stdout JSON clean) --------------
         fprintf(stderr, "depth loop: steps=%d branches=%d compiles=%d (budget %d) "
-                        "weight_patches=%d\n",
-                DEPTH_STEPS, CFG_BRANCHES, compile_delta, max_compile, LAYERS - 1);
+                        "canonical_plan_layers=%d\n",
+                DEPTH_STEPS, CFG_BRANCHES, compile_delta, max_compile, LAYERS);
         for (NSDictionary *batch in parity_results) {
             fprintf(stderr, "  layer0 batch %d: max_abs=%.6f relative_l2=%.6f %s\n",
                     [batch[@"batch"] intValue], [batch[@"max_abs"] doubleValue],

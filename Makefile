@@ -46,8 +46,10 @@ CLI_SRC = \
 	apps/cli/commands/infer.m \
 	apps/cli/commands/train.m \
 	apps/cli/commands/bench.m \
+	apps/cli/commands/depth_canonical.m \
 	apps/cli/commands/depth_eval.m \
-	apps/cli/commands/depth_serve.m
+	apps/cli/commands/depth_serve.m \
+	apps/cli/commands/depth_serve_support.m
 
 # Stage 2: Compiler sources (pure C + ObjC for codegen/adapter)
 COMPILER_C_SRC = \
@@ -82,10 +84,12 @@ COMPILER_M_SRC = \
 MAIN_SRC = apps/cli/main.m
 
 # All library sources (everything except main.m)
+RUNTIME_C_SRC = core/orion_compile_ledger.c
 LIB_SRC = $(CORE_SRC) $(INFERENCE_SRC) $(TRAINING_SRC) $(MODEL_SRC) $(TOKENIZER_SRC) $(CLI_SRC)
 
 # Object files for library
-LIB_OBJ  = $(patsubst %.m,$(BUILDDIR)/%.o,$(LIB_SRC))
+LIB_OBJ  = $(patsubst %.m,$(BUILDDIR)/%.o,$(LIB_SRC)) \
+           $(patsubst %.c,$(BUILDDIR)/%.o,$(RUNTIME_C_SRC))
 MAIN_OBJ = $(patsubst %.m,$(BUILDDIR)/%.o,$(MAIN_SRC))
 ALL_OBJ  = $(LIB_OBJ) $(MAIN_OBJ)
 
@@ -95,7 +99,7 @@ COMPILER_M_OBJ = $(patsubst %.m,$(BUILDDIR)/%.o,$(COMPILER_M_SRC))
 COMPILER_OBJ = $(COMPILER_C_OBJ) $(COMPILER_M_OBJ)
 
 # ---------------------------------------------------------------------------
-# Test binaries (21 total: 17 original + 4 compiler tests)
+# Test binaries (41 total: 35 runtime + 6 compiler)
 # ---------------------------------------------------------------------------
 
 TEST_NAMES = \
@@ -131,7 +135,9 @@ TEST_NAMES = \
 	test_voxtream_seqpack_plan_verified \
 	test_m5_compile_limit \
 	test_voxtream_seqpack_timing \
-	test_voxtream_seqpack_depth_loop_ane
+	test_voxtream_seqpack_depth_loop_ane \
+	test_depth_serve_support \
+	test_aggregate_plan_generation
 
 # Compiler tests (link with compiler objects, not full library)
 COMPILER_TEST_NAMES = \
@@ -149,7 +155,7 @@ COMPILER_TEST_BINS = $(patsubst %,$(BUILDDIR)/tests/%,$(COMPILER_TEST_NAMES))
 # Targets
 # ---------------------------------------------------------------------------
 
-.PHONY: all clean test test-compiler bench
+.PHONY: all clean test test-compiler test-depth-serve-lifecycle-static test-depth-serve-protocol-static bench
 
 all: orion
 
@@ -167,8 +173,8 @@ $(BUILDDIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) -O2 -Wall -Wextra -I . -I core -I compiler -c -o $@ $<
 
-# Build and run all test binaries (original 17 + 4 compiler tests)
-test: $(TEST_BINS) $(COMPILER_TEST_BINS)
+# Build and run all test binaries plus the static lifecycle and protocol tests.
+test: test-depth-serve-lifecycle-static test-depth-serve-protocol-static $(TEST_BINS) $(COMPILER_TEST_BINS)
 	@passed=0; failed=0; total=0; \
 	for t in $(TEST_BINS) $(COMPILER_TEST_BINS); do \
 		total=$$((total + 1)); \
@@ -185,6 +191,12 @@ test: $(TEST_BINS) $(COMPILER_TEST_BINS)
 	echo ""; \
 	echo "$$passed/$$total passed, $$failed failed"; \
 	if [ $$failed -gt 0 ]; then exit 1; fi
+
+test-depth-serve-lifecycle-static:
+	@python3 tests/test_depth_serve_lifecycle_static.py
+
+test-depth-serve-protocol-static:
+	@python3 tests/test_depth_serve_protocol_static.py
 
 # Run only compiler tests
 test-compiler: $(COMPILER_TEST_BINS)
