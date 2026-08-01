@@ -190,66 +190,43 @@ static int open_confined_fd(const char* weight_root, const char* relative_path,
     return current_fd;
 }
 
-static bool fd_sha256(int fd, char out[65]) {
-    if (lseek(fd, 0, SEEK_SET) < 0) return false;
-    CC_SHA256_CTX context;
-    CC_SHA256_Init(&context);
-    unsigned char buffer[16384];
-    ssize_t count = 0;
-    while ((count = read(fd, buffer, sizeof(buffer))) > 0)
-        CC_SHA256_Update(&context, buffer, (CC_LONG)count);
-    if (count < 0) return false;
-    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
-    CC_SHA256_Final(digest, &context);
-    hex_digest(digest, out);
-    return true;
-}
-
 static uint32_t read_le32(const unsigned char *bytes) {
     return (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
            ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24);
 }
 
-static bool validate_blobfile(int fd, size_t logical_bytes) {
-    unsigned char header[128];
+// Validate the individual 64-byte BLOBFILE chunk named by a plan weight.
+// The payload declaration belongs to that chunk header, not to the first chunk
+// or to the aggregate file as a whole.
+static bool validate_blobfile_for_weight(int fd, uint64_t offset, size_t logical_bytes,
+                                         uint64_t* out_payload_offset) {
+    unsigned char preamble[5];
+    unsigned char header[64];
     struct stat statbuf;
     if (fstat(fd, &statbuf) != 0 || !S_ISREG(statbuf.st_mode) ||
-        pread(fd, header, sizeof(header), 0) != (ssize_t)sizeof(header)) return false;
-    uint32_t payload_size = read_le32(header + 72);
-    uint32_t data_offset = read_le32(header + 80);
-    if (header[0] != 0x01 || header[4] != 0x02 ||
-        memcmp(header + 64, (unsigned char[]){0xef, 0xbe, 0xad, 0xde}, 4) != 0 ||
-        header[68] != 0x01 || data_offset != 128 || payload_size != logical_bytes) return false;
-    return (uint64_t)statbuf.st_size == (uint64_t)data_offset + payload_size;
+        statbuf.st_size < (off_t)sizeof(preamble) ||
+        pread(fd, preamble, sizeof(preamble), 0) != (ssize_t)sizeof(preamble) ||
+        preamble[0] != 0x01 || preamble[4] != 0x02 ||
+        offset > UINT64_MAX - sizeof(header) ||
+        offset > (uint64_t)statbuf.st_size ||
+        sizeof(header) > (uint64_t)statbuf.st_size - offset ||
+        pread(fd, header, sizeof(header), (off_t)offset) != (ssize_t)sizeof(header)) return false;
+    uint64_t payload_size = read_le32(header + 8);
+    uint64_t payload_offset = read_le32(header + 16);
+    if (memcmp(header, (unsigned char[]){0xef, 0xbe, 0xad, 0xde}, 4) != 0 ||
+        header[4] != 0x01 || payload_size != logical_bytes ||
+        payload_offset < offset + sizeof(header) ||
+        payload_offset > (uint64_t)statbuf.st_size ||
+        payload_size > (uint64_t)statbuf.st_size - payload_offset) return false;
+    if (out_payload_offset) *out_payload_offset = payload_offset;
+    return true;
 }
 
-// Validate a BLOBFILE header for a weight. Handles three cases:
-// 1. Legacy single-tensor (offset=64, file payload == logical_bytes).
-// 2. Aggregate first-chunk (offset=64, file payload > logical_bytes — multiple chunks).
-// 3. Aggregate subsequent-chunk (offset>64).
-static bool validate_blobfile_for_weight(int fd, uint64_t offset, size_t logical_bytes,
-                                         uint32_t* out_payload_size) {
-    unsigned char header[128];
-    struct stat statbuf;
-    if (fstat(fd, &statbuf) != 0 || !S_ISREG(statbuf.st_mode) ||
-        pread(fd, header, sizeof(header), 0) != (ssize_t)sizeof(header)) return false;
-    uint32_t payload_size = read_le32(header + 72);
-    uint32_t data_offset = read_le32(header + 80);
-    if (out_payload_size) *out_payload_size = payload_size;
-    if (header[0] != 0x01 || header[4] != 0x02 ||
-        memcmp(header + 64, (unsigned char[]){0xef, 0xbe, 0xad, 0xde}, 4) != 0 ||
-        header[68] != 0x01 || data_offset != 128) return false;
-
-    if (offset == 64 && payload_size == logical_bytes &&
-        (uint64_t)statbuf.st_size == (uint64_t)data_offset + payload_size) {
+static bool ranges_overlap(uint64_t left_offset, size_t left_size,
+                           uint64_t right_offset, size_t right_size) {
+    if (left_offset > UINT64_MAX - left_size || right_offset > UINT64_MAX - right_size)
         return true;
-    }
-    static const uint64_t CHUNK_HDR = 64;
-    uint64_t data_start = offset + CHUNK_HDR;
-    uint64_t data_end = data_start + logical_bytes;
-    if (data_start < data_offset) return false;
-    if (data_end > (uint64_t)data_offset + payload_size) return false;
-    return (uint64_t)statbuf.st_size >= data_end;
+    return left_offset < right_offset + right_size && right_offset < left_offset + left_size;
 }
 
 // Hash a byte range [offset, offset+length) within an open file descriptor.
@@ -348,6 +325,7 @@ bool orion_binding_plan_generate_with_identity(
         return false;
     }
     memset(out_plan, 0, sizeof(*out_plan));
+    uint64_t payload_offsets[ORION_MAX_PLAN_WEIGHTS] = {0};
     out_plan->version = ORION_BINDING_PLAN_VERSION;
     if (!copy_string(out_plan->program_name, sizeof(out_plan->program_name), program_name,
                      "program name", error, error_size)) return false;
@@ -401,22 +379,30 @@ bool orion_binding_plan_generate_with_identity(
             set_error(error, error_size, "cannot open weight '%s'", weight->name);
             return false;
         }
-        // Validate the BLOBFILE header and determine the hash offset.
-        uint32_t payload_size_for_weight = 0;
+        uint64_t payload_offset = 0;
         bool valid_file = validate_blobfile_for_weight(fd, weight->offset,
                                                        weight->logical_bytes,
-                                                       &payload_size_for_weight);
+                                                       &payload_offset);
         if (valid_file) {
-            static const uint64_t CHUNK_HDR = 64;
-            uint64_t hash_offset = weight->offset + CHUNK_HDR;
-            valid_file = fd_range_sha256(fd, hash_offset, weight->logical_bytes,
-                                         weight->sha256);
+            for (int prior = 0; prior < out_plan->n_weights - 1; prior++) {
+                const OrionBindingPlanWeight* other = &out_plan->weights[prior];
+                if (strcmp(other->path, weight->path) == 0 &&
+                    ranges_overlap(payload_offsets[prior], other->logical_bytes,
+                                   payload_offset, weight->logical_bytes)) {
+                    valid_file = false;
+                    break;
+                }
+            }
         }
+        if (valid_file)
+            valid_file = fd_range_sha256(fd, payload_offset, weight->logical_bytes,
+                                         weight->sha256);
         if (fd >= 0) close(fd);
         if (!valid_file) {
             set_error(error, error_size, "cannot hash weight '%s'", weight->name);
             return false;
         }
+        payload_offsets[out_plan->n_weights - 1] = payload_offset;
     }
     qsort(out_plan->weights, (size_t)out_plan->n_weights,
           sizeof(out_plan->weights[0]), weight_compare);
@@ -493,25 +479,6 @@ bool orion_binding_plan_validate(const OrionBindingPlan* plan, char* error,
             weight->logical_bytes != expected) {
             set_error(error, error_size, "binding-plan weight has invalid metadata");
             return false;
-        }
-    }
-    // For multi-chunk aggregate BLOBFILEs: weights sharing the same path must
-    // have non-overlapping byte ranges [offset, offset + logical_bytes). The
-    // legacy single-tensor-per-file layout (offset=64, one weight per path)
-    // trivially satisfies this check.
-    for (int i = 0; i < plan->n_weights; i++) {
-        const OrionBindingPlanWeight* a = &plan->weights[i];
-        for (int j = i + 1; j < plan->n_weights; j++) {
-            const OrionBindingPlanWeight* b = &plan->weights[j];
-            if (strcmp(a->path, b->path) != 0) continue;
-            uint64_t a_end = a->offset + a->logical_bytes;
-            uint64_t b_end = b->offset + b->logical_bytes;
-            if (a->offset < b_end && b->offset < a_end) {
-                set_error(error, error_size,
-                          "binding-plan weights '%s' and '%s' overlap in '%s'",
-                          a->name, b->name, a->path);
-                return false;
-            }
         }
     }
     return true;

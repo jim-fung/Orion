@@ -24,6 +24,13 @@ static void digest_hex(NSData* data, char out[65]) {
     for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) snprintf(out + i * 2, 3, "%02x", digest[i]);
 }
 
+static void write_le32(uint8_t* bytes, uint32_t value) {
+    bytes[0] = (uint8_t)value;
+    bytes[1] = (uint8_t)(value >> 8);
+    bytes[2] = (uint8_t)(value >> 16);
+    bytes[3] = (uint8_t)(value >> 24);
+}
+
 static void fill_entry(OrionBindingPlanEntry* entry, const char* name) {
     snprintf(entry->name, sizeof(entry->name), "%s", name);
     entry->dtype = ORION_DTYPE_FP16;
@@ -41,9 +48,9 @@ static NSDictionary* valid_dictionary(OrionBindingPlan* plan) {
     uint8_t* bytes = data.mutableBytes;
     bytes[0] = 1; bytes[4] = 2;
     bytes[64] = 0xef; bytes[65] = 0xbe; bytes[66] = 0xad; bytes[67] = 0xde;
-    bytes[68] = 1; bytes[72] = 8; bytes[80] = 128;
+    bytes[68] = 1; write_le32(bytes + 72, 8); write_le32(bytes + 80, 128);
     for (int i = 0; i < 8; i++) bytes[128 + i] = (uint8_t)(i + 1);
-    digest_hex(data, plan->weights[0].sha256);
+    digest_hex([data subdataWithRange:NSMakeRange(128, 8)], plan->weights[0].sha256);
     return @{ @"@model_path/weights/w.bin": @{ @"offset": @0, @"data": data } };
 }
 
@@ -77,11 +84,85 @@ static bool test_plan_weight_dictionary_is_exact(void) {
     NSMutableData* tampered_data = [good[@"@model_path/weights/w.bin"][@"data"] mutableCopy];
     ((uint8_t*)tampered_data.mutableBytes)[128] ^= 1;
     NSDictionary* tampered = @{ @"@model_path/weights/w.bin": @{ @"offset": @0, @"data": tampered_data } };
+    NSMutableData* bad_first_preamble = [good[@"@model_path/weights/w.bin"][@"data"] mutableCopy];
+    ((uint8_t*)bad_first_preamble.mutableBytes)[0] = 0;
+    NSMutableData* bad_second_preamble = [good[@"@model_path/weights/w.bin"][@"data"] mutableCopy];
+    ((uint8_t*)bad_second_preamble.mutableBytes)[4] = 0;
     return orion_validate_weight_dictionary_for_plan(&plan, good) &&
         !orion_validate_weight_dictionary_for_plan(&plan, @{}) &&
         !orion_validate_weight_dictionary_for_plan(&plan, extra) &&
         !orion_validate_weight_dictionary_for_plan(&plan, wrong_offset) &&
-        !orion_validate_weight_dictionary_for_plan(&plan, tampered);
+        !orion_validate_weight_dictionary_for_plan(&plan, tampered) &&
+        !orion_validate_weight_dictionary_for_plan(&plan,
+            @{ @"@model_path/weights/w.bin": @{ @"offset": @0, @"data": bad_first_preamble } }) &&
+        !orion_validate_weight_dictionary_for_plan(&plan,
+            @{ @"@model_path/weights/w.bin": @{ @"offset": @0, @"data": bad_second_preamble } });
+}
+
+static bool test_aggregate_weight_dictionary_hashes_chunk_payloads(void) {
+    OrionBindingPlan plan = {0};
+    plan.version = ORION_BINDING_PLAN_VERSION;
+    snprintf(plan.program_name, sizeof(plan.program_name), "aggregate-weight-test");
+    memset(plan.graph_identity, 'a', ORION_SHA256_HEX_LENGTH);
+    memset(plan.mil_identity, 'b', ORION_SHA256_HEX_LENGTH);
+    snprintf(plan.orion_revision, sizeof(plan.orion_revision), "test");
+    snprintf(plan.compiler_build, sizeof(plan.compiler_build), "test");
+    snprintf(plan.position_semantics, sizeof(plan.position_semantics), "fixed");
+    snprintf(plan.mask_semantics, sizeof(plan.mask_semantics), "fixed");
+    snprintf(plan.failure_semantics, sizeof(plan.failure_semantics), "fail-closed");
+    plan.n_inputs = plan.n_outputs = 1;
+    fill_entry(&plan.inputs[0], "hidden");
+    fill_entry(&plan.outputs[0], "hidden_out");
+    plan.n_weights = 2;
+    for (int i = 0; i < 2; i++) {
+        snprintf(plan.weights[i].name, sizeof(plan.weights[i].name), "w%d", i);
+        snprintf(plan.weights[i].path, sizeof(plan.weights[i].path),
+                 "@model_path/weights/aggregate.bin");
+        plan.weights[i].offset = i ? 136 : 64;
+        plan.weights[i].dtype = ORION_DTYPE_FP16;
+        plan.weights[i].shape[0] = 2; plan.weights[i].shape[1] = 2;
+        plan.weights[i].shape[2] = plan.weights[i].shape[3] = 1;
+        plan.weights[i].logical_bytes = 8;
+    }
+    NSMutableData* data = [NSMutableData dataWithLength:208];
+    uint8_t* bytes = data.mutableBytes;
+    // Production aggregate layout: each plan offset names its own chunk header.
+    // In particular the first chunk declares only its eight-byte payload.
+    bytes[0] = 1; bytes[4] = 2;
+    bytes[64] = 0xef; bytes[65] = 0xbe; bytes[66] = 0xad; bytes[67] = 0xde;
+    bytes[68] = 1; write_le32(bytes + 72, 8); write_le32(bytes + 80, 128);
+    bytes[136] = 0xef; bytes[137] = 0xbe; bytes[138] = 0xad; bytes[139] = 0xde;
+    bytes[140] = 1; write_le32(bytes + 144, 8); write_le32(bytes + 152, 200);
+    for (int i = 0; i < 8; i++) {
+        bytes[128 + i] = (uint8_t)(i + 1);
+        bytes[200 + i] = (uint8_t)(i + 9);
+    }
+    digest_hex([data subdataWithRange:NSMakeRange(128, 8)], plan.weights[0].sha256);
+    digest_hex([data subdataWithRange:NSMakeRange(200, 8)], plan.weights[1].sha256);
+    NSDictionary* good = @{ @"@model_path/weights/aggregate.bin": @{ @"offset": @0, @"data": data } };
+    NSMutableData* tampered_data = [data mutableCopy];
+    ((uint8_t*)tampered_data.mutableBytes)[200] ^= 1;
+    NSDictionary* tampered = @{ @"@model_path/weights/aggregate.bin": @{ @"offset": @0, @"data": tampered_data } };
+    NSMutableData* bad_header_data = [data mutableCopy];
+    ((uint8_t*)bad_header_data.mutableBytes)[136] ^= 1;
+    NSDictionary* bad_header = @{ @"@model_path/weights/aggregate.bin": @{ @"offset": @0, @"data": bad_header_data } };
+    NSMutableData* bad_range_data = [data mutableCopy];
+    write_le32((uint8_t*)bad_range_data.mutableBytes + 152, 204);
+    NSDictionary* bad_range = @{ @"@model_path/weights/aggregate.bin": @{ @"offset": @0, @"data": bad_range_data } };
+    NSMutableData* overlapping_data = [data mutableCopy];
+    write_le32((uint8_t*)overlapping_data.mutableBytes + 152, 128);
+    OrionBindingPlan dynamically_overlapping = plan;
+    digest_hex([overlapping_data subdataWithRange:NSMakeRange(128, 8)],
+               dynamically_overlapping.weights[1].sha256);
+    NSDictionary* dynamically_overlapping_dict = @{
+        @"@model_path/weights/aggregate.bin": @{ @"offset": @0, @"data": overlapping_data }
+    };
+    return orion_validate_weight_dictionary_for_plan(&plan, good) &&
+        !orion_validate_weight_dictionary_for_plan(&plan, tampered) &&
+        !orion_validate_weight_dictionary_for_plan(&plan, bad_header) &&
+        !orion_validate_weight_dictionary_for_plan(&plan, bad_range) &&
+        !orion_validate_weight_dictionary_for_plan(&dynamically_overlapping,
+                                                   dynamically_overlapping_dict);
 }
 
 static bool test_compile_with_plan_rejects_bad_dict_with_error(void) {
@@ -222,13 +303,18 @@ static bool test_adapted_kernel_compile_and_eval_path(void) {
     IOSurfaceRef input = orion_tensor_create_for_binding(&cached->inputs[0], &status);
     IOSurfaceRef output = orion_tensor_create_for_binding(&cached->outputs[0], &status);
     bool eval_ok = false;
+    bool foreign_plan_rejected = false;
     if (input && output && status == ORION_SURFACE_OK) {
+        OrionBindingPlan foreign_plan = *cached;
+        foreign_plan.graph_identity[0] = foreign_plan.graph_identity[0] == 'a' ? 'b' : 'a';
+        foreign_plan_rejected = !orion_eval_with_plan(first, &foreign_plan,
+                                                       &input, 1, &output, 1);
         eval_ok = orion_kernel_eval(&kernel, 0, 16, &cfg, "/tmp", &wb,
                                     &input, 1, &output, 1);
     }
     if (input) CFRelease(input);
     if (output) CFRelease(output);
-    return cached_hit && eval_ok &&
+    return cached_hit && foreign_plan_rejected && eval_ok &&
         strlen(cached->mil_identity) == ORION_SHA256_HEX_LENGTH;
 }
 
@@ -262,6 +348,7 @@ int main(void) {
     @autoreleasepool {
         printf("test_plan_weight_dict:\n");
         TEST(plan_weight_dictionary_is_exact);
+        TEST(aggregate_weight_dictionary_hashes_chunk_payloads);
         TEST(compile_with_plan_rejects_bad_dict_with_error);
         TEST(program_plan_accessor);
         TEST(program_plan_caches_plan_from_compile_with_plan);

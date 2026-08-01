@@ -18,6 +18,13 @@ static int g_passed = 0, g_failed = 0;
     else { printf("FAIL\n"); g_failed++; } \
 } while(0)
 
+static void write_le32(uint8_t* bytes, uint32_t value) {
+    bytes[0] = (uint8_t)value;
+    bytes[1] = (uint8_t)(value >> 8);
+    bytes[2] = (uint8_t)(value >> 16);
+    bytes[3] = (uint8_t)(value >> 24);
+}
+
 // Test: SRAM estimation for known dimensions
 static bool test_sram_normal(void) {
     OrionGraph* g = orion_graph_create();
@@ -300,8 +307,8 @@ static bool test_binding_plan_hashes_and_sizes_weights(void) {
     bytes[4] = 0x02;
     bytes[64] = 0xef; bytes[65] = 0xbe; bytes[66] = 0xad; bytes[67] = 0xde;
     bytes[68] = 0x01;
-    bytes[72] = 8;
-    bytes[80] = 128;
+    write_le32(bytes + 72, 8);
+    write_le32(bytes + 80, 128);
     [data writeToFile:path atomically:YES];
 
     OrionGraph* g = orion_graph_create();
@@ -348,36 +355,33 @@ static bool test_binding_plan_accepts_multichunk_aggregate(void) {
     [[NSFileManager defaultManager] createDirectoryAtPath:root
         withIntermediateDirectories:YES attributes:nil error:nil];
 
-    // Layout: [BLOB_HDR 128][chunk0_hdr 64][payload0 8][chunk1_hdr 64][payload1 8]
-    // Total = 128 + 64 + 8 + 64 + 8 = 272. payload_size = 272 - 128 = 144.
+    // Layout: preamble, header0@64/payload0@128, then header1@136/payload1@200.
+    // Each header independently declares its payload size at +8 and absolute
+    // payload offset at +16, matching the per-chunk parser.
     NSString* agg_path = [root stringByAppendingPathComponent:@"aggregate.blob"];
-    NSMutableData* data = [NSMutableData dataWithLength:272];
+    NSMutableData* data = [NSMutableData dataWithLength:208];
     uint8_t* bytes = data.mutableBytes;
     bytes[0] = 0x01; bytes[4] = 0x02;
     bytes[64] = 0xef; bytes[65] = 0xbe; bytes[66] = 0xad; bytes[67] = 0xde;
     bytes[68] = 0x01;
-    bytes[72] = 144;  // payload_size
-    bytes[80] = 128;  // data_offset
-    // Chunk 0 header at offset 128, payload at 192.
-    bytes[128] = 0xef; bytes[129] = 0xbe; bytes[130] = 0xad; bytes[131] = 0xde;
-    bytes[132] = 0x01;
-    // Chunk 1 header at offset 200, payload at 264.
-    bytes[200] = 0xef; bytes[201] = 0xbe; bytes[202] = 0xad; bytes[203] = 0xde;
-    bytes[204] = 0x01;
-    // Payloads.
-    for (int i = 0; i < 8; i++) bytes[192 + i] = (uint8_t)(i + 1);
-    for (int i = 0; i < 8; i++) bytes[264 + i] = (uint8_t)(i + 10);
+    write_le32(bytes + 72, 8);
+    write_le32(bytes + 80, 128);
+    bytes[136] = 0xef; bytes[137] = 0xbe; bytes[138] = 0xad; bytes[139] = 0xde;
+    bytes[140] = 0x01;
+    write_le32(bytes + 144, 8);
+    write_le32(bytes + 152, 200);
+    for (int i = 0; i < 8; i++) bytes[128 + i] = (uint8_t)(i + 1);
+    for (int i = 0; i < 8; i++) bytes[200 + i] = (uint8_t)(i + 10);
     [data writeToFile:agg_path atomically:YES];
 
     OrionGraph* g = orion_graph_create();
     int input_shape[4] = {1, 2, 1, 16};
     int weight_shape[4] = {2, 2, 1, 1};
     int x = orion_gb_input(g, "x", ORION_DTYPE_FP16, input_shape);
-    // Two weights: chunk0 at offset 128, chunk1 at offset 200.
     int w0 = orion_gb_const_weight(g, "w0", ORION_DTYPE_FP16, weight_shape,
-                                   "@model_path/aggregate.blob", 128);
+                                   "@model_path/aggregate.blob", 64);
     int w1 = orion_gb_const_weight(g, "w1", ORION_DTYPE_FP16, weight_shape,
-                                   "@model_path/aggregate.blob", 200);
+                                   "@model_path/aggregate.blob", 136);
     int conv0 = orion_gb_conv1x1(g, x, w0, -1, "c0", 2, 16);
     int conv1 = orion_gb_conv1x1(g, conv0, w1, -1, "c1", 2, 16);
     orion_gb_output(g, conv1, "y");
@@ -394,36 +398,39 @@ static bool test_binding_plan_accepts_multichunk_aggregate(void) {
     orion_graph_free(g);
     [[NSFileManager defaultManager] removeItemAtPath:root error:nil];
     return ok && plan.n_weights == 2 &&
-           plan.weights[0].offset == 128 && plan.weights[1].offset == 200;
+           plan.weights[0].offset == 64 && plan.weights[1].offset == 136;
 }
 
-// G009: Verify the binding plan rejects two weights that overlap in the same
-// aggregate BLOBFILE.
+// Physical payload declarations, rather than nominal chunk positions, govern
+// overlap. Distinct headers may maliciously point at the same payload.
 static bool test_binding_plan_rejects_overlapping_chunks(void) {
     NSString* root = [NSTemporaryDirectory() stringByAppendingPathComponent:
         [NSString stringWithFormat:@"orion-overlap-%@", NSUUID.UUID.UUIDString]];
     [[NSFileManager defaultManager] createDirectoryAtPath:root
         withIntermediateDirectories:YES attributes:nil error:nil];
 
-    // Layout with chunk headers: [BLOB_HDR 128][chunk0_hdr 64][payload0 8]
-    // w1 overlaps: its chunk header at 132 means payload at 196, overlapping payload0 at [192,200).
     NSString* agg_path = [root stringByAppendingPathComponent:@"aggregate.blob"];
-    NSMutableData* data = [NSMutableData dataWithLength:272];
+    NSMutableData* data = [NSMutableData dataWithLength:208];
     uint8_t* bytes = data.mutableBytes;
     bytes[0] = 0x01; bytes[4] = 0x02;
     bytes[64] = 0xef; bytes[65] = 0xbe; bytes[66] = 0xad; bytes[67] = 0xde;
-    bytes[68] = 0x01; bytes[72] = 144; bytes[80] = 128;
+    bytes[68] = 0x01;
+    write_le32(bytes + 72, 8);
+    write_le32(bytes + 80, 200);
+    bytes[136] = 0xef; bytes[137] = 0xbe; bytes[138] = 0xad; bytes[139] = 0xde;
+    bytes[140] = 0x01;
+    write_le32(bytes + 144, 8);
+    write_le32(bytes + 152, 200);  // same declared physical payload as w0
     [data writeToFile:agg_path atomically:YES];
 
     OrionGraph* g = orion_graph_create();
     int input_shape[4] = {1, 2, 1, 16};
     int weight_shape[4] = {2, 2, 1, 1};
     int x = orion_gb_input(g, "x", ORION_DTYPE_FP16, input_shape);
-    // w0 at offset 128, w1 at offset 132 — their payloads (at +64) overlap.
     int w0 = orion_gb_const_weight(g, "w0", ORION_DTYPE_FP16, weight_shape,
-                                   "@model_path/aggregate.blob", 128);
+                                   "@model_path/aggregate.blob", 64);
     int w1 = orion_gb_const_weight(g, "w1", ORION_DTYPE_FP16, weight_shape,
-                                   "@model_path/aggregate.blob", 132);
+                                   "@model_path/aggregate.blob", 136);
     int conv0 = orion_gb_conv1x1(g, x, w0, -1, "c0", 2, 16);
     int conv1 = orion_gb_conv1x1(g, conv0, w1, -1, "c1", 2, 16);
     orion_gb_output(g, conv1, "y");
@@ -435,9 +442,6 @@ static bool test_binding_plan_rejects_overlapping_chunks(void) {
     };
     OrionBindingPlan plan;
     char error[256] = {0};
-    // Plan generation should succeed (the generate function builds the plan)
-    // but validation should catch the overlap. Actually, generate calls
-    // validate internally — so this should return false.
     bool rejects = !orion_binding_plan_generate_with_identity(
         g, "overlap-test", &identity, &plan, error, sizeof(error));
     orion_graph_free(g);

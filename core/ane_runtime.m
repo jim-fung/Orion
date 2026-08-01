@@ -30,6 +30,33 @@ static NSString* sha256_hex(NSData* data) {
     return text;
 }
 
+// A plan weight offset identifies its 64-byte chunk header.  Each chunk carries
+// its own declared payload range; the header at byte 64 is not a file-wide
+// aggregate header.
+static bool blobfile_chunk_payload_range(NSData* data, uint64_t chunk_offset,
+                                         size_t logical_bytes, NSRange* out_range) {
+    static const uint64_t chunk_header_size = 64;
+    if (![data isKindOfClass:[NSData class]] || data.length < 5 ||
+        ((const uint8_t*)data.bytes)[0] != 0x01 ||
+        ((const uint8_t*)data.bytes)[4] != 0x02 ||
+        chunk_offset > UINT64_MAX - chunk_header_size ||
+        chunk_offset > (uint64_t)data.length ||
+        chunk_header_size > (uint64_t)data.length - chunk_offset) return false;
+    const uint8_t* header = (const uint8_t*)data.bytes + (NSUInteger)chunk_offset;
+    uint64_t payload_size = read_le32(header + 8);
+    uint64_t payload_offset = read_le32(header + 16);
+    if (header[0] != 0xef || header[1] != 0xbe || header[2] != 0xad ||
+        header[3] != 0xde || header[4] != 0x01 ||
+        payload_size != logical_bytes ||
+        payload_offset > (uint64_t)data.length ||
+        payload_size > (uint64_t)data.length - payload_offset ||
+        payload_offset < chunk_offset + chunk_header_size ||
+        payload_offset > NSUIntegerMax || payload_size > NSUIntegerMax) return false;
+    if (out_range) *out_range = NSMakeRange((NSUInteger)payload_offset,
+                                             (NSUInteger)payload_size);
+    return true;
+}
+
 bool orion_validate_weight_dictionary_for_plan(
     const OrionBindingPlan* plan, NSDictionary* weight_dict
 ) {
@@ -37,9 +64,10 @@ bool orion_validate_weight_dictionary_for_plan(
     NSDictionary* dictionary = weight_dict ?: @{};
     if (!plan || !orion_binding_plan_validate_finalized(plan, error, sizeof(error))) return false;
 
-    // Group weights by path: single-tensor files have one weight per path,
-    // aggregate multi-chunk files share one path across many weights.
-    NSMutableDictionary* paths_seen = [NSMutableDictionary dictionary];
+    // Dictionary keys correspond to physical BLOBFILEs, so aggregate chunks
+    // share one entry while each is independently range- and hash-verified.
+    NSMutableDictionary<NSString*, NSMutableArray<NSValue*>*>* payload_ranges =
+        [NSMutableDictionary dictionary];
     for (int i = 0; i < plan->n_weights; i++) {
         @autoreleasepool {
             const OrionBindingPlanWeight* weight = &plan->weights[i];
@@ -50,44 +78,26 @@ bool orion_validate_weight_dictionary_for_plan(
                 [entry[@"offset"] unsignedLongLongValue] != 0 ||
                 ![entry[@"data"] isKindOfClass:[NSData class]]) return false;
             NSData* data = entry[@"data"];
-            if (data.length < 128) return false;
-            const uint8_t* bytes = data.bytes;
-            if (bytes[0] != 0x01 || bytes[4] != 0x02 ||
-                bytes[64] != 0xef || bytes[65] != 0xbe ||
-                bytes[66] != 0xad || bytes[67] != 0xde || bytes[68] != 0x01 ||
-                read_le32(bytes + 80) != 128) return false;
-
-            if (weight->offset == 64) {
-                // Legacy single-tensor: the file IS this one weight.
-                if (paths_seen[path]) return false;  // duplicate path for single-tensor
-                if (read_le32(bytes + 72) != weight->logical_bytes) return false;
-                if (data.length != (NSUInteger)128 + weight->logical_bytes) return false;
-                if (![[sha256_hex(data) lowercaseString] isEqualToString:
-                      [[NSString stringWithUTF8String:weight->sha256] lowercaseString]])
-                    return false;
-                paths_seen[path] = @YES;
-            } else {
-                // Aggregate multi-chunk: validate this weight's payload at
-                // [offset+64, offset+64+logical_bytes) within the shared file.
-                if (!paths_seen[path]) {
-                    paths_seen[path] = @YES;
-                }
-                static const uint64_t CHUNK_HDR = 64;
-                uint64_t payload_start = weight->offset + CHUNK_HDR;
-                uint64_t payload_end = payload_start + weight->logical_bytes;
-                if (payload_start < 128 || payload_end > data.length) return false;
-                NSRange range = NSMakeRange((NSUInteger)payload_start, weight->logical_bytes);
-                NSData* chunk = [data subdataWithRange:range];
-                if (![[sha256_hex(chunk) lowercaseString] isEqualToString:
-                      [[NSString stringWithUTF8String:weight->sha256] lowercaseString]])
-                    return false;
-                paths_seen[path] = @YES;  // mark as validated
+            NSRange range;
+            if (!blobfile_chunk_payload_range(data, weight->offset, weight->logical_bytes, &range))
+                return false;
+            NSData* payload = [data subdataWithRange:range];
+            if (![[sha256_hex(payload) lowercaseString] isEqualToString:
+                  [[NSString stringWithUTF8String:weight->sha256] lowercaseString]])
+                return false;
+            NSMutableArray<NSValue*>* ranges = payload_ranges[path];
+            if (!ranges) {
+                ranges = [NSMutableArray array];
+                payload_ranges[path] = ranges;
             }
+            for (NSValue* existing in ranges) {
+                if (NSIntersectionRange(existing.rangeValue, range).length != 0) return false;
+            }
+            [ranges addObject:[NSValue valueWithRange:range]];
         }
     }
     // Verify every dictionary entry was consumed by at least one weight.
-    if (dictionary.count != paths_seen.count) return false;
-    return true;
+    return dictionary.count == payload_ranges.count;
 }
 
 #pragma mark - OrionProgram
@@ -106,23 +116,23 @@ static bool rebound_plan_for_weights(const OrionProgram* donor,
                                      NSDictionary* weight_dict,
                                      const char* patched_mil,
                                      OrionBindingPlan* out_plan) {
-    if (!donor || !donor->has_plan || !out_plan) return false;
+    if (!donor || !donor->has_plan || !patched_mil || !out_plan) return false;
     *out_plan = donor->plan;
-    if ((NSUInteger)out_plan->n_weights != weight_dict.count) return false;
     for (int i = 0; i < out_plan->n_weights; i++) {
         NSString* path = @(out_plan->weights[i].path);
         NSDictionary* entry = weight_dict[path];
         NSData* data = [entry isKindOfClass:[NSDictionary class]] ? entry[@"data"] : nil;
         if (![data isKindOfClass:[NSData class]]) return false;
-        unsigned char digest[CC_SHA256_DIGEST_LENGTH];
-        CC_SHA256(data.bytes, (CC_LONG)data.length, digest);
-        for (int j = 0; j < CC_SHA256_DIGEST_LENGTH; j++) {
-            snprintf(out_plan->weights[i].sha256 + j * 2, 3, "%02x", digest[j]);
-        }
-        out_plan->weights[i].sha256[ORION_SHA256_HEX_LENGTH] = '\0';
+        NSRange range;
+        if (!blobfile_chunk_payload_range(data, out_plan->weights[i].offset,
+                                    out_plan->weights[i].logical_bytes, &range)) return false;
+        NSData* payload = [data subdataWithRange:range];
+        NSString* digest = sha256_hex(payload);
+        strlcpy(out_plan->weights[i].sha256, digest.UTF8String,
+                sizeof(out_plan->weights[i].sha256));
     }
-    return orion_binding_plan_set_mil_identity(out_plan, patched_mil) &&
-           orion_validate_weight_dictionary_for_plan(out_plan, weight_dict);
+    if (!orion_binding_plan_set_mil_identity(out_plan, patched_mil)) return false;
+    return orion_validate_weight_dictionary_for_plan(out_plan, weight_dict);
 }
 
 static NSString* patched_mil_text(const char* mil_text, NSDictionary* weight_dict) {
@@ -364,14 +374,65 @@ bool orion_eval(
     }
 }
 
+static bool binding_entry_equal(const OrionBindingPlanEntry* left,
+                                const OrionBindingPlanEntry* right) {
+    return strcmp(left->name, right->name) == 0 && left->dtype == right->dtype &&
+        memcmp(left->declared_shape, right->declared_shape, sizeof(left->declared_shape)) == 0 &&
+        left->logical_bytes == right->logical_bytes &&
+        left->allocation_bytes == right->allocation_bytes &&
+        left->packed_prefix_bytes == right->packed_prefix_bytes &&
+        strcmp(left->layout, right->layout) == 0 &&
+        strcmp(left->allocation_layout, right->allocation_layout) == 0;
+}
+
+static bool plan_has_same_eval_abi(const OrionBindingPlan* supplied,
+                                   const OrionBindingPlan* cached) {
+    if (!supplied || !cached || supplied->version != cached->version ||
+        strcmp(supplied->program_name, cached->program_name) != 0 ||
+        strcmp(supplied->graph_identity, cached->graph_identity) != 0 ||
+        strcmp(supplied->orion_revision, cached->orion_revision) != 0 ||
+        strcmp(supplied->compiler_build, cached->compiler_build) != 0 ||
+        strcmp(supplied->position_semantics, cached->position_semantics) != 0 ||
+        strcmp(supplied->mask_semantics, cached->mask_semantics) != 0 ||
+        strcmp(supplied->failure_semantics, cached->failure_semantics) != 0 ||
+        supplied->n_inputs != cached->n_inputs ||
+        supplied->n_outputs != cached->n_outputs) return false;
+    for (int i = 0; i < supplied->n_inputs; i++)
+        if (!binding_entry_equal(&supplied->inputs[i], &cached->inputs[i])) return false;
+    for (int i = 0; i < supplied->n_outputs; i++)
+        if (!binding_entry_equal(&supplied->outputs[i], &cached->outputs[i])) return false;
+    return true;
+}
+
+// Weight hashes and MIL identity are provenance, not surface-evaluation ABI.
+// They must nevertheless exactly identify the cached program: a patched model
+// is evaluated only with its rebound plan from orion_program_plan().
+static bool plan_has_same_provenance(const OrionBindingPlan* supplied,
+                                     const OrionBindingPlan* cached) {
+    if (!supplied || !cached || strcmp(supplied->mil_identity, cached->mil_identity) != 0 ||
+        supplied->n_weights != cached->n_weights) return false;
+    for (int i = 0; i < supplied->n_weights; i++) {
+        const OrionBindingPlanWeight* left = &supplied->weights[i];
+        const OrionBindingPlanWeight* right = &cached->weights[i];
+        if (strcmp(left->name, right->name) != 0 || strcmp(left->path, right->path) != 0 ||
+            strcmp(left->sha256, right->sha256) != 0 || left->offset != right->offset ||
+            left->dtype != right->dtype ||
+            memcmp(left->shape, right->shape, sizeof(left->shape)) != 0 ||
+            left->logical_bytes != right->logical_bytes) return false;
+    }
+    return true;
+}
+
 bool orion_eval_with_plan(
     OrionProgram* prog, const OrionBindingPlan* plan,
     IOSurfaceRef* inputs, int num_inputs,
     IOSurfaceRef* outputs, int num_outputs
 ) {
     char error[256] = {0};
-    if (!prog || !plan || !inputs || !outputs ||
+    if (!prog || !prog->has_plan || !plan || !inputs || !outputs ||
         !orion_binding_plan_validate_finalized(plan, error, sizeof(error)) ||
+        !plan_has_same_eval_abi(plan, &prog->plan) ||
+        !plan_has_same_provenance(plan, &prog->plan) ||
         num_inputs != plan->n_inputs || num_outputs != plan->n_outputs) return false;
     for (int i = 0; i < num_inputs; i++) {
         if (orion_tensor_validate_for_binding(inputs[i], &plan->inputs[i]) !=
@@ -432,6 +493,12 @@ OrionProgram* orion_program_patch_weights(
         !donor->primary_weight_path[0]) return NULL;
 
     @autoreleasepool {
+        if (donor->has_plan) {
+            OrionBindingPlan caller_plan = donor->plan;
+            if (!orion_binding_plan_set_mil_identity(&caller_plan, mil_text) ||
+                strcmp(caller_plan.mil_identity, donor->plan.mil_identity) != 0)
+                return NULL;
+        }
         NSDictionary *wdict = weight_dict ?: @{};
         NSString* patchedMIL = patched_mil_text(mil_text, wdict);
         NSData *milData = [patchedMIL dataUsingEncoding:NSUTF8StringEncoding];

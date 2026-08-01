@@ -27,8 +27,9 @@ OrionProgram* orion_compile_mil(
 );
 
 /// Verify that a BLOBFILE dictionary exactly matches a generated binding plan.
-/// Each weight must be present once, use dictionary offset zero, contain a valid
-/// 128-byte BLOBFILE header, and match the plan's payload size and SHA-256.
+/// Each weight must be present through its BLOBFILE path, use dictionary offset
+/// zero, contain one exact BLOBFILE, and match the plan's chunk payload range
+/// and SHA-256. Aggregate BLOBFILE paths may satisfy multiple plan weights.
 bool orion_validate_weight_dictionary_for_plan(
     const OrionBindingPlan* plan, NSDictionary* weight_dict
 );
@@ -87,8 +88,10 @@ int orion_compile_count(void);
 /// The ANE compiler's "data" file IS the BLOBFILE. By creating a new model
 /// identity and copying the compiled net.plist + new BLOBFILE, we can load
 /// new weights without compiling. For a plan-bound donor, the returned program
-/// retains the donor ABI/MIL identity while recording and validating hashes for
-/// the replacement BLOBFILE bytes.
+/// retains an independently rebound plan whose provenance identity is the
+/// patched MIL text and whose weight hashes describe the replacement chunks.
+/// Evaluation compares that exact cached provenance plan; callers must obtain
+/// it with orion_program_plan() rather than reusing the donor plan.
 ///
 /// @param donor        A previously compiled OrionProgram (provides net.plist)
 /// @param mil_text     Same MIL text used to compile the donor
