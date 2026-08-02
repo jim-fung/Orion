@@ -237,7 +237,7 @@ All durations are accumulated host-observed monotonic nanoseconds for the accept
 
 The named phase durations do not have to sum to `frame_duration_ns`: recurrence control flow, counter maintenance, tensor conversion, error classification, and timer overhead are intentionally unattributed. A failed or not-invoked evaluation attempt can still contribute host elapsed time while the normative invocation counters identify whether the private selector boundary was entered.
 
-The diagnostic is not included in `semantic_request_sha256`, `program_set_digest`, token hashes, `receipt_sha256`, or receipt chaining. It is therefore correlated observational telemetry, not receipt-attested evidence. There is no diagnostic for a pre-acceptance rejection or shutdown. Consumers should capture standard error separately and select objects by `diagnostic_schema`; ordinary standard-error lines remain human-readable diagnostics.
+The diagnostic is best-effort: a full, closed, or otherwise unavailable stderr descriptor may cause the record to be dropped or partially written. Consumers must parse only complete JSON objects identified by `diagnostic_schema`; diagnostic loss or truncation must not be treated as a protocol failure. The diagnostic is not included in `semantic_request_sha256`, `program_set_digest`, token hashes, `receipt_sha256`, or receipt chaining. It is therefore correlated observational telemetry, not receipt-attested evidence. There is no diagnostic for a pre-acceptance rejection or shutdown. Consumers should capture standard error separately; ordinary standard-error lines remain human-readable diagnostics.
 
 ## Shutdown
 

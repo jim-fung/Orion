@@ -1097,7 +1097,12 @@ static NSDictionary *phase_timings_dictionary(const DepthPhaseTimings *timings) 
 }
 
 static bool configure_phase_timing_stderr(void) {
-    return fcntl(STDERR_FILENO, F_SETNOSIGPIPE, 1) == 0;
+    int flags = fcntl(STDERR_FILENO, F_GETFL);
+    if (flags < 0) return false;
+    if (fcntl(STDERR_FILENO, F_SETFL, flags | O_NONBLOCK) != 0) return false;
+    if (fcntl(STDERR_FILENO, F_SETNOSIGPIPE, 1) == 0) return true;
+    (void)fcntl(STDERR_FILENO, F_SETFL, flags);
+    return false;
 }
 
 static void emit_phase_timing_diagnostic(DepthPhaseTimings *timings,
@@ -1130,18 +1135,8 @@ static void emit_phase_timing_diagnostic(DepthPhaseTimings *timings,
         const uint8_t newline = '\n';
         [line appendBytes:&newline length:1];
         const uint8_t *bytes = line.bytes;
-        size_t offset = 0;
-        flockfile(stderr);
-        while (offset < line.length) {
-            ssize_t written = write(STDERR_FILENO, bytes + offset, line.length - offset);
-            if (written > 0) {
-                offset += (size_t)written;
-                continue;
-            }
-            if (written < 0 && errno == EINTR) continue;
-            break;
-        }
-        funlockfile(stderr);
+        ssize_t written = write(STDERR_FILENO, bytes, line.length);
+        (void)written;
     } @catch (__unused NSException *exception) {
         // Phase timing is best-effort and must never affect protocol lifetime.
     }
@@ -1509,11 +1504,14 @@ int orion_cmd_depth_serve(int argc, const char *argv[]) {
             bool eval_ok = depth_worker_run_frame(&worker, in_cond, in_uncond,
                                                   (int)c0, gamma, tokens, &counters,
                                                   phase_timings_ptr, &frame_failure);
-            uint64_t token_encoding_start = phase_start(phase_timings_ptr);
-            NSData *token_data = eval_ok ? tokens_data(tokens) : nil;
-            if (phase_timings_ptr)
-                phase_accumulate(phase_timings_ptr, token_encoding_start,
-                                 &phase_timings.token_encoding_ns);
+            NSData *token_data = nil;
+            if (eval_ok) {
+                uint64_t token_encoding_start = phase_start(phase_timings_ptr);
+                token_data = tokens_data(tokens);
+                if (phase_timings_ptr)
+                    phase_accumulate(phase_timings_ptr, token_encoding_start,
+                                     &phase_timings.token_encoding_ns);
+            }
             int compile_after = orion_compile_count();
             int compile_delta = compile_after - compile_before;
             bool counts_complete =

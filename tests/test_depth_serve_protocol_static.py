@@ -168,9 +168,10 @@ def test_phase_timings_are_opt_in_stderr_diagnostics_outside_v2_receipts() -> No
     assert 'DepthPhaseTimings *phase_timings_ptr =' in source
     assert 'phase_timings_enabled ? &phase_timings : NULL' in source
     assert 'static void emit_phase_timing_diagnostic(' in source
-    assert 'write(STDERR_FILENO, bytes + offset, line.length - offset)' in source
-    assert 'if (written < 0 && errno == EINTR) continue;' in source
-    assert 'flockfile(stderr)' in source and 'funlockfile(stderr)' in source
+    assert 'write(STDERR_FILENO, bytes, line.length)' in source
+    assert 'F_SETFL, flags | O_NONBLOCK' in source
+    assert '(void)fcntl(STDERR_FILENO, F_SETFL, flags);' in source
+    assert 'F_SETNOSIGPIPE' in source
     assert 'configure_phase_timing_stderr()' in source
     assert 'best-effort and must never affect protocol lifetime' in source
     assert '@"phase_duration_ns": phase_timings_dictionary(timings)' in source
