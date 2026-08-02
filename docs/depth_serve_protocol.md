@@ -194,6 +194,51 @@ The first accepted frame uses 64 zeroes as `previous_receipt_sha256`. Every succ
 10. on success only: unsigned `token_count` equal to 15, then unsigned fields `token0` through `token14`, digest `token_sha256`, digest `tokens_bin_sha256`;
 11. string `output_placement`.
 
+## Optional phase-timing diagnostics
+
+`--phase-timings` enables observational phase timing for controlled benchmark and qualification runs. It does not change protocol-v2 stdout: readiness, unreceipted errors, accepted-frame receipts, and shutdown acknowledgements retain their exact schemas. Instead, after an accepted frame receipt has been serialized, written, flushed, and committed to the receipt chain, the worker makes a best-effort attempt to write one compact JSON object to standard error:
+
+```json
+{
+  "diagnostic_schema": "voxtream.orion.depth-phase-timings/1",
+  "clock": "mach-absolute-time",
+  "worker_session_id": "550e8400-e29b-41d4-a716-446655440000",
+  "stream_session_id": "stream-alpha",
+  "logical_frame_id": 42,
+  "request_id": "request-000042",
+  "request_sequence": 7,
+  "mode": "seqpack",
+  "ok": true,
+  "receipt_sha256": "64 lowercase hex characters",
+  "frame_duration_ns": 60000000,
+  "phase_duration_ns": {
+    "surface_write_ns": 1,
+    "private_evaluation_ns": 2,
+    "private_evaluation_by_program_ns": {
+      "layer0": 1,
+      "layer1": 1,
+      "layer2": 0,
+      "layer3": 0,
+      "final_norm": 0
+    },
+    "surface_read_ns": 3,
+    "host_rmsnorm_ns": 4,
+    "audio_head_ns": 5,
+    "cfg_combine_ns": 6,
+    "argmax_ns": 7,
+    "embedding_update_ns": 8,
+    "token_encoding_ns": 9,
+    "output_write_ns": 10
+  }
+}
+```
+
+All durations are accumulated host-observed monotonic nanoseconds for the accepted frame. Fields have the same exact shape in separate and seqpack modes; a phase that is not applicable has value zero. `private_evaluation_ns` measures elapsed host time around the complete `orion_eval_report` or `orion_eval_with_plan_report` wrapper call and equals the sum of `private_evaluation_by_program_ns`. It therefore includes plan/surface validation, IOSurface wrapping, request construction, and the private selector when those stages are reached. It does not prove physical ANE scheduling or execution time on a particular hardware unit.
+
+The named phase durations do not have to sum to `frame_duration_ns`: recurrence control flow, counter maintenance, tensor conversion, error classification, and timer overhead are intentionally unattributed. A failed or not-invoked evaluation attempt can still contribute host elapsed time while the normative invocation counters identify whether the private selector boundary was entered.
+
+The diagnostic is not included in `semantic_request_sha256`, `program_set_digest`, token hashes, `receipt_sha256`, or receipt chaining. It is therefore correlated observational telemetry, not receipt-attested evidence. There is no diagnostic for a pre-acceptance rejection or shutdown. Consumers should capture standard error separately and select objects by `diagnostic_schema`; ordinary standard-error lines remain human-readable diagnostics.
+
 ## Shutdown
 
 Shutdown uses the exact request:

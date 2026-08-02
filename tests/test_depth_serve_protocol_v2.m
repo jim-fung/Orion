@@ -165,6 +165,13 @@ int main(void) {
             fprintf(stderr, "receipt schema accepted legacy counter key\n");
             failures++;
         }
+        NSMutableDictionary *timed = fixture_receipt(YES);
+        timed[@"phase_timings"] = @{
+            @"schema": @"voxtream.orion.depth-phase-timings/1",
+            @"private_evaluation_ns": @1,
+        };
+        if (!expect_receipt_rejection(timed, "receipt-schema")) failures++;
+
         NSMutableArray<NSDictionary *> *invalid_receipts = [NSMutableArray array];
         NSMutableDictionary *invalid = fixture_receipt(YES);
         invalid[@"unexpected"] = @1;

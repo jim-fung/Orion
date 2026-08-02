@@ -20,6 +20,7 @@
 //                     [--audio-head <audio_head.fp32.bin>]
 //                     [--max-compile N]
 //                     [--seqpack]
+//                     [--phase-timings]
 //
 // Building this command consumes ZERO ANE compile budget; the worker compiles
 // on first connect.
@@ -68,6 +69,7 @@
 #define DEFAULT_MAX_COMPILE 20
 #define DEPTH_PROTOCOL_VERSION 2
 #define DEPTH_RECEIPT_SCHEMA @"voxtream.orion.depth-operational-receipt/2"
+#define DEPTH_PHASE_TIMINGS_SCHEMA @"voxtream.orion.depth-phase-timings/1"
 #define ZERO_SHA256 @"0000000000000000000000000000000000000000000000000000000000000000"
 #define MAX_SAFE_JSON_INTEGER INT64_C(9007199254740991)
 #define MAX_REQUEST_BYTES (1024u * 1024u)
@@ -579,11 +581,35 @@ typedef enum {
 } DepthFrameFailure;
 
 typedef struct {
+    uint64_t surface_write_ns;
+    uint64_t private_evaluation_ns;
+    uint64_t private_evaluation_by_program_ns[LAYERS + 1];
+    uint64_t surface_read_ns;
+    uint64_t host_rmsnorm_ns;
+    uint64_t audio_head_ns;
+    uint64_t cfg_combine_ns;
+    uint64_t argmax_ns;
+    uint64_t embedding_update_ns;
+    uint64_t token_encoding_ns;
+    uint64_t output_write_ns;
+} DepthPhaseTimings;
+
+typedef struct {
     uint32_t expected[LAYERS + 1];
     uint32_t actual[LAYERS + 1];
     uint32_t successful[LAYERS + 1];
     uint32_t failed[LAYERS + 1];
 } DepthEvalCounters;
+
+static uint64_t phase_start(const DepthPhaseTimings *timings) {
+    return timings ? monotonic_ns() : 0;
+}
+
+static void phase_accumulate(DepthPhaseTimings *timings, uint64_t start,
+                             uint64_t *field) {
+    if (!timings || !field) return;
+    *field += monotonic_ns() - start;
+}
 
 static void depth_eval_counters_init(DepthEvalCounters *counters, bool seqpack) {
     memset(counters, 0, sizeof(*counters));
@@ -594,7 +620,9 @@ static void depth_eval_counters_init(DepthEvalCounters *counters, bool seqpack) 
 static bool depth_eval_counted(DepthWorker *w, int program_index,
                                IOSurfaceRef *input, IOSurfaceRef *output,
                                DepthEvalCounters *counters,
+                               DepthPhaseTimings *timings,
                                DepthFrameFailure *failure) {
+    uint64_t eval_start = phase_start(timings);
     OrionEvalResult result = program_index < LAYERS
         ? (w->seqpack
             ? orion_eval_report(w->layer_programs[program_index], input, 1, output, 1)
@@ -603,6 +631,11 @@ static bool depth_eval_counted(DepthWorker *w, int program_index,
                                           output, 1))
         : orion_eval_with_plan_report(w->final_norm_program, &w->final_norm_plan,
                                       input, 1, output, 1);
+    if (timings) {
+        uint64_t elapsed = monotonic_ns() - eval_start;
+        timings->private_evaluation_ns += elapsed;
+        timings->private_evaluation_by_program_ns[program_index] += elapsed;
+    }
     if (result == ORION_EVAL_NOT_INVOKED) {
         if (failure) *failure = DEPTH_FRAME_FAILURE_EVALUATION_PREPARATION;
         return false;
@@ -625,6 +658,7 @@ static bool depth_worker_run_frame(DepthWorker *w,
                                    int c0_token, double cfg_gamma,
                                    int32_t *tokens_out,
                                    DepthEvalCounters *counters,
+                                   DepthPhaseTimings *timings,
                                    DepthFrameFailure *failure) {
     if (failure) *failure = DEPTH_FRAME_FAILURE_NONE;
     if (!w->ready || !counters || !failure) return false;
@@ -657,24 +691,33 @@ static bool depth_worker_run_frame(DepthWorker *w,
         int prefix_len = 2;  // active prefix length per branch
 
         for (int step = 0; step < DEPTH_STEPS; step++) {
-            if (orion_tensor_write_packed_checked(
-                    w->chain[0], ORION_SURFACE_DTYPE_FP16, w->packed_prefix,
-                    (size_t)surf_bytes) != ORION_SURFACE_OK) {
+            uint64_t write_start = phase_start(timings);
+            OrionSurfaceStatus write_status = orion_tensor_write_packed_checked(
+                w->chain[0], ORION_SURFACE_DTYPE_FP16, w->packed_prefix,
+                (size_t)surf_bytes);
+            if (timings)
+                phase_accumulate(timings, write_start, &timings->surface_write_ns);
+            if (write_status != ORION_SURFACE_OK) {
                 *failure = DEPTH_FRAME_FAILURE_EVALUATION_PREPARATION;
                 return false;
             }
             bool eval_ok = true;
             for (int stage = 0; stage < LAYERS; stage++) {
                 if (!depth_eval_counted(w, stage, &w->chain[stage],
-                                        &w->chain[stage + 1], counters, failure)) {
+                                        &w->chain[stage + 1], counters, timings,
+                                        failure)) {
                     eval_ok = false; break;
                 }
             }
             if (!eval_ok) return false;
             // Read the final layer output (pre-norm) for the active positions.
-            if (orion_tensor_read_packed_checked(
-                    w->chain[LAYERS], ORION_SURFACE_DTYPE_FP16, w->output,
-                    (size_t)surf_bytes) != ORION_SURFACE_OK) {
+            uint64_t read_start = phase_start(timings);
+            OrionSurfaceStatus read_status = orion_tensor_read_packed_checked(
+                w->chain[LAYERS], ORION_SURFACE_DTYPE_FP16, w->output,
+                (size_t)surf_bytes);
+            if (timings)
+                phase_accumulate(timings, read_start, &timings->surface_read_ns);
+            if (read_status != ORION_SURFACE_OK) {
                 *failure = DEPTH_FRAME_FAILURE_EVALUATION_PREPARATION;
                 return false;
             }
@@ -686,6 +729,7 @@ static bool depth_worker_run_frame(DepthWorker *w,
             // Apply the checked CPU RMSNorm to each branch (seq32 ANE norm graph
             // is incompatible with seq64 surfaces). Any helper failure fails the
             // frame: no identity/pre-norm fallback is permitted.
+            uint64_t rmsnorm_start = phase_start(timings);
             OrionDepthServeSupportStatus cond_norm_status =
                 orion_depth_serve_host_rmsnorm_checked(
                     w->output, DIM, w->seq_len, (size_t)active,
@@ -696,6 +740,8 @@ static bool depth_worker_run_frame(DepthWorker *w,
                     w->output, DIM, w->seq_len, (size_t)(32 + active),
                     w->final_norm_scale, ORION_VOXTREAM_DEPTH_RMS_EPS,
                     w->hidden_uncond_f32);
+            if (timings)
+                phase_accumulate(timings, rmsnorm_start, &timings->host_rmsnorm_ns);
             if (cond_norm_status != ORION_DEPTH_SERVE_SUPPORT_OK ||
                 uncond_norm_status != ORION_DEPTH_SERVE_SUPPORT_OK) {
                 *failure = DEPTH_FRAME_FAILURE_HOST_RMSNORM;
@@ -707,13 +753,23 @@ static bool depth_worker_run_frame(DepthWorker *w,
             }
 
             const float *head_step = w->audio_head + (size_t)step * DIM * AUDIO_VOCAB;
+            uint64_t audio_head_start = phase_start(timings);
             audio_head_gemv(w->hidden_cond_f32, head_step, DIM, AUDIO_VOCAB, w->logits_cond);
             audio_head_gemv(w->hidden_uncond_f32, head_step, DIM, AUDIO_VOCAB, w->logits_uncond);
+            if (timings)
+                phase_accumulate(timings, audio_head_start, &timings->audio_head_ns);
+            uint64_t cfg_start = phase_start(timings);
             cfg_combine(w->logits_cond, w->logits_uncond, AUDIO_VOCAB,
                         (float)cfg_gamma, w->combined);
+            if (timings)
+                phase_accumulate(timings, cfg_start, &timings->cfg_combine_ns);
+            uint64_t argmax_start = phase_start(timings);
             int token = argmax_float(w->combined, AUDIO_VOCAB);
+            if (timings)
+                phase_accumulate(timings, argmax_start, &timings->argmax_ns);
             tokens_out[step] = token;
             if (step < DEPTH_STEPS - 1) {
+                uint64_t embedding_start = phase_start(timings);
                 int codebook = step + 1;
                 const float *embed_row = w->embeddings +
                     (size_t)(token + codebook * AUDIO_VOCAB) * AUDIO_EMBED_DIM;
@@ -725,6 +781,9 @@ static bool depth_worker_run_frame(DepthWorker *w,
                     w->packed_prefix[(size_t)c * w->seq_len + slot1] = e;
                 }
                 prefix_len++;
+                if (timings)
+                    phase_accumulate(timings, embedding_start,
+                                     &timings->embedding_update_ns);
             }
         }
         return true;
@@ -744,46 +803,69 @@ static bool depth_worker_run_frame(DepthWorker *w,
     for (int step = 0; step < DEPTH_STEPS; step++) {
         float *hidden_out[2] = {w->hidden_cond_f32, w->hidden_uncond_f32};
         for (int branch = 0; branch < CFG_BRANCHES; branch++) {
-            if (orion_tensor_write_packed_checked(
-                    w->chain[0], ORION_SURFACE_DTYPE_FP16, w->prefix[branch],
-                    TENSOR_BYTES) != ORION_SURFACE_OK) {
+            uint64_t write_start = phase_start(timings);
+            OrionSurfaceStatus write_status = orion_tensor_write_packed_checked(
+                w->chain[0], ORION_SURFACE_DTYPE_FP16, w->prefix[branch],
+                TENSOR_BYTES);
+            if (timings)
+                phase_accumulate(timings, write_start, &timings->surface_write_ns);
+            if (write_status != ORION_SURFACE_OK) {
                 *failure = DEPTH_FRAME_FAILURE_EVALUATION_PREPARATION;
                 return false;
             }
             bool eval_ok = true;
             for (int stage = 0; stage < LAYERS; stage++) {
                 if (!depth_eval_counted(w, stage, &w->chain[stage],
-                                        &w->chain[stage + 1], counters, failure)) {
+                                        &w->chain[stage + 1], counters, timings,
+                                        failure)) {
                     eval_ok = false; break;
                 }
             }
             if (eval_ok && !depth_eval_counted(w, LAYERS, &w->chain[LAYERS],
-                                               &w->chain[LAYERS + 1], counters, failure)) {
+                                               &w->chain[LAYERS + 1], counters,
+                                               timings, failure)) {
                 eval_ok = false;
             }
             if (!eval_ok) return false;
-            if (orion_tensor_read_packed_checked(
-                    w->chain[LAYERS + 1], ORION_SURFACE_DTYPE_FP16, w->output,
-                    TENSOR_BYTES) != ORION_SURFACE_OK) {
+            uint64_t read_start = phase_start(timings);
+            OrionSurfaceStatus read_status = orion_tensor_read_packed_checked(
+                w->chain[LAYERS + 1], ORION_SURFACE_DTYPE_FP16, w->output,
+                TENSOR_BYTES);
+            if (timings)
+                phase_accumulate(timings, read_start, &timings->surface_read_ns);
+            if (read_status != ORION_SURFACE_OK) {
                 *failure = DEPTH_FRAME_FAILURE_EVALUATION_PREPARATION;
                 return false;
             }
             fp16_row_to_f32(w->output, prefix_len - 1, hidden_out[branch]);
         }
         const float *head_step = w->audio_head + (size_t)step * DIM * AUDIO_VOCAB;
+        uint64_t audio_head_start = phase_start(timings);
         audio_head_gemv(w->hidden_cond_f32, head_step, DIM, AUDIO_VOCAB, w->logits_cond);
         audio_head_gemv(w->hidden_uncond_f32, head_step, DIM, AUDIO_VOCAB, w->logits_uncond);
+        if (timings)
+            phase_accumulate(timings, audio_head_start, &timings->audio_head_ns);
+        uint64_t cfg_start = phase_start(timings);
         cfg_combine(w->logits_cond, w->logits_uncond, AUDIO_VOCAB,
                     (float)cfg_gamma, w->combined);
+        if (timings)
+            phase_accumulate(timings, cfg_start, &timings->cfg_combine_ns);
+        uint64_t argmax_start = phase_start(timings);
         int token = argmax_float(w->combined, AUDIO_VOCAB);
+        if (timings)
+            phase_accumulate(timings, argmax_start, &timings->argmax_ns);
         tokens_out[step] = token;
         if (step < DEPTH_STEPS - 1) {
+            uint64_t embedding_start = phase_start(timings);
             int codebook = step + 1;
             const float *embed_row = w->embeddings +
                 (size_t)(token + codebook * AUDIO_VOCAB) * AUDIO_EMBED_DIM;
             write_prefix_slot_fp32(w->prefix[0], prefix_len, embed_row, DIM);
             write_prefix_slot_fp32(w->prefix[1], prefix_len, embed_row, DIM);
             prefix_len++;
+            if (timings)
+                phase_accumulate(timings, embedding_start,
+                                 &timings->embedding_update_ns);
         }
     }
     return true;
@@ -990,6 +1072,81 @@ static NSDictionary *eval_counts_dictionary(const DepthEvalCounters *counters) {
     return result;
 }
 
+static NSDictionary *phase_timings_dictionary(const DepthPhaseTimings *timings) {
+    if (!timings) return nil;
+    NSMutableDictionary *by_program = [NSMutableDictionary dictionaryWithCapacity:LAYERS + 1];
+    for (int i = 0; i <= LAYERS; i++) {
+        NSString *name = i < LAYERS
+            ? [NSString stringWithFormat:@"layer%d", i]
+            : @"final_norm";
+        by_program[name] = @(timings->private_evaluation_by_program_ns[i]);
+    }
+    return @{
+        @"surface_write_ns": @(timings->surface_write_ns),
+        @"private_evaluation_ns": @(timings->private_evaluation_ns),
+        @"private_evaluation_by_program_ns": by_program,
+        @"surface_read_ns": @(timings->surface_read_ns),
+        @"host_rmsnorm_ns": @(timings->host_rmsnorm_ns),
+        @"audio_head_ns": @(timings->audio_head_ns),
+        @"cfg_combine_ns": @(timings->cfg_combine_ns),
+        @"argmax_ns": @(timings->argmax_ns),
+        @"embedding_update_ns": @(timings->embedding_update_ns),
+        @"token_encoding_ns": @(timings->token_encoding_ns),
+        @"output_write_ns": @(timings->output_write_ns),
+    };
+}
+
+static bool configure_phase_timing_stderr(void) {
+    return fcntl(STDERR_FILENO, F_SETNOSIGPIPE, 1) == 0;
+}
+
+static void emit_phase_timing_diagnostic(DepthPhaseTimings *timings,
+                                         NSString *worker_session_id,
+                                         NSDictionary *request,
+                                         bool seqpack,
+                                         bool ok,
+                                         NSString *receipt_sha256,
+                                         uint64_t frame_duration_ns) {
+    if (!timings) return;
+    @try {
+        NSDictionary *diagnostic = @{
+            @"diagnostic_schema": DEPTH_PHASE_TIMINGS_SCHEMA,
+            @"clock": @"mach-absolute-time",
+            @"worker_session_id": worker_session_id,
+            @"stream_session_id": request[@"stream_session_id"],
+            @"logical_frame_id": request[@"logical_frame_id"],
+            @"request_id": request[@"request_id"],
+            @"request_sequence": request[@"request_sequence"],
+            @"mode": seqpack ? @"seqpack" : @"separate",
+            @"ok": @(ok),
+            @"receipt_sha256": receipt_sha256,
+            @"frame_duration_ns": @(frame_duration_ns),
+            @"phase_duration_ns": phase_timings_dictionary(timings),
+        };
+        NSError *error = nil;
+        NSData *json = [NSJSONSerialization dataWithJSONObject:diagnostic options:0 error:&error];
+        if (!json || error) return;
+        NSMutableData *line = [json mutableCopy];
+        const uint8_t newline = '\n';
+        [line appendBytes:&newline length:1];
+        const uint8_t *bytes = line.bytes;
+        size_t offset = 0;
+        flockfile(stderr);
+        while (offset < line.length) {
+            ssize_t written = write(STDERR_FILENO, bytes + offset, line.length - offset);
+            if (written > 0) {
+                offset += (size_t)written;
+                continue;
+            }
+            if (written < 0 && errno == EINTR) continue;
+            break;
+        }
+        funlockfile(stderr);
+    } @catch (__unused NSException *exception) {
+        // Phase timing is best-effort and must never affect protocol lifetime.
+    }
+}
+
 static uint32_t eval_count_total(const uint32_t values[LAYERS + 1]) {
     uint32_t total = 0;
     for (int i = 0; i <= LAYERS; i++) total += values[i];
@@ -1038,6 +1195,7 @@ static void print_depth_serve_help(void) {
         "  --max-compile N       Abort if startup compile count > N (default 20).\n"
         "  --seqpack             Use sequence-packed CFG (halves ANE evals).\n"
         "                         Requires a seqpack export (4 layer_seqpack.blob files).\n"
+        "  --phase-timings       Emit correlated phase timing JSON to stderr.\n"
         "  --help                Show this help message.\n");
 }
 
@@ -1049,6 +1207,7 @@ int orion_cmd_depth_serve(int argc, const char *argv[]) {
         const char *launch_challenge_arg = NULL;
         int max_compile = DEFAULT_MAX_COMPILE;
         bool seqpack_mode = false;
+        bool phase_timings_enabled = false;
 
         for (int i = 1; i < argc; i++) {
             if (strcmp(argv[i], "--export-dir") == 0 && i + 1 < argc) {
@@ -1067,6 +1226,8 @@ int orion_cmd_depth_serve(int argc, const char *argv[]) {
                 }
             } else if (strcmp(argv[i], "--seqpack") == 0) {
                 seqpack_mode = true;
+            } else if (strcmp(argv[i], "--phase-timings") == 0) {
+                phase_timings_enabled = true;
             } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
                 print_depth_serve_help();
                 return 0;
@@ -1075,6 +1236,11 @@ int orion_cmd_depth_serve(int argc, const char *argv[]) {
                 print_depth_serve_help();
                 return 1;
             }
+        }
+
+        if (phase_timings_enabled && !configure_phase_timing_stderr()) {
+            fprintf(stderr, "depth-serve: cannot configure safe phase timing stderr; disabling diagnostics\n");
+            phase_timings_enabled = false;
         }
 
         if (!export_arg || !embeddings_arg || !launch_challenge_arg) {
@@ -1334,13 +1500,20 @@ int orion_cmd_depth_serve(int argc, const char *argv[]) {
 
             int32_t tokens[DEPTH_STEPS] = {0};
             DepthEvalCounters counters;
+            DepthPhaseTimings phase_timings = {0};
+            DepthPhaseTimings *phase_timings_ptr =
+                phase_timings_enabled ? &phase_timings : NULL;
             DepthFrameFailure frame_failure = DEPTH_FRAME_FAILURE_NONE;
             uint64_t frame_start_ns = monotonic_ns();
             int compile_before = orion_compile_count();
             bool eval_ok = depth_worker_run_frame(&worker, in_cond, in_uncond,
                                                   (int)c0, gamma, tokens, &counters,
-                                                  &frame_failure);
+                                                  phase_timings_ptr, &frame_failure);
+            uint64_t token_encoding_start = phase_start(phase_timings_ptr);
             NSData *token_data = eval_ok ? tokens_data(tokens) : nil;
+            if (phase_timings_ptr)
+                phase_accumulate(phase_timings_ptr, token_encoding_start,
+                                 &phase_timings.token_encoding_ns);
             int compile_after = orion_compile_count();
             int compile_delta = compile_after - compile_before;
             bool counts_complete =
@@ -1359,7 +1532,11 @@ int orion_cmd_depth_serve(int argc, const char *argv[]) {
                 frame_error = @"private-invocation-proof-incomplete";
             else if (compile_delta != 0) frame_error = @"compile-count-changed";
             else {
+                uint64_t output_write_start = phase_start(phase_timings_ptr);
                 output_ok = write_tokens_bin_checked(output_dir, token_data);
+                if (phase_timings_ptr)
+                    phase_accumulate(phase_timings_ptr, output_write_start,
+                                     &phase_timings.output_write_ns);
                 if (!output_ok) frame_error = @"output-write-failed";
             }
             uint64_t frame_end_ns = monotonic_ns();
@@ -1419,6 +1596,9 @@ int orion_cmd_depth_serve(int argc, const char *argv[]) {
             }
             require_depth_emission(emit_serialized_depth_response(serialized_receipt));
             previous_receipt_sha256 = receipt_sha;
+            emit_phase_timing_diagnostic(
+                phase_timings_ptr, worker_session_id, req, seqpack_mode,
+                frame_error == nil, receipt_sha, frame_end_ns - frame_start_ns);
                 } @catch (NSException *exception) {
                     if (!accepted_frame) {
                         require_depth_emission(emit_depth_error(nil, @"request-handler-failed"));

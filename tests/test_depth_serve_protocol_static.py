@@ -159,6 +159,52 @@ def test_final_norm_digest_derivations_are_documented_exactly() -> None:
     assert "no NUL, newline, or normalization" in docs
 
 
+def test_phase_timings_are_opt_in_stderr_diagnostics_outside_v2_receipts() -> None:
+    source = SOURCE.read_text()
+    support = SUPPORT.read_text()
+    assert 'strcmp(argv[i], "--phase-timings")' in source
+    assert '"  --phase-timings' in source
+    assert '#define DEPTH_PHASE_TIMINGS_SCHEMA @"voxtream.orion.depth-phase-timings/1"' in source
+    assert 'DepthPhaseTimings *phase_timings_ptr =' in source
+    assert 'phase_timings_enabled ? &phase_timings : NULL' in source
+    assert 'static void emit_phase_timing_diagnostic(' in source
+    assert 'write(STDERR_FILENO, bytes + offset, line.length - offset)' in source
+    assert 'if (written < 0 && errno == EINTR) continue;' in source
+    assert 'flockfile(stderr)' in source and 'funlockfile(stderr)' in source
+    assert 'configure_phase_timing_stderr()' in source
+    assert 'best-effort and must never affect protocol lifetime' in source
+    assert '@"phase_duration_ns": phase_timings_dictionary(timings)' in source
+    assert 'phase_timings' not in support
+
+    receipt = source[source.index('NSString *receipt_sha = orion_depth_serve_receipt_sha256(receipt);'):]
+    require_in_order(
+        receipt,
+        'orion_depth_serve_receipt_sha256(receipt)',
+        'receipt[@"receipt_sha256"] = receipt_sha;',
+        'serialize_depth_response(receipt)',
+        'emit_serialized_depth_response(serialized_receipt)',
+        'previous_receipt_sha256 = receipt_sha;',
+        'emit_phase_timing_diagnostic(',
+    )
+
+
+def test_phase_timings_cover_both_execution_modes_and_private_programs() -> None:
+    source = SOURCE.read_text()
+    run = function_body(source, "depth_worker_run_frame")
+    counted = function_body(source, "depth_eval_counted")
+    assert run.count('phase_start(timings)') >= 13
+    for field in (
+        'surface_write_ns', 'surface_read_ns', 'host_rmsnorm_ns',
+        'audio_head_ns', 'cfg_combine_ns', 'argmax_ns',
+        'embedding_update_ns',
+    ):
+        assert f'&timings->{field}' in run
+    assert 'timings->private_evaluation_ns += elapsed;' in counted
+    assert 'timings->private_evaluation_by_program_ns[program_index] += elapsed;' in counted
+    assert run.count('counters, timings,') >= 2
+    assert run.count('timings, failure') >= 1
+
+
 def test_canonical_hash_domains_and_no_json_hashing() -> None:
     support = SUPPORT.read_text()
     for domain in (
