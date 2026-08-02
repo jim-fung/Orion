@@ -254,6 +254,15 @@ OrionProgram* orion_compile_mil(
 
         // Wrap in OrionProgram (manual retain for C struct)
         OrionProgram *prog = (OrionProgram *)calloc(1, sizeof(OrionProgram));
+        if (!prog) {
+            // calloc failure is not deterministically injectable here. The model
+            // has loaded but has not crossed a CF bridge, so ARC owns its release.
+            ((BOOL(*)(id,SEL,unsigned int,NSError**))objc_msgSend)(
+                model, @selector(unloadWithQoS:error:), 21, &e);
+            [fm removeItemAtPath:tmpDir error:nil];
+            model = nil;
+            return NULL;
+        }
         prog->model = (void *)CFBridgingRetain(model);
         prog->tmpDir = (void *)CFBridgingRetain(tmpDir);
         prog->loaded = true;
@@ -321,57 +330,75 @@ const char* orion_program_model_dir(const OrionProgram* prog) {
 
 #import "iosurface_tensor.h"
 
+OrionEvalResult orion_eval_report(
+    OrionProgram* prog,
+    IOSurfaceRef* inputs, int num_inputs,
+    IOSurfaceRef* outputs, int num_outputs
+) {
+    if (!prog || !prog->loaded || !inputs || !outputs) return ORION_EVAL_NOT_INVOKED;
+    if (num_inputs <= 0 || num_outputs <= 0) return ORION_EVAL_NOT_INVOKED;
+
+    @autoreleasepool {
+        @try {
+            // Wrap inputs as _ANEIOSurfaceObject
+            NSMutableArray *inArr = [NSMutableArray arrayWithCapacity:num_inputs];
+            NSMutableArray *inIdx = [NSMutableArray arrayWithCapacity:num_inputs];
+            for (int i = 0; i < num_inputs; i++) {
+                id wrapped = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(
+                    g_AIO, @selector(objectWithIOSurface:), inputs[i]);
+                if (!wrapped) return ORION_EVAL_NOT_INVOKED;
+                [inArr addObject:wrapped];
+                [inIdx addObject:@(i)];
+            }
+
+            // Wrap outputs
+            NSMutableArray *outArr = [NSMutableArray arrayWithCapacity:num_outputs];
+            NSMutableArray *outIdx = [NSMutableArray arrayWithCapacity:num_outputs];
+            for (int i = 0; i < num_outputs; i++) {
+                id wrapped = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(
+                    g_AIO, @selector(objectWithIOSurface:), outputs[i]);
+                if (!wrapped) return ORION_EVAL_NOT_INVOKED;
+                [outArr addObject:wrapped];
+                [outIdx addObject:@(i)];
+            }
+
+            // Build request. Failures before the private evaluation selector are
+            // reported as not-invoked so callers can issue a chained receipt.
+            id req = ((id(*)(Class,SEL,id,id,id,id,id,id,id))objc_msgSend)(
+                g_AR,
+                @selector(requestWithInputs:inputIndices:outputs:outputIndices:
+                          weightsBuffer:perfStats:procedureIndex:),
+                inArr, inIdx, outArr, outIdx, nil, nil, @0);
+            if (!req) return ORION_EVAL_NOT_INVOKED;
+
+            // This is the invocation boundary. Once control enters the selector,
+            // the private call is counted as invoked even if it returns NO.
+            id model = (__bridge id)prog->model;
+            NSError *e = nil;
+            @try {
+                BOOL ok = ((BOOL(*)(id,SEL,unsigned int,id,id,NSError**))objc_msgSend)(
+                    model, @selector(evaluateWithQoS:options:request:error:),
+                    21, @{}, req, &e);
+                if (!ok && e) NSLog(@"orion_eval ERROR [%s]: %@", prog->tag, e);
+                return ok ? ORION_EVAL_PRIVATE_SUCCEEDED : ORION_EVAL_PRIVATE_FAILED;
+            } @catch (NSException *exception) {
+                NSLog(@"orion_eval EXCEPTION [%s]: %@", prog->tag, exception);
+                return ORION_EVAL_PRIVATE_FAILED;
+            }
+        } @catch (NSException *exception) {
+            NSLog(@"orion_eval preparation EXCEPTION [%s]: %@", prog->tag, exception);
+            return ORION_EVAL_NOT_INVOKED;
+        }
+    }
+}
+
 bool orion_eval(
     OrionProgram* prog,
     IOSurfaceRef* inputs, int num_inputs,
     IOSurfaceRef* outputs, int num_outputs
 ) {
-    if (!prog || !prog->loaded || !inputs || !outputs) return false;
-    if (num_inputs <= 0 || num_outputs <= 0) return false;
-
-    @autoreleasepool {
-        // Wrap inputs as _ANEIOSurfaceObject
-        NSMutableArray *inArr = [NSMutableArray arrayWithCapacity:num_inputs];
-        NSMutableArray *inIdx = [NSMutableArray arrayWithCapacity:num_inputs];
-        for (int i = 0; i < num_inputs; i++) {
-            id wrapped = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(
-                g_AIO, @selector(objectWithIOSurface:), inputs[i]);
-            if (!wrapped) return false;
-            [inArr addObject:wrapped];
-            [inIdx addObject:@(i)];
-        }
-
-        // Wrap outputs
-        NSMutableArray *outArr = [NSMutableArray arrayWithCapacity:num_outputs];
-        NSMutableArray *outIdx = [NSMutableArray arrayWithCapacity:num_outputs];
-        for (int i = 0; i < num_outputs; i++) {
-            id wrapped = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(
-                g_AIO, @selector(objectWithIOSurface:), outputs[i]);
-            if (!wrapped) return false;
-            [outArr addObject:wrapped];
-            [outIdx addObject:@(i)];
-        }
-
-        // Build request
-        id req = ((id(*)(Class,SEL,id,id,id,id,id,id,id))objc_msgSend)(
-            g_AR,
-            @selector(requestWithInputs:inputIndices:outputs:outputIndices:
-                      weightsBuffer:perfStats:procedureIndex:),
-            inArr, inIdx, outArr, outIdx, nil, nil, @0);
-        if (!req) return false;
-
-        // Evaluate
-        id model = (__bridge id)prog->model;
-        NSError *e = nil;
-        BOOL ok = ((BOOL(*)(id,SEL,unsigned int,id,id,NSError**))objc_msgSend)(
-            model, @selector(evaluateWithQoS:options:request:error:),
-            21, @{}, req, &e);
-
-        if (!ok && e) {
-            NSLog(@"orion_eval ERROR [%s]: %@", prog->tag, e);
-        }
-        return ok;
-    }
+    return orion_eval_report(prog, inputs, num_inputs, outputs, num_outputs) ==
+        ORION_EVAL_PRIVATE_SUCCEEDED;
 }
 
 static bool binding_entry_equal(const OrionBindingPlanEntry* left,
@@ -423,7 +450,7 @@ static bool plan_has_same_provenance(const OrionBindingPlan* supplied,
     return true;
 }
 
-bool orion_eval_with_plan(
+OrionEvalResult orion_eval_with_plan_report(
     OrionProgram* prog, const OrionBindingPlan* plan,
     IOSurfaceRef* inputs, int num_inputs,
     IOSurfaceRef* outputs, int num_outputs
@@ -433,16 +460,26 @@ bool orion_eval_with_plan(
         !orion_binding_plan_validate_finalized(plan, error, sizeof(error)) ||
         !plan_has_same_eval_abi(plan, &prog->plan) ||
         !plan_has_same_provenance(plan, &prog->plan) ||
-        num_inputs != plan->n_inputs || num_outputs != plan->n_outputs) return false;
+        num_inputs != plan->n_inputs || num_outputs != plan->n_outputs)
+        return ORION_EVAL_NOT_INVOKED;
     for (int i = 0; i < num_inputs; i++) {
         if (orion_tensor_validate_for_binding(inputs[i], &plan->inputs[i]) !=
-            ORION_SURFACE_OK) return false;
+            ORION_SURFACE_OK) return ORION_EVAL_NOT_INVOKED;
     }
     for (int i = 0; i < num_outputs; i++) {
         if (orion_tensor_validate_for_binding(outputs[i], &plan->outputs[i]) !=
-            ORION_SURFACE_OK) return false;
+            ORION_SURFACE_OK) return ORION_EVAL_NOT_INVOKED;
     }
-    return orion_eval(prog, inputs, num_inputs, outputs, num_outputs);
+    return orion_eval_report(prog, inputs, num_inputs, outputs, num_outputs);
+}
+
+bool orion_eval_with_plan(
+    OrionProgram* prog, const OrionBindingPlan* plan,
+    IOSurfaceRef* inputs, int num_inputs,
+    IOSurfaceRef* outputs, int num_outputs
+) {
+    return orion_eval_with_plan_report(prog, plan, inputs, num_inputs, outputs,
+                                       num_outputs) == ORION_EVAL_PRIVATE_SUCCEEDED;
 }
 
 #pragma mark - T017: Release
@@ -626,6 +663,15 @@ OrionProgram* orion_program_patch_weights(
 
         // Wrap in OrionProgram
         OrionProgram *prog = (OrionProgram *)calloc(1, sizeof(OrionProgram));
+        if (!prog) {
+            // calloc failure is not deterministically injectable here. The model
+            // has loaded but has not crossed a CF bridge, so ARC owns its release.
+            ((BOOL(*)(id,SEL,unsigned int,NSError**))objc_msgSend)(
+                model, @selector(unloadWithQoS:error:), 21, &e);
+            [fm removeItemAtPath:newDir error:nil];
+            model = nil;
+            return NULL;
+        }
         prog->model = (void *)CFBridgingRetain(model);
         prog->tmpDir = (void *)CFBridgingRetain(newDir);
         prog->loaded = true;

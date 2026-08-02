@@ -154,6 +154,80 @@ static bool test_host_rmsnorm_rejects_invalid_epsilon_without_write(void) {
         out[0] == 123.0f && out[1] == 456.0f;
 }
 
+// C _Bool has a distinct NSNumber boxing from CFBoolean and numeric NSNumber.
+// Verify that the typed _Bool boxing hashes identically to the CFBoolean form.
+static NSMutableDictionary *receipt_with_ok_boxing(id ok_value) {
+    return [@{
+        @"receipt_schema": @"voxtream.orion.depth-operational-receipt/2",
+        @"ok": ok_value,
+        @"worker_session_id": @"550e8400-e29b-41d4-a716-446655440000",
+        @"stream_session_id": @"stream-alpha",
+        @"logical_frame_id": @42,
+        @"request_id": @"request-000042",
+        @"request_sequence": @7,
+        @"challenge_nonce": @"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+        @"hidden_cond_sha256": @"1111111111111111111111111111111111111111111111111111111111111111",
+        @"hidden_uncond_sha256": @"2222222222222222222222222222222222222222222222222222222222222222",
+        @"semantic_request_sha256": @"53808229003275463352dc3f86f60f27e50b220b39e06ba42933b4acc787fc3a",
+        @"program_set_digest": @"3333333333333333333333333333333333333333333333333333333333333333",
+        @"previous_receipt_sha256": @"0000000000000000000000000000000000000000000000000000000000000000",
+        @"private_invocation_known": @YES,
+        @"private_invocations_expected": @60,
+        @"private_invocations_actual": @60,
+        @"private_invocations_successful": @60,
+        @"private_invocations_failed": @0,
+        @"private_invocations_by_program": @{
+            @"layer0": @{@"expected": @15, @"actual": @15, @"successful": @15, @"failed": @0},
+            @"layer1": @{@"expected": @15, @"actual": @15, @"successful": @15, @"failed": @0},
+            @"layer2": @{@"expected": @15, @"actual": @15, @"successful": @15, @"failed": @0},
+            @"layer3": @{@"expected": @15, @"actual": @15, @"successful": @15, @"failed": @0},
+            @"final_norm": @{@"expected": @0, @"actual": @0, @"successful": @0, @"failed": @0},
+        },
+        @"compile_count_before": @4,
+        @"compile_count_after": @4,
+        @"compile_count_delta": @0,
+        @"native_fallback_used": @NO,
+        @"frame_start_monotonic_ns": @1000000,
+        @"frame_end_monotonic_ns": @2000000,
+        @"frame_duration_ns": @1000000,
+        @"output_placement": @"host-memory+atomic-tokens-bin",
+        @"tokens": @[@100, @101, @102, @103, @104, @105, @106, @107, @108, @109,
+                     @110, @111, @112, @113, @114],
+        @"token_sha256": @"904db4399aa10326d1155440f63b38ca363af85c3490684f51847084f9d11c3d",
+        @"tokens_bin_sha256": @"904db4399aa10326d1155440f63b38ca363af85c3490684f51847084f9d11c3d",
+    } mutableCopy];
+}
+
+static bool test_receipt_accepts_c_bool_ok_boxing(void) {
+    _Bool c_bool = 1;
+    id bool_expr = @(c_bool);
+    NSMutableDictionary *r = receipt_with_ok_boxing(bool_expr);
+    NSString *sha = orion_depth_serve_receipt_sha256(r);
+    // Must hash, and must equal the @YES form (semantically identical).
+    NSMutableDictionary *r_yes = receipt_with_ok_boxing(@YES);
+    NSString *sha_yes = orion_depth_serve_receipt_sha256(r_yes);
+    return sha != nil && sha_yes != nil &&
+        [sha isEqualToString:sha_yes] &&
+        [sha isEqualToString:
+            @"e60f295cc2515e969fbc60f47ac87616ad3ff3f8c4325055b61f969d33b74d76"];
+}
+
+static bool test_receipt_rejects_numeric_one_in_ok_slot(void) {
+    // Numeric NSNumber values must not be silently accepted as Booleans, even
+    // when their value is 1. Only CFBoolean and boxed C _Bool are valid.
+    NSMutableDictionary *r = receipt_with_ok_boxing(@1);
+    return orion_depth_serve_receipt_sha256(r) == nil;
+}
+
+static bool test_receipt_diagnostic_names_the_failing_field(void) {
+    NSMutableDictionary *r = receipt_with_ok_boxing(@YES);
+    [r removeObjectForKey:@"private_invocations_actual"];
+    char *field = orion_depth_serve_receipt_sha256_failure_field(r);
+    bool ok = field != NULL && strcmp(field, "private_invocations_actual") == 0;
+    if (field) free(field);
+    return ok;
+}
+
 int main(void) {
     @autoreleasepool {
         printf("test_depth_serve_support:\n");
@@ -167,6 +241,9 @@ int main(void) {
         TEST(host_rmsnorm_rejects_invalid_args_without_write);
         TEST(host_rmsnorm_rejects_nonfinite_inputs_without_write);
         TEST(host_rmsnorm_rejects_invalid_epsilon_without_write);
+        TEST(receipt_accepts_c_bool_ok_boxing);
+        TEST(receipt_rejects_numeric_one_in_ok_slot);
+        TEST(receipt_diagnostic_names_the_failing_field);
         printf("\n%d/%d passed\n", g_passed, g_passed + g_failed);
         return g_failed ? 1 : 0;
     }

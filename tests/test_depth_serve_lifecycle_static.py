@@ -60,7 +60,7 @@ def test_seqpack_compile_schedule_is_exactly_four_layers() -> None:
     assert "const int planned_compiles = w->seqpack ? LAYERS : LAYERS + 1;" in body
     seqpack = body[body.index("if (w->seqpack)"):body.index("} else {", body.index("if (w->seqpack)"))]
     assert "for (int n = 0; n < LAYERS; n++)" in seqpack
-    assert "compile_seqpack_layer(root, n, mil_n," in seqpack
+    assert "compile_seqpack_layer(n, mil_n, blob_n," in seqpack
     assert "final_norm_program" not in seqpack
     assert "depth-serve-final-norm" not in seqpack
     assert "orion_compile_mil(" not in seqpack

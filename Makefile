@@ -145,6 +145,7 @@ COMPILER_TEST_NAMES = \
 	test_passes \
 	test_ane_passes \
 	test_compiler_equiv \
+	test_depth_serve_protocol_v2 \
 	test_orion_error \
 	test_orion_ledger
 
@@ -238,6 +239,10 @@ $(BUILDDIR)/tests/test_ane_passes: tests/test_ane_passes.m $(COMPILER_OBJ)
 $(BUILDDIR)/tests/test_compiler_equiv: tests/test_compiler_equiv.m $(COMPILER_OBJ)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -framework Foundation -o $@ $< $(COMPILER_OBJ)
+
+$(BUILDDIR)/tests/test_depth_serve_protocol_v2: tests/test_depth_serve_protocol_v2.m apps/cli/commands/depth_serve_support.m
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -framework Foundation -o $@ $^
 
 # Standalone pure-C compiler-only tests (ORX-400 / ORX-408): no runtime or
 # compiler object dependencies, link only Foundation.

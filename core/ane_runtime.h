@@ -53,6 +53,24 @@ const OrionBindingPlan* orion_program_plan(const OrionProgram* prog);
 /// The pointer is valid until the next call on the same thread.
 const char* orion_program_model_dir(const OrionProgram* prog);
 
+/// Result of a checked evaluation attempt. `ORION_EVAL_NOT_INVOKED` means
+/// validation or request/surface preparation failed before the private
+/// `evaluateWithQoS:options:request:error:` selector was invoked.
+typedef enum {
+    ORION_EVAL_NOT_INVOKED = 0,
+    ORION_EVAL_PRIVATE_SUCCEEDED,
+    ORION_EVAL_PRIVATE_FAILED,
+} OrionEvalResult;
+
+/// Evaluate a compiled ANE program and report whether the private evaluation
+/// selector was actually invoked. Private Objective-C exceptions are converted
+/// to `ORION_EVAL_PRIVATE_FAILED` so invocation accounting remains observable.
+OrionEvalResult orion_eval_report(
+    OrionProgram* prog,
+    IOSurfaceRef* inputs, int num_inputs,
+    IOSurfaceRef* outputs, int num_outputs
+);
+
 /// Evaluate a compiled ANE program.
 /// @param prog        Compiled program handle
 /// @param inputs      Array of input IOSurface tensors
@@ -67,7 +85,15 @@ bool orion_eval(
 );
 
 /// Validate surfaces against the generated ABI plan, then evaluate them in
-/// the plan's alphabetical input/output binding order.
+/// the plan's alphabetical input/output binding order. Reports NOT_INVOKED for
+/// all plan and surface validation failures.
+OrionEvalResult orion_eval_with_plan_report(
+    OrionProgram* prog, const OrionBindingPlan* plan,
+    IOSurfaceRef* inputs, int num_inputs,
+    IOSurfaceRef* outputs, int num_outputs
+);
+
+/// Boolean compatibility wrapper around orion_eval_with_plan_report().
 bool orion_eval_with_plan(
     OrionProgram* prog, const OrionBindingPlan* plan,
     IOSurfaceRef* inputs, int num_inputs,
