@@ -474,6 +474,20 @@ static uint64_t xorshift64(uint64_t* state) {
     return x;
 }
 
+// Comparator for top-p sampling (BSD qsort_r context-then-elements order):
+// sort indices by probability descending, breaking ties by index ascending.
+// This matches the stable ordering the prior insertion sort produced, so
+// nucleus membership and sampling are deterministic for a given RNG state.
+static int cmp_prob_desc(void* ctx, const void* a, const void* b) {
+    const float* probs = (const float*)ctx;
+    int ia = *(const int*)a;
+    int ib = *(const int*)b;
+    float pa = probs[ia];
+    float pb = probs[ib];
+    if (pa != pb) return (pa < pb) ? 1 : -1;  // higher prob first
+    return ia - ib;                             // tie: lower index first
+}
+
 int orion_sample_token(const float* logits, int vocab_size,
                        float temperature, float top_p, uint64_t* rng_state) {
     // Argmax for temp=0
@@ -506,21 +520,13 @@ int orion_sample_token(const float* logits, int vocab_size,
     }
 
     // Top-p (nucleus) sampling
-    // Sort indices by probability descending
+    // Sort indices by probability descending. The prior code insertion-sorted
+    // the entire 50,257-entry vocabulary every generated token — O(vocab²)
+    // worst case. qsort_r is O(n log n) and preserves the same deterministic
+    // tie ordering (index ascending for equal probabilities).
     int* indices = (int*)malloc(vocab_size * sizeof(int));
     for (int i = 0; i < vocab_size; i++) indices[i] = i;
-
-    // Simple insertion sort on top candidates (sufficient for 50K vocab)
-    for (int i = 1; i < vocab_size; i++) {
-        int key = indices[i];
-        float key_p = probs[key];
-        int j = i - 1;
-        while (j >= 0 && probs[indices[j]] < key_p) {
-            indices[j + 1] = indices[j];
-            j--;
-        }
-        indices[j + 1] = key;
-    }
+    qsort_r(indices, vocab_size, sizeof(int), probs, cmp_prob_desc);
 
     // Truncate to top-p cumulative probability
     float cum = 0.0f;
