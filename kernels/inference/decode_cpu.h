@@ -78,14 +78,15 @@ void orion_gpt2_forward_cpu_all(const OrionGPT2Weights* w,
 
 /// Run prefill forward pass and populate KV cache.
 /// Returns true on success. Returns false (without mutating the cache) if
-/// seq_len exceeds max_seq — an oversized prompt is a hard failure rather than
-/// a silent zeroed/over-length cache. On success the cache is populated and
-/// current_len is advanced to seq_len.
-/// @param w         Loaded GPT-2 weights
-/// @param tokens    Input token ids [seq_len]
-/// @param seq_len   Number of tokens
-/// @param kv        KV cache (will be populated)
-/// @param logits    Output logits buffer [vocab]
+/// any argument is null or seq_len is outside [1, max_seq]. An oversized prompt
+/// is a hard failure rather than a silent zeroed/over-length cache; an empty
+/// prompt is rejected because the final logits GEMM needs a valid last position.
+/// On success the cache is populated and current_len is advanced to seq_len.
+/// @param w         Loaded GPT-2 weights (required)
+/// @param tokens    Input token ids [seq_len] (required)
+/// @param seq_len   Number of tokens, in [1, max_seq]
+/// @param kv        KV cache (will be populated, required)
+/// @param logits    Output logits buffer [vocab] (required)
 bool orion_gpt2_prefill_kv(const OrionGPT2Weights* w,
                              const int* tokens, int seq_len,
                              OrionKVCache* kv, float* logits);

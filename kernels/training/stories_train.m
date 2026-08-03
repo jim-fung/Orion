@@ -1147,14 +1147,21 @@ static bool patch_layer(OrionLayerKernels* kern, int layer_idx,
                         const OrionModelConfig* cfg, NSString* weight_dir) {
     int s = cfg->max_seq;
     NSString *base = weight_dir;
-    // Weight patching does not change the surface ABI (shapes/dtype/names), so
-    // the original plans' ABI fields remain valid. But plan-aware eval also
-    // authenticates weight provenance via sha256, and orion_program_patch_weights
-    // rebinds the plan to the PATCHED bytes (recomputed sha256). We must copy
-    // each patched program's rebound plan back into kern->plan_* so eval's
-    // provenance check passes; otherwise every post-patch eval returns
-    // ORION_EVAL_NOT_INVOKED and training silently produces zeros.
-    OrionLayerKernels replacement = *kern;
+    // Ownership transaction: build a complete replacement set in isolation, then
+    // commit only after every weighted program has patched successfully. The
+    // replacement starts empty (zero-initialized) so failure cleanup can release
+    // every non-null field unambiguously — it never aliases the live donor
+    // program pointers, so a failed patch cannot release handles that remain
+    // installed in `kern`. No live kern field (program pointer or plan) is
+    // mutated until the success commit, so a failure leaves the trainer with its
+    // pre-patch programs and plans intact for fallback recompilation.
+    //
+    // Plan provenance: orion_program_patch_weights rebinds the plan to the
+    // patched bytes (recomputed sha256), so eval's provenance check would reject
+    // the old plan. The rebound plan is copied into replacement.plan_* (NOT
+    // kern->plan_*) so the final *kern = replacement installs it atomically
+    // together with the new program handles.
+    OrionLayerKernels replacement = {0};
 
 #define PATCH_PROGRAM(field, plan_field, mil_fn, dict_fn, tag) do { \
     NSString* patch_mil = mil_fn(layer_idx, s, cfg); \
@@ -1163,7 +1170,7 @@ static bool patch_layer(OrionLayerKernels* kern, int layer_idx,
         kern->field, patch_mil.UTF8String, patch_dict, tag); \
     if (!replacement.field) goto patch_failed; \
     const OrionBindingPlan* rebound = orion_program_plan(replacement.field); \
-    if (rebound) kern->plan_field = *rebound; \
+    if (rebound) replacement.plan_field = *rebound; \
 } while (0)
 
     PATCH_PROGRAM(fwd_attn, plan_fwd_attn, compiler_fwd_attn_adapter,
@@ -1179,8 +1186,9 @@ static bool patch_layer(OrionLayerKernels* kern, int layer_idx,
     PATCH_PROGRAM(qkv_bwd, plan_qkv_bwd, compiler_qkv_bwd_adapter,
                   wdict_qkv_bwd_adapter, "qkvBwdPatch");
 
-    // The weight-free SDPA stage remains valid. Replace all weighted handles
-    // only after every isolated patch has loaded successfully.
+    // Success: all six weighted programs patched. Preserve the weight-free
+    // sdpa_bwd2 handle (ownership transfers to the replacement), release the old
+    // weighted donors, then commit the fully built replacement into *kern.
     replacement.sdpa_bwd2 = kern->sdpa_bwd2;
     orion_release_program(kern->fwd_attn);
     orion_release_program(kern->fwd_attn_core);
@@ -1194,6 +1202,8 @@ static bool patch_layer(OrionLayerKernels* kern, int layer_idx,
 
 patch_failed:
 #undef PATCH_PROGRAM
+    // Failure: release only the newly-created patched programs. The donor
+    // programs and plans in `kern` are untouched and remain usable.
     if (replacement.fwd_attn) orion_release_program(replacement.fwd_attn);
     if (replacement.fwd_attn_core) orion_release_program(replacement.fwd_attn_core);
     if (replacement.fwd_ffn) orion_release_program(replacement.fwd_ffn);

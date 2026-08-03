@@ -823,6 +823,21 @@ static int bench_inference(const char *prompt_text, int max_tokens, int warmup,
         return 1;
     }
 
+    // Context bounds: the KV cache is sized to max_seq. A prompt plus the
+    // requested generation must fit, or decode would stop advancing the cache
+    // and the benchmark would sample stale logits. Reject up front rather than
+    // emit a misleading timing run (matches the infer command's preflight).
+    int max_seq = kGPT2_124M.max_seq;
+    if (prompt_len + max_tokens > max_seq) {
+        fprintf(stderr,
+            "bench inference: prompt (%d tokens) + max_tokens (%d) = %d exceeds the "
+            "model's max_seq (%d). Use a shorter prompt or fewer --max_tokens.\n",
+            prompt_len, max_tokens, prompt_len + max_tokens, max_seq);
+        orion_gpt2_weights_free(w);
+        orion_gpt2_tokenizer_free(tok);
+        return 1;
+    }
+
     const char *mode_str = "CPU only";
     if (use_ane && ane_decode) mode_str = "ANE full";
     else if (use_ane) mode_str = "ANE prefill + CPU decode";

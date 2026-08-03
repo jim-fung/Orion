@@ -287,10 +287,12 @@ bool orion_gpt2_prefill_kv(const OrionGPT2Weights* w,
 
     // Fail closed before any allocation if the prompt cannot fit. An oversized
     // prompt would otherwise leave current_len advanced past a zeroed cache and
-    // poison every subsequent decode step (silent corruption).
-    if (seq_len < 0 || seq_len > kv->max_seq) {
-        fprintf(stderr, "orion_gpt2_prefill_kv: seq_len %d exceeds max_seq %d\n",
-                seq_len, kv->max_seq);
+    // poison every subsequent decode step (silent corruption). An empty prompt
+    // is also invalid: the final logits GEMM addresses x + (seq_len-1)*d, which
+    // points before the allocation when seq_len == 0.
+    if (!w || !tokens || !kv || !logits || seq_len <= 0 || seq_len > kv->max_seq) {
+        fprintf(stderr, "orion_gpt2_prefill_kv: invalid args (seq_len=%d max_seq=%d)\n",
+                seq_len, kv ? kv->max_seq : -1);
         return false;
     }
 

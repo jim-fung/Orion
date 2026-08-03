@@ -20,19 +20,22 @@ static int g_passed = 0, g_failed = 0;
     else { printf("FAIL\n"); g_failed++; } \
 } while (0)
 
-// Returns true if every float in the [count]-element K/V cache for (layer) is 0.
-static bool layer_kv_is_zero(const OrionKVCache* kv, int layer, int count) {
+// Returns true if every float in layer (layer)'s K/V cache region is 0.
+// Inspects exactly one layer's stride (n_head * max_seq * head_dim) so the
+// helper can never read past the cache allocation — the prior version took a
+// caller-supplied count and could over-read into the next layer / out of bounds.
+static bool layer_kv_is_zero(const OrionKVCache* kv, int layer) {
     size_t layer_stride = (size_t)kv->n_head * kv->max_seq * kv->head_dim;
     size_t base = (size_t)layer * layer_stride;
-    for (size_t i = 0; i < (size_t)count; i++) {
+    for (size_t i = 0; i < layer_stride; i++) {
         if (kv->k_cache[base + i] != 0.0f) return false;
         if (kv->v_cache[base + i] != 0.0f) return false;
     }
     return true;
 }
 
-// A tiny config: 2 layers, 1 head, head_dim 2, max_seq 4. The cache holds
-// 2*1*4*2 = 16 floats per K/V buffer.
+// A tiny config: 2 layers, 1 head, head_dim 2, max_seq 4. Each layer's K/V
+// region is 1*4*2 = 8 floats; the whole cache holds 2*8 = 16 floats per buffer.
 static OrionKVCache* make_tiny_cache(void) {
     OrionModelConfig cfg = { .n_layer = 2, .n_head = 1, .head_dim = 2, .max_seq = 4 };
     return orion_kv_cache_create(&cfg);
@@ -48,7 +51,7 @@ static bool test_store_prefill_rejects_oversized_prompt(void) {
     bool ok = orion_kv_cache_store_prefill(kv, /*layer*/ 0, k, v, /*seq_len*/ 5);
     if (ok) { printf("(expected false) "); goto fail; }   // must reject
     if (kv->current_len != 0) goto fail;                   // must not advance
-    if (!layer_kv_is_zero(kv, 0, 16)) goto fail;           // must not write anything
+    if (!layer_kv_is_zero(kv, 0)) goto fail;               // must not write anything
     orion_kv_cache_free(kv);
     return true;
 fail:
@@ -79,7 +82,7 @@ static bool test_store_prefill_rejects_bad_layer(void) {
     if (ok) goto fail;
     // Every layer's cache must still be zero.
     for (int L = 0; L < kv->n_layer; L++) {
-        if (!layer_kv_is_zero(kv, L, 16)) goto fail;
+        if (!layer_kv_is_zero(kv, L)) goto fail;
     }
     orion_kv_cache_free(kv);
     return true;
@@ -120,7 +123,7 @@ static bool test_append_rejects_when_full(void) {
     bool ok = orion_kv_cache_append(kv, 0, k, v);
     if (ok) { printf("(expected false) "); goto fail; }    // must reject
     if (kv->current_len != kv->max_seq) goto fail;         // must not advance past full
-    if (!layer_kv_is_zero(kv, 0, 16)) goto fail;           // must not write at the OOB slot
+    if (!layer_kv_is_zero(kv, 0)) goto fail;               // must not write at the OOB slot
     orion_kv_cache_free(kv);
     return true;
 fail:
