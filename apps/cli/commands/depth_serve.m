@@ -127,8 +127,12 @@ static bool rewrite_refs_seqpack(OrionGraph *g, NSString *blob_mil_path,
     return true;
 }
 
-// Generate MIL for a seqpack layer graph (with blob refs rewritten).
-static NSString *generate_seqpack_mil(int layer, NSString *root) {
+// Generate MIL and a finalized binding plan for a seqpack layer graph.
+// The plan and MIL come from the same rewritten graph so that the runtime can
+// authenticate the cached ABI/provenance during plan-aware eval — the same
+// integrity guarantee separate-CFG already has.
+static NSString *generate_seqpack_mil_with_plan(int layer, NSString *root,
+                                                 OrionBindingPlan *out_plan) {
     NSDictionary *offsets = seqpack_offsets(root, layer);
     if (!offsets) {
         fprintf(stderr, "depth-serve: no seqpack manifest for layer %d\n", layer);
@@ -149,16 +153,29 @@ static NSString *generate_seqpack_mil(int layer, NSString *root) {
         return nil;
     }
     NSString *mil = orion_codegen_mil(g, "main");
+    if (!mil) { orion_graph_free(g); return nil; }
+    char plan_err[512] = {0};
+    bool planned = orion_binding_plan_generate(g, "main", out_plan, plan_err, sizeof(plan_err));
     orion_graph_free(g);
+    if (!planned || !orion_binding_plan_set_mil_identity(out_plan, mil.UTF8String) ||
+        !orion_binding_plan_validate_finalized(out_plan, plan_err, sizeof(plan_err))) {
+        fprintf(stderr, "depth-serve: seqpack layer %d finalized plan rejected: %s\n",
+                layer, plan_err[0] ? plan_err : "invalid MIL/plan");
+        return nil;
+    }
     return mil;
 }
 
-// Compile a seqpack layer program from its blob + MIL.
+// Compile a seqpack layer program from its blob + MIL, plan-verified.
+// The weight dictionary is validated against the finalized plan before the
+// private compiler consumes it, and the program is compiled via the plan-aware
+// path so eval can authenticate the cached ABI.
 static OrionProgram *compile_seqpack_layer(int layer, NSString *mil, NSData *blob,
+                                           const OrionBindingPlan *plan,
                                            int *compile_count,
                                            OrionCompileLedger *ledger) {
-    if (!blob) {
-        fprintf(stderr, "depth-serve: missing seqpack blob for layer %d\n", layer);
+    if (!blob || !plan) {
+        fprintf(stderr, "depth-serve: missing seqpack blob/plan for layer %d\n", layer);
         return nil;
     }
     if (orion_ledger_exhausted(ledger)) {
@@ -168,9 +185,20 @@ static OrionProgram *compile_seqpack_layer(int layer, NSString *mil, NSData *blo
     }
     NSString *blob_mil = [NSString stringWithFormat:@"@model_path/weights/layer%d_seqpack.blob", layer];
     NSDictionary *wd = @{blob_mil: @{@"offset": @0, @"data": blob}};
+    if (!orion_validate_weight_dictionary_for_plan(plan, wd)) {
+        fprintf(stderr, "depth-serve: seqpack layer %d weight dictionary does not match plan\n",
+                layer);
+        return nil;
+    }
     char tag[40];
     snprintf(tag, sizeof(tag), "depth-serve-seqpack-layer%d", layer);
-    OrionProgram *program = orion_compile_mil(mil.UTF8String, wd, tag);
+    char compile_err[512] = {0};
+    OrionProgram *program = orion_compile_mil_with_plan(mil.UTF8String, plan, wd, tag,
+                                                        compile_err, sizeof(compile_err));
+    if (!program) {
+        fprintf(stderr, "depth-serve: seqpack layer %d compile failed: %s\n", layer,
+                compile_err[0] ? compile_err : "private compiler failure");
+    }
     orion_ledger_record_compile(ledger, program != nil, /*cached=*/0);
     if (program) (*compile_count)++;
     return program;
@@ -357,9 +385,13 @@ static bool depth_worker_compile(DepthWorker *w, NSString *root, int max_compile
     }
 
     if (w->seqpack) {
-        // Seqpack uses checked CPU RMSNorm on seq64 output; compile exactly four layers.
+        // Seqpack uses checked CPU RMSNorm on seq64 output; compile exactly four
+        // layers. Each layer is now compiled plan-verified, matching separate-CFG:
+        // MIL and a finalized plan come from the same rewritten graph, the weight
+        // dictionary is authenticated against the plan, and eval uses the cached
+        // plan ABI rather than a raw eval.
         for (int n = 0; n < LAYERS; n++) {
-            NSString *mil_n = generate_seqpack_mil(n, root);
+            NSString *mil_n = generate_seqpack_mil_with_plan(n, root, &w->layer_plans[n]);
             NSString *blob_path = [root stringByAppendingPathComponent:
                 [NSString stringWithFormat:@"weights/layer%d_seqpack.blob", n]];
             NSData *blob_n = [NSData dataWithContentsOfFile:blob_path];
@@ -371,6 +403,7 @@ static bool depth_worker_compile(DepthWorker *w, NSString *root, int max_compile
                 return false;
             }
             w->layer_programs[n] = compile_seqpack_layer(n, mil_n, blob_n,
+                                                         &w->layer_plans[n],
                                                          &w->compile_count,
                                                          &w->compile_ledger);
             if (!w->layer_programs[n]) {
@@ -625,12 +658,12 @@ static bool depth_eval_counted(DepthWorker *w, int program_index,
                                DepthPhaseTimings *timings,
                                DepthFrameFailure *failure) {
     uint64_t eval_start = phase_start(timings);
+    // Both seqpack and separate-CFG layers are now plan-verified: eval
+    // authenticates the cached ABI/provenance against the stored plan.
     OrionEvalResult result = program_index < LAYERS
-        ? (w->seqpack
-            ? orion_eval_report(w->layer_programs[program_index], input, 1, output, 1)
-            : orion_eval_with_plan_report(w->layer_programs[program_index],
-                                          &w->layer_plans[program_index], input, 1,
-                                          output, 1))
+        ? orion_eval_with_plan_report(w->layer_programs[program_index],
+                                      &w->layer_plans[program_index], input, 1,
+                                      output, 1)
         : orion_eval_with_plan_report(w->final_norm_program, &w->final_norm_plan,
                                       input, 1, output, 1);
     if (timings) {

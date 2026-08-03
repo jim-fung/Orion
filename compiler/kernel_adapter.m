@@ -79,6 +79,18 @@ static NSString* generate_mil(OrionGraph* g, const OrionBindingPlanIdentity* ide
     // Optimize
     orion_pipeline_optimize(g);
 
+    // Revalidate structurally after optimization. The optimization passes
+    // mutate graph liveness, output references, and node topology; a pass bug
+    // could create dead references, invalid shapes, or name collisions after
+    // the only prior structural gate. Catch that here, before ANE validation
+    // and plan generation consume the post-optimize graph.
+    OrionValidationResult vr_post = orion_graph_validate(g);
+    if (!vr_post.valid) {
+        NSLog(@"[kernel_adapter] post-optimize validation failed: %s", vr_post.message);
+        orion_graph_free(g);
+        return nil;
+    }
+
     // ANE validation is mandatory before codegen. Unlike the structural graph
     // validator, this checks external ABI constraints and banned operations.
     orion_pipeline_ane_passes(g);

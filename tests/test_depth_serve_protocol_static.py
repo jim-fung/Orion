@@ -90,11 +90,18 @@ def test_actual_private_calls_are_counted_and_expected_counts_are_exact() -> Non
     assert 'seqpack ? DEPTH_STEPS : DEPTH_STEPS * CFG_BRANCHES' in init
     assert 'counters->expected[LAYERS] = seqpack ? 0 : DEPTH_STEPS * CFG_BRANCHES;' in init
     counted = function_body(source, "depth_eval_counted")
-    require_in_order(counted, 'orion_eval_report(', 'orion_eval_with_plan_report(',
+    # Both seqpack and separate-CFG layers are plan-verified: every layer and
+    # the final-norm eval go through orion_eval_with_plan_report so the cached
+    # ABI/provenance is authenticated. The raw orion_eval_report must NOT be
+    # used for any layer eval.
+    require_in_order(counted, 'orion_eval_with_plan_report(w->layer_programs[program_index],',
+                     'orion_eval_with_plan_report(w->final_norm_program',
                      'if (result == ORION_EVAL_NOT_INVOKED)',
                      'counters->actual[program_index]++;',
                      'counters->successful[program_index]++;',
                      'counters->failed[program_index]++;')
+    assert 'orion_eval_report(' not in counted, \
+        "seqpack layers must use plan-aware eval, not raw orion_eval_report"
     report = runtime[runtime.index('OrionEvalResult orion_eval_report('):]
     require_in_order(report, 'if (!wrapped) return ORION_EVAL_NOT_INVOKED;',
                      'if (!req) return ORION_EVAL_NOT_INVOKED;',
