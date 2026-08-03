@@ -843,15 +843,17 @@ static int bench_inference(const char *prompt_text, int max_tokens, int warmup,
         }
 
         uint64_t rng = 42;
+        OrionDecodeWorkspace* warmup_ws = orion_decode_workspace_create(w, kv);
         for (int i = 0; i < 5; i++) {
             int next = orion_sample_token(logits, w->vocab, 0.0f, 0.9f, &rng);
             if (next == 50256) break;
             if (ane_decode) {
                 orion_ane_decode_step(w, kv, next, weights_path, logits);
             } else {
-                orion_gpt2_decode_step(w, kv, next, logits);
+                orion_gpt2_decode_step(w, kv, next, logits, warmup_ws);
             }
         }
+        orion_decode_workspace_free(warmup_ws);
 
         orion_kv_cache_free(kv);
         free(logits);
@@ -883,6 +885,7 @@ static int bench_inference(const char *prompt_text, int max_tokens, int warmup,
     double *decode_samples = (double *)malloc(max_tokens * sizeof(double));
     int gen_count = 0;
     uint64_t rng = 42;
+    OrionDecodeWorkspace* decode_ws = orion_decode_workspace_create(w, kv);
 
     for (int i = 0; i < max_tokens; i++) {
         int next = orion_sample_token(logits, w->vocab, 0.0f, 0.9f, &rng);
@@ -895,13 +898,14 @@ static int bench_inference(const char *prompt_text, int max_tokens, int warmup,
             if (!ok) {
                 fprintf(stderr, "ANE decode failed at step %d, falling back to CPU\n", i);
                 ane_decode = false;
-                orion_gpt2_decode_step(w, kv, next, logits);
+                orion_gpt2_decode_step(w, kv, next, logits, decode_ws);
             }
         } else {
-            orion_gpt2_decode_step(w, kv, next, logits);
+            orion_gpt2_decode_step(w, kv, next, logits, decode_ws);
         }
         decode_samples[i] = time_ms() - td0;
     }
+    orion_decode_workspace_free(decode_ws);
 
     // Compute decode stats
     double decode_sum = 0;

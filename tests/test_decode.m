@@ -77,7 +77,7 @@ static void test_decode_step(void) {
     orion_gpt2_prefill_kv(g_weights, tokens_1, 1, kv, logits_prefill);
 
     // Now decode with token 11
-    orion_gpt2_decode_step(g_weights, kv, 11, logits_decode);
+    orion_gpt2_decode_step(g_weights, kv, 11, logits_decode, NULL);
     int argmax_decode = orion_sample_token(logits_decode, g_weights->vocab, 0.0f, 1.0f, NULL);
 
     ASSERT(kv->current_len == 2, "KV cache len=%d, expected 2", kv->current_len);
@@ -108,10 +108,10 @@ static void test_multi_step_decode(void) {
     int tok1 = orion_sample_token(logits, g_weights->vocab, 0.0f, 1.0f, NULL);
 
     // Decode 2 more tokens
-    orion_gpt2_decode_step(g_weights, kv, tok1, logits);
+    orion_gpt2_decode_step(g_weights, kv, tok1, logits, NULL);
     int tok2 = orion_sample_token(logits, g_weights->vocab, 0.0f, 1.0f, NULL);
 
-    orion_gpt2_decode_step(g_weights, kv, tok2, logits);
+    orion_gpt2_decode_step(g_weights, kv, tok2, logits, NULL);
     int tok3 = orion_sample_token(logits, g_weights->vocab, 0.0f, 1.0f, NULL);
 
     printf("  multi_step: generated tokens: %d %d %d (cache_len=%d)\n",

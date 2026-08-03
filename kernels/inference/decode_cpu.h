@@ -18,6 +18,41 @@
 void orion_cpu_layernorm(const float* x, const float* gamma, const float* beta,
                           int dim, float* out);
 
+#pragma mark - Decode Workspace (T039)
+
+/// Persistent workspace for the single-token decode hot path.
+///
+/// The decode loop previously allocated/free'd several buffers on every
+/// generated token: per-token hidden/ln/attn/ffn vectors, per-layer Q/K/V and
+/// output-projection vectors, and a per-head attention-score vector. Over a
+/// long generation (n_layer × n_head × n_tokens) this is heavy allocator lock
+/// traffic, zeroing, and cache churn for buffers that are always the same size.
+///
+/// The workspace is sized once to the model/cache and reused across every step
+/// and every layer/head inside a step. Create it before the decode loop and
+/// free it after.
+typedef struct {
+    float* x;            // [d_model]  hidden state for the single active token
+    float* ln_out;       // [d_model]  layernorm output
+    float* attn_out;     // [d_model]  attention output (all heads concatenated)
+    float* ffn_out;      // [d_model]  FFN output
+    float* q;            // [d_model]  Q projection (per-token, reused per layer)
+    float* k_new;        // [d_model]  K projection (per-token, reused per layer)
+    float* v_new;        // [d_model]  V projection (per-token, reused per layer)
+    float* proj_out;     // [d_model]  attention output projection
+    float* scores;       // [max_seq]  attention score buffer (reused per head)
+    int d_model;
+    int max_seq;
+} OrionDecodeWorkspace;
+
+/// Allocate a decode workspace sized to the model and KV cache. Returns NULL
+/// on allocation failure.
+OrionDecodeWorkspace* orion_decode_workspace_create(const OrionGPT2Weights* w,
+                                                     const OrionKVCache* kv);
+
+/// Free a decode workspace (NULL-safe).
+void orion_decode_workspace_free(OrionDecodeWorkspace* ws);
+
 #pragma mark - Prefill Forward Pass (T036)
 
 /// Run full CPU GPT-2 forward pass (prefill mode).
@@ -59,10 +94,14 @@ void orion_gpt2_prefill_kv(const OrionGPT2Weights* w,
 /// @param kv        KV cache (read for past K,V; updated with new K,V)
 /// @param token     Input token id for this step
 /// @param logits    Output logits buffer [vocab]
+/// @param ws        Persistent decode workspace (create once before the loop).
+///                  If NULL, a transient workspace is allocated/freed per call
+///                  (backwards-compatible but loses the reuse benefit).
 void orion_gpt2_decode_step(const OrionGPT2Weights* w,
                               OrionKVCache* kv,
                               int token,
-                              float* logits);
+                              float* logits,
+                              OrionDecodeWorkspace* ws);
 
 #pragma mark - Sampling (T040)
 

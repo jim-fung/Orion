@@ -341,46 +341,81 @@ void orion_gpt2_prefill_kv(const OrionGPT2Weights* w,
 
 #pragma mark - T039: Single-Token Decode with KV Cache
 
-/// Single-head attention for decode: Q[1, head_dim] against cached K,V
+/// Single-head attention for decode: Q[1, head_dim] against cached K,V.
+/// scores_buf is a caller-owned [max_seq] scratch buffer, reused across heads
+/// and tokens to avoid per-head malloc/free in the inner attention loop.
 static void attention_decode_head(const float* q_h, const float* k_cache_h,
                                     const float* v_cache_h, int cache_len,
-                                    int head_dim, int max_seq __attribute__((unused)), float* out_h) {
+                                    int head_dim, int max_seq,
+                                    float* scores_buf, float* out_h) {
+    (void)max_seq;  // scores_buf is already sized to max_seq by the workspace
     float scale = 1.0f / sqrtf((float)head_dim);
 
     // scores[cache_len] = Q_h @ K_h^T * scale
-    float* scores = (float*)malloc(cache_len * sizeof(float));
     cblas_sgemv(CblasRowMajor, CblasNoTrans,
                 cache_len, head_dim,
                 scale, k_cache_h, head_dim, q_h, 1,
-                0.0f, scores, 1);
+                0.0f, scores_buf, 1);
 
     // Softmax (no causal mask needed — we attend to all cached positions)
-    float max_val = scores[0];
+    float max_val = scores_buf[0];
     for (int j = 1; j < cache_len; j++) {
-        if (scores[j] > max_val) max_val = scores[j];
+        if (scores_buf[j] > max_val) max_val = scores_buf[j];
     }
     float sum = 0.0f;
     for (int j = 0; j < cache_len; j++) {
-        scores[j] = expf(scores[j] - max_val);
-        sum += scores[j];
+        scores_buf[j] = expf(scores_buf[j] - max_val);
+        sum += scores_buf[j];
     }
     for (int j = 0; j < cache_len; j++) {
-        scores[j] /= sum;
+        scores_buf[j] /= sum;
     }
 
     // out_h[head_dim] = scores[cache_len] @ V_h[cache_len, head_dim]
     cblas_sgemv(CblasRowMajor, CblasTrans,
                 cache_len, head_dim,
-                1.0f, v_cache_h, head_dim, scores, 1,
+                1.0f, v_cache_h, head_dim, scores_buf, 1,
                 0.0f, out_h, 1);
+}
 
-    free(scores);
+OrionDecodeWorkspace* orion_decode_workspace_create(const OrionGPT2Weights* w,
+                                                     const OrionKVCache* kv) {
+    if (!w || !kv) return NULL;
+    OrionDecodeWorkspace* ws = (OrionDecodeWorkspace*)calloc(1, sizeof(*ws));
+    if (!ws) return NULL;
+    ws->d_model = w->d_model;
+    ws->max_seq = kv->max_seq;
+    size_t d_bytes = (size_t)w->d_model * sizeof(float);
+    ws->x        = (float*)malloc(d_bytes);
+    ws->ln_out   = (float*)malloc(d_bytes);
+    ws->attn_out = (float*)malloc(d_bytes);
+    ws->ffn_out  = (float*)malloc(d_bytes);
+    ws->q        = (float*)malloc(d_bytes);
+    ws->k_new    = (float*)malloc(d_bytes);
+    ws->v_new    = (float*)malloc(d_bytes);
+    ws->proj_out = (float*)malloc(d_bytes);
+    ws->scores   = (float*)malloc((size_t)kv->max_seq * sizeof(float));
+    if (!ws->x || !ws->ln_out || !ws->attn_out || !ws->ffn_out ||
+        !ws->q || !ws->k_new || !ws->v_new || !ws->proj_out || !ws->scores) {
+        orion_decode_workspace_free(ws);
+        return NULL;
+    }
+    return ws;
+}
+
+void orion_decode_workspace_free(OrionDecodeWorkspace* ws) {
+    if (!ws) return;
+    free(ws->x); free(ws->ln_out); free(ws->attn_out); free(ws->ffn_out);
+    free(ws->q); free(ws->k_new); free(ws->v_new); free(ws->proj_out);
+    free(ws->scores);
+    free(ws);
 }
 
 void orion_gpt2_decode_step(const OrionGPT2Weights* w,
                               OrionKVCache* kv,
                               int token,
-                              float* logits) {
+                              float* logits,
+                              OrionDecodeWorkspace* ws) {
     int d = w->d_model;
     int n_layer = w->n_layer;
     int n_head = kv->n_head;
@@ -389,11 +424,20 @@ void orion_gpt2_decode_step(const OrionGPT2Weights* w,
     int vocab = w->vocab;
     int pos = kv->current_len;
 
-    // x[d_model] — hidden state for single token
-    float* x = (float*)malloc(d * sizeof(float));
-    float* ln_out = (float*)malloc(d * sizeof(float));
-    float* attn_out_full = (float*)malloc(d * sizeof(float));
-    float* ffn_out = (float*)malloc(d * sizeof(float));
+    // Use the caller's persistent workspace when provided; otherwise allocate a
+    // transient one for backwards compatibility (tests/diagnostics). The
+    // production decode loop should create the workspace once before the loop.
+    bool transient = false;
+    if (!ws) {
+        ws = orion_decode_workspace_create(w, kv);
+        if (!ws) return;
+        transient = true;
+    }
+
+    float* x = ws->x;
+    float* ln_out = ws->ln_out;
+    float* attn_out_full = ws->attn_out;
+    float* ffn_out = ws->ffn_out;
 
     // Embed: wte[token] + wpe[pos]
     for (int i = 0; i < d; i++) {
@@ -408,35 +452,33 @@ void orion_gpt2_decode_step(const OrionGPT2Weights* w,
         // Pre-attention LayerNorm
         orion_cpu_layernorm(x, l->ln1_g, l->ln1_b, d, ln_out);
 
-        // Q, K, V projections for single token: [1, d_model] @ [d_model, d_model]^T
-        float* q = (float*)malloc(d * sizeof(float));
-        float* k_new = (float*)malloc(d * sizeof(float));
-        float* v_new = (float*)malloc(d * sizeof(float));
-        linear(ln_out, l->wq, l->bq, 1, d, d, q);
-        linear(ln_out, l->wk, l->bk, 1, d, d, k_new);
-        linear(ln_out, l->wv, l->bv, 1, d, d, v_new);
+        // Q, K, V projections for single token — reused per layer from the
+        // workspace instead of malloc/free on every layer of every token.
+        linear(ln_out, l->wq, l->bq, 1, d, d, ws->q);
+        linear(ln_out, l->wk, l->bk, 1, d, d, ws->k_new);
+        linear(ln_out, l->wv, l->bv, 1, d, d, ws->v_new);
 
         // Append K, V to cache
-        orion_kv_cache_append(kv, layer, k_new, v_new);
+        orion_kv_cache_append(kv, layer, ws->k_new, ws->v_new);
 
-        // Multi-head attention using cached K, V
+        // Multi-head attention using cached K, V. The score buffer is reused
+        // across all heads (and all tokens) from the workspace.
         int cache_len = pos + 1;  // includes current position
         for (int h = 0; h < n_head; h++) {
-            float* q_h = q + h * head_dim;
+            float* q_h = ws->q + h * head_dim;
             float* k_cache_h = kv->k_cache + layer * layer_stride + h * kv->max_seq * head_dim;
             float* v_cache_h = kv->v_cache + layer * layer_stride + h * kv->max_seq * head_dim;
 
             attention_decode_head(q_h, k_cache_h, v_cache_h, cache_len,
-                                   head_dim, kv->max_seq, attn_out_full + h * head_dim);
+                                   head_dim, kv->max_seq, ws->scores,
+                                   attn_out_full + h * head_dim);
         }
 
-        // Output projection
-        float* proj_out = (float*)malloc(d * sizeof(float));
-        linear(attn_out_full, l->wo, l->bo, 1, d, d, proj_out);
+        // Output projection — proj_out reused from the workspace.
+        linear(attn_out_full, l->wo, l->bo, 1, d, d, ws->proj_out);
 
         // Residual
-        vDSP_vadd(x, 1, proj_out, 1, x, 1, d);
-        free(proj_out);
+        vDSP_vadd(x, 1, ws->proj_out, 1, x, 1, d);
 
         // Pre-FFN LayerNorm
         orion_cpu_layernorm(x, l->ln2_g, l->ln2_b, d, ln_out);
@@ -444,8 +486,6 @@ void orion_gpt2_decode_step(const OrionGPT2Weights* w,
         // FFN (single token)
         ffn(l, ln_out, 1, d, d_ff, ffn_out);
         vDSP_vadd(x, 1, ffn_out, 1, x, 1, d);
-
-        free(q); free(k_new); free(v_new);
     }
 
     // Final LayerNorm
@@ -459,7 +499,7 @@ void orion_gpt2_decode_step(const OrionGPT2Weights* w,
 
     kv->current_len = pos + 1;
 
-    free(x); free(ln_out); free(attn_out_full); free(ffn_out);
+    if (transient) orion_decode_workspace_free(ws);
 }
 
 #pragma mark - T040: Sampling

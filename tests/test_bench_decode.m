@@ -82,7 +82,7 @@ int main(int argc, const char* argv[]) {
             double times[20];
             for (int i = 0; i < n_iters; i++) {
                 double t0 = time_ms();
-                orion_gpt2_decode_step(w, kv, next, logits);
+                orion_gpt2_decode_step(w, kv, next, logits, NULL);
                 times[i] = time_ms() - t0;
                 next = orion_sample_token(logits, vocab, 0.0f, 1.0f, NULL);
             }

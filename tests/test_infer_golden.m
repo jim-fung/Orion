@@ -37,7 +37,7 @@ static void test_greedy_generation(OrionGPT2Weights* w,
         }
 
         if (i < expected_len - 1) {
-            orion_gpt2_decode_step(w, kv, next, logits);
+            orion_gpt2_decode_step(w, kv, next, logits, NULL);
         }
     }
 
@@ -89,7 +89,7 @@ int main(int argc, const char* argv[]) {
             int expected[5];
             for (int i = 0; i < 5; i++) {
                 expected[i] = orion_sample_token(logits, w->vocab, 0.0f, 1.0f, NULL);
-                if (i < 4) orion_gpt2_decode_step(w, kv, expected[i], logits);
+                if (i < 4) orion_gpt2_decode_step(w, kv, expected[i], logits, NULL);
             }
 
             orion_kv_cache_free(kv);

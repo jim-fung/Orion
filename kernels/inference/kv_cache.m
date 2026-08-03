@@ -1,6 +1,7 @@
 #import "kv_cache.h"
 #import <stdlib.h>
 #import <string.h>
+#import <stdio.h>
 
 // T037-T038: KV Cache Management
 //
@@ -30,6 +31,15 @@ void orion_kv_cache_store_prefill(OrionKVCache* cache, int layer,
     int nh = cache->n_head;
     int hd = cache->head_dim;
     int ms = cache->max_seq;
+
+    // Bounds check: a prompt longer than max_seq would write past the allocated
+    // K/V cache. Fail fast rather than corrupting memory.
+    if (seq_len < 0 || seq_len > ms) {
+        fprintf(stderr, "orion_kv_cache_store_prefill: seq_len %d exceeds max_seq %d\n",
+                seq_len, ms);
+        return;
+    }
+
     size_t layer_stride = (size_t)nh * ms * hd;
 
     for (int h = 0; h < nh; h++) {
@@ -50,6 +60,15 @@ void orion_kv_cache_append(OrionKVCache* cache, int layer,
     int hd = cache->head_dim;
     int ms = cache->max_seq;
     int pos = cache->current_len;
+
+    // Bounds check: once the cache is full, a further append would write past
+    // the allocated buffer. Fail fast rather than corrupting memory.
+    if (pos < 0 || pos >= ms) {
+        fprintf(stderr, "orion_kv_cache_append: position %d out of bounds [0, %d)\n",
+                pos, ms);
+        return;
+    }
+
     size_t layer_stride = (size_t)nh * ms * hd;
 
     for (int h = 0; h < nh; h++) {

@@ -554,7 +554,7 @@ static void test_ane_golden(void) {
                 match = 0;
                 break;
             }
-            if (i < 4) orion_gpt2_decode_step(w, kv, next, logits);
+            if (i < 4) orion_gpt2_decode_step(w, kv, next, logits, NULL);
         }
         CHECK(match, "Hello→5tok: ANE matches CPU golden");
 

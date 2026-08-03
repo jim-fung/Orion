@@ -68,7 +68,7 @@ static void test_single_step_matches_cpu(OrionGPT2Weights* w) {
 
     // CPU decode step
     float* logits_cpu = (float*)malloc(vocab * sizeof(float));
-    orion_gpt2_decode_step(w, kv_cpu, first_token, logits_cpu);
+    orion_gpt2_decode_step(w, kv_cpu, first_token, logits_cpu, NULL);
     int cpu_next = orion_sample_token(logits_cpu, vocab, 0.0f, 1.0f, NULL);
     printf("  CPU decode next token: %d\n", cpu_next);
 
@@ -158,7 +158,7 @@ static void test_multi_step_greedy(OrionGPT2Weights* w) {
     int cpu_tokens[3];
     for (int i = 0; i < 3; i++) {
         cpu_tokens[i] = orion_sample_token(logits, vocab, 0.0f, 1.0f, NULL);
-        if (i < 2) orion_gpt2_decode_step(w, kv_cpu, cpu_tokens[i], logits);
+        if (i < 2) orion_gpt2_decode_step(w, kv_cpu, cpu_tokens[i], logits, NULL);
     }
     printf("  CPU tokens: %d %d %d\n", cpu_tokens[0], cpu_tokens[1], cpu_tokens[2]);
 

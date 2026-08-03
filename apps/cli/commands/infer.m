@@ -132,6 +132,20 @@ int orion_cmd_infer(int argc, const char* argv[]) {
     }
     fprintf(stderr, "Prompt: \"%s\" → %d tokens\n", prompt, prompt_len);
 
+    // Context bounds: the KV cache is allocated to max_seq. A prompt plus the
+    // requested generation must fit, or decode would write past the cache. Fail
+    // fast with a clear message rather than corrupting memory mid-generation.
+    int max_seq = kGPT2_124M.max_seq;
+    if (prompt_len + max_tokens > max_seq) {
+        fprintf(stderr,
+            "Error: prompt (%d tokens) + max_tokens (%d) = %d exceeds the model's "
+            "max_seq (%d). Use a shorter prompt or fewer --max_tokens.\n",
+            prompt_len, max_tokens, prompt_len + max_tokens, max_seq);
+        orion_gpt2_weights_free(w);
+        orion_gpt2_tokenizer_free(tok);
+        return 1;
+    }
+
     // Allocate
     float* logits = (float*)malloc(w->vocab * sizeof(float));
     OrionKVCache* kv = orion_kv_cache_create(&kGPT2_124M);
@@ -173,6 +187,10 @@ int orion_cmd_infer(int argc, const char* argv[]) {
     uint64_t rng_state = seed;
     fprintf(stderr, "Decoding (%s)...\n", ane_decode ? "ANE" : "CPU");
 
+    // Persistent CPU decode workspace: sized once to the model/cache and reused
+    // across every token instead of allocating/freeing per-token/per-layer/per-head.
+    OrionDecodeWorkspace* decode_ws = orion_decode_workspace_create(w, kv);
+
     for (int i = 0; i < max_tokens; i++) {
         int next_token = orion_sample_token(logits, w->vocab, temperature, top_p, &rng_state);
 
@@ -194,14 +212,16 @@ int orion_cmd_infer(int argc, const char* argv[]) {
             if (!decode_ok) {
                 fprintf(stderr, "Warning: ANE decode failed at step %d, falling back to CPU\n", i);
                 ane_decode = false;
-                orion_gpt2_decode_step(w, kv, next_token, logits);
+                orion_gpt2_decode_step(w, kv, next_token, logits, decode_ws);
             }
         } else {
-            orion_gpt2_decode_step(w, kv, next_token, logits);
+            orion_gpt2_decode_step(w, kv, next_token, logits, decode_ws);
         }
         double decode_ms = time_ms() - t0;
         orion_prof_record_decode(decode_ms);
     }
+
+    orion_decode_workspace_free(decode_ws);
 
     printf("\n");
 

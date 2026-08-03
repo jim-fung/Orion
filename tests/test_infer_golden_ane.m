@@ -86,7 +86,7 @@ static void test_ane_vs_cpu(OrionGPT2Weights* w,
     int cpu_tokens[64];
     for (int i = 0; i < gen_len; i++) {
         cpu_tokens[i] = orion_sample_token(logits, w->vocab, 0.0f, 1.0f, NULL);
-        if (i < gen_len - 1) orion_gpt2_decode_step(w, kv_cpu, cpu_tokens[i], logits);
+        if (i < gen_len - 1) orion_gpt2_decode_step(w, kv_cpu, cpu_tokens[i], logits, NULL);
     }
 
     // ANE
