@@ -25,6 +25,7 @@
 // non-finite or non-deterministic output, or full-loop p99 >= 60 ms.
 
 #import <Foundation/Foundation.h>
+#include "orion_test.h"
 #import <IOSurface/IOSurface.h>
 #include <mach/mach_time.h>
 #include <math.h>
@@ -341,11 +342,11 @@ int main(void) {
         const char *root_env = getenv("VOXTREAM_DEPTH_EXPORT");
         if (!root_env || !root_env[0]) {
             printf("SKIP: set VOXTREAM_DEPTH_EXPORT to a validated export directory\n");
-            return 0;
+            return ORION_TEST_SKIP;
         }
         if (!orion_ane_init()) {
             printf("SKIP: ANE runtime unavailable\n");
-            return 0;
+            return ORION_TEST_SKIP;
         }
         NSString *root = @(root_env);
         const char *output_path = getenv("VOXTREAM_DEPTH_LOOP_OUTPUT");

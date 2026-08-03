@@ -177,23 +177,30 @@ $(BUILDDIR)/%.o: %.c
 	$(CC) -O2 -Wall -Wextra -I . -I core -I compiler -c -o $@ $<
 
 # Build and run all test binaries plus the static lifecycle and protocol tests.
+# Exit codes: 0 PASS, 1 FAIL, 77 SKIP (capability/asset unavailable). Output is
+# captured per-test so PASS vs SKIP is distinguishable and failures show context.
 test: test-depth-serve-lifecycle-static test-depth-serve-protocol-static $(TEST_BINS) $(COMPILER_TEST_BINS)
-	@passed=0; failed=0; total=0; \
+	@mkdir -p $(BUILDDIR)/test-logs; \
+	passed=0; failed=0; skipped=0; total=0; failed_list=""; \
 	for t in $(TEST_BINS) $(COMPILER_TEST_BINS); do \
 		total=$$((total + 1)); \
 		name=$$(basename $$t); \
-		printf "%-30s " "$$name"; \
-		if $$t > /dev/null 2>&1; then \
-			printf "PASS\n"; \
-			passed=$$((passed + 1)); \
+		log="$(BUILDDIR)/test-logs/$$name.log"; \
+		printf "%-34s " "$$name"; \
+		$$t > $$log 2>&1; \
+		code=$$?; \
+		if [ $$code -eq 0 ]; then \
+			printf "PASS\n"; passed=$$((passed + 1)); \
+		elif [ $$code -eq 77 ]; then \
+			printf "SKIP\n"; skipped=$$((skipped + 1)); \
 		else \
-			printf "FAIL\n"; \
-			failed=$$((failed + 1)); \
+			printf "FAIL (exit %d)\n" $$code; failed=$$((failed + 1)); failed_list="$$failed_list $$name"; \
 		fi; \
 	done; \
 	echo ""; \
-	echo "$$passed/$$total passed, $$failed failed"; \
-	if [ $$failed -gt 0 ]; then exit 1; fi
+	echo "$$passed passed, $$skipped skipped, $$failed failed ($$total total)"; \
+	if [ $$failed -gt 0 ]; then echo "Failed:$$failed_list"; \
+		echo "See $(BUILDDIR)/test-logs/*.log for output."; exit 1; fi
 
 test-depth-serve-lifecycle-static:
 	@python3 tests/test_depth_serve_lifecycle_static.py
@@ -201,24 +208,29 @@ test-depth-serve-lifecycle-static:
 test-depth-serve-protocol-static:
 	@python3 tests/test_depth_serve_protocol_static.py
 
-# Run only compiler tests
+# Run only compiler tests (portable: no ANE/model-asset dependency).
 test-compiler: $(COMPILER_TEST_BINS)
-	@passed=0; failed=0; total=0; \
+	@mkdir -p $(BUILDDIR)/test-logs; \
+	passed=0; failed=0; skipped=0; total=0; failed_list=""; \
 	for t in $(COMPILER_TEST_BINS); do \
 		total=$$((total + 1)); \
 		name=$$(basename $$t); \
-		printf "%-30s " "$$name"; \
-		if $$t > /dev/null 2>&1; then \
-			printf "PASS\n"; \
-			passed=$$((passed + 1)); \
+		log="$(BUILDDIR)/test-logs/$$name.log"; \
+		printf "%-34s " "$$name"; \
+		$$t > $$log 2>&1; \
+		code=$$?; \
+		if [ $$code -eq 0 ]; then \
+			printf "PASS\n"; passed=$$((passed + 1)); \
+		elif [ $$code -eq 77 ]; then \
+			printf "SKIP\n"; skipped=$$((skipped + 1)); \
 		else \
-			printf "FAIL\n"; \
-			failed=$$((failed + 1)); \
+			printf "FAIL (exit %d)\n" $$code; failed=$$((failed + 1)); failed_list="$$failed_list $$name"; \
 		fi; \
 	done; \
 	echo ""; \
-	echo "$$passed/$$total passed, $$failed failed"; \
-	if [ $$failed -gt 0 ]; then exit 1; fi
+	echo "$$passed passed, $$skipped skipped, $$failed failed ($$total total)"; \
+	if [ $$failed -gt 0 ]; then echo "Failed:$$failed_list"; \
+		echo "See $(BUILDDIR)/test-logs/*.log for output."; exit 1; fi
 
 # Build each test binary: compile test .m + link with all library + compiler .o files
 $(BUILDDIR)/tests/%: tests/%.m $(LIB_OBJ) $(COMPILER_OBJ)

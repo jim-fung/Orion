@@ -24,6 +24,7 @@
 // unavailable (no budget consumed).
 
 #import <Foundation/Foundation.h>
+#include "orion_test.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -63,12 +64,12 @@ int main(void) {
         const char *export_root = getenv("VOXTREAM_DEPTH_EXPORT");
         if (!export_root || !*export_root) {
             printf("SKIP: set VOXTREAM_DEPTH_EXPORT to a seq-pack export directory\n");
-            return 0;
+            return ORION_TEST_SKIP;
         }
 
         if (!orion_ane_init()) {
             printf("SKIP: ANE unavailable\n");
-            return 0;
+            return ORION_TEST_SKIP;
         }
 
         NSString *export = [NSString stringWithUTF8String:export_root];

@@ -20,6 +20,7 @@
 // Consumes: 1 fresh ANE compile.
 
 #import <Foundation/Foundation.h>
+#include "orion_test.h"
 #import <IOSurface/IOSurface.h>
 #include <mach/mach_time.h>
 #include <math.h>
@@ -79,12 +80,12 @@ int main(void) {
         const char *export_root = getenv("VOXTREAM_DEPTH_EXPORT");
         if (!export_root || !export_root[0]) {
             printf("SKIP: set VOXTREAM_DEPTH_EXPORT to a v15 export directory\n");
-            return 0;
+            return ORION_TEST_SKIP;
         }
 
         if (!orion_ane_init()) {
             printf("SKIP: ANE unavailable\n");
-            return 0;
+            return ORION_TEST_SKIP;
         }
 
         NSString *export = @(export_root);

@@ -29,6 +29,7 @@
 // Consumes (when VOXTREAM_DEPTH_EXPORT set): 1 ANE compile.
 
 #import <Foundation/Foundation.h>
+#include "orion_test.h"
 #import <IOSurface/IOSurface.h>
 #include <mach/mach_time.h>
 #include <math.h>
@@ -215,7 +216,7 @@ int main(void) {
     @autoreleasepool {
         if (!orion_ane_init()) {
             printf("SKIP: ANE unavailable\n");
-            return 0;
+            return ORION_TEST_SKIP;
         }
 
         const char *export_root = getenv("VOXTREAM_DEPTH_EXPORT");

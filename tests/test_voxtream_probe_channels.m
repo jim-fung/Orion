@@ -30,6 +30,7 @@
 // without explicit opt-in.
 
 #import <Foundation/Foundation.h>
+#include "orion_test.h"
 #include <stdlib.h>
 #include <stdio.h>
 
@@ -65,7 +66,7 @@ int main(void) {
 
         if (!orion_ane_init()) {
             printf("SKIP: ANE unavailable (private runtime not accessible)\n");
-            return 0;
+            return ORION_TEST_SKIP;
         }
 
         printf("=== Orion channel-count probe (ORX-102/003) ===\n");

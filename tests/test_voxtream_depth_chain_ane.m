@@ -14,6 +14,7 @@
 // deliberately skips when the private runtime or artifacts are unavailable.
 
 #import <Foundation/Foundation.h>
+#include "orion_test.h"
 #import <IOSurface/IOSurface.h>
 #import <CommonCrypto/CommonDigest.h>
 #include <mach/mach_time.h>
@@ -465,11 +466,11 @@ int main(void) {
         const char* blob_dir = getenv("VOXTREAM_DEPTH_EXPORT");
         if (!blob_dir || !blob_dir[0]) {
             printf("SKIP: set VOXTREAM_DEPTH_EXPORT to a validated export directory\n");
-            return 0;
+            return ORION_TEST_SKIP;
         }
         if (!orion_ane_init()) {
             printf("SKIP: ANE runtime unavailable\n");
-            return 0;
+            return ORION_TEST_SKIP;
         }
 
         OrionModelConfig config = {

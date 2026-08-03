@@ -9,6 +9,7 @@
 // Default samples=30. Skip when export unset or ANE unavailable.
 
 #import <Foundation/Foundation.h>
+#include "orion_test.h"
 #import <IOSurface/IOSurface.h>
 #include <mach/mach_time.h>
 #include <math.h>
@@ -61,9 +62,9 @@ int main(int argc, char *argv[]) {
         const char *export_root = getenv("VOXTREAM_DEPTH_EXPORT");
         if (!export_root || !*export_root) {
             printf("SKIP: set VOXTREAM_DEPTH_EXPORT to a seqpack export\n");
-            return 0;
+            return ORION_TEST_SKIP;
         }
-        if (!orion_ane_init()) { printf("SKIP: ANE unavailable\n"); return 0; }
+        if (!orion_ane_init()) { printf("SKIP: ANE unavailable\n"); return ORION_TEST_SKIP; }
 
         int samples = (argc > 1) ? atoi(argv[1]) : 30;
         int warmup = 3;

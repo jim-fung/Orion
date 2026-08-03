@@ -10,6 +10,7 @@
 //   ./tests/test_program_cache
 
 #import <Foundation/Foundation.h>
+#include "orion_test.h"
 #import <stdio.h>
 #import "core/ane_runtime.h"
 #import "core/ane_program_cache.h"
@@ -306,7 +307,7 @@ int main(void) {
 
         if (!orion_ane_init()) {
             fprintf(stderr, "SKIP: ANE not available\n");
-            return 0;
+            return ORION_TEST_SKIP;
         }
 
         test_empty_cache();

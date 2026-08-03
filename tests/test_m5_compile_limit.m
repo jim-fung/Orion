@@ -16,12 +16,13 @@
 #include "compiler/pipeline.h"
 #include "compiler/codegen.h"
 #include "compiler/frontends/voxtream_depth.h"
+#include "orion_test.h"
 
 int main(int argc, char *argv[]) {
     @autoreleasepool {
         if (!orion_ane_init()) {
             printf("SKIP: ANE unavailable\n");
-            return 0;
+            return ORION_TEST_SKIP;
         }
         int max_iters = (argc > 1) ? atoi(argv[1]) : 300;
 
