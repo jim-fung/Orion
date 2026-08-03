@@ -20,11 +20,19 @@ typedef struct {
 OrionKVCache* orion_kv_cache_create(const OrionModelConfig* cfg);
 
 /// Store K,V from prefill (all positions at once).
-void orion_kv_cache_store_prefill(OrionKVCache* cache, int layer,
+/// Returns true on success. Returns false (without writing) if seq_len is out
+/// of range [0, max_seq] or `layer` is out of range [0, n_layer) — callers must
+/// propagate this as a hard failure rather than advancing current_len, so that
+/// an oversized prompt fails loudly instead of leaving a zeroed/over-length cache.
+bool orion_kv_cache_store_prefill(OrionKVCache* cache, int layer,
                                    const float* k, const float* v, int seq_len);
 
-/// Append K,V for a single new decode position.
-void orion_kv_cache_append(OrionKVCache* cache, int layer,
+/// Append K,V for a single new decode position (writes at current_len).
+/// Returns true on success. Returns false (without writing) if the cache is
+/// already full (current_len >= max_seq) or `layer` is out of range
+/// [0, n_layer). Callers must check the return and stop decoding on failure;
+/// continuing would read uninitialized/over-length cache rows.
+bool orion_kv_cache_append(OrionKVCache* cache, int layer,
                             const float* k, const float* v);
 
 /// Free KV cache.

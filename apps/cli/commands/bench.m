@@ -839,7 +839,10 @@ static int bench_inference(const char *prompt_text, int max_tokens, int warmup,
             orion_ane_prefill(w, prompt_tokens, prompt_len,
                               &kGPT2_124M, weights_path, kv, logits);
         } else {
-            orion_gpt2_prefill_kv(w, prompt_tokens, prompt_len, kv, logits);
+            if (!orion_gpt2_prefill_kv(w, prompt_tokens, prompt_len, kv, logits)) {
+                fprintf(stderr, "Warmup prefill failed (prompt %d > max_seq %d); skipping warmup\n",
+                        prompt_len, kGPT2_124M.max_seq);
+            }
         }
 
         uint64_t rng = 42;
@@ -874,12 +877,23 @@ static int bench_inference(const char *prompt_text, int max_tokens, int warmup,
             fprintf(stderr, "ANE prefill failed, falling back to CPU\n");
             orion_kv_cache_free(kv);
             kv = orion_kv_cache_create(&kGPT2_124M);
-            orion_gpt2_prefill_kv(w, prompt_tokens, prompt_len, kv, logits);
+            prefill_ok = orion_gpt2_prefill_kv(w, prompt_tokens, prompt_len, kv, logits);
         }
     } else {
-        orion_gpt2_prefill_kv(w, prompt_tokens, prompt_len, kv, logits);
+        prefill_ok = orion_gpt2_prefill_kv(w, prompt_tokens, prompt_len, kv, logits);
     }
     double prefill_ms = time_ms() - t_prefill_start;
+
+    if (!prefill_ok) {
+        fprintf(stderr, "Prefill failed (prompt %d > max_seq %d); aborting benchmark run.\n",
+                prompt_len, kGPT2_124M.max_seq);
+        orion_kv_cache_free(kv);
+        orion_gpt2_weights_free(w);
+        orion_gpt2_tokenizer_free(tok);
+        // prompt_tokens is a stack array (not heap); only logits is heap-allocated.
+        free(logits);
+        return 1;
+    }
 
     // Decode loop with profiler
     double *decode_samples = (double *)malloc(max_tokens * sizeof(double));

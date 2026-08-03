@@ -168,16 +168,24 @@ int orion_cmd_infer(int argc, const char* argv[]) {
             // Reset KV cache
             orion_kv_cache_free(kv);
             kv = orion_kv_cache_create(&kGPT2_124M);
-            orion_gpt2_prefill_kv(w, prompt_tokens, prompt_len, kv, logits);
-            prefill_ok = true;
+            prefill_ok = orion_gpt2_prefill_kv(w, prompt_tokens, prompt_len, kv, logits);
         }
     } else {
-        orion_gpt2_prefill_kv(w, prompt_tokens, prompt_len, kv, logits);
-        prefill_ok = true;
+        prefill_ok = orion_gpt2_prefill_kv(w, prompt_tokens, prompt_len, kv, logits);
     }
 
     double t_prefill = time_ms() - t0;
     fprintf(stderr, "Prefill: %.1f ms (%.1f ms/token)\n", t_prefill, t_prefill / prompt_len);
+
+    if (!prefill_ok) {
+        fprintf(stderr, "Error: prefill failed (prompt length %d exceeds model max_seq %d); aborting.\n",
+                prompt_len, kGPT2_124M.max_seq);
+        free(logits);
+        orion_kv_cache_free(kv);
+        orion_gpt2_weights_free(w);
+        orion_gpt2_tokenizer_free(tok);
+        return 1;
+    }
 
     // Print prompt
     printf("%s", prompt);

@@ -10,12 +10,29 @@
 #include "compiler/binding_plan.h"
 #include "compiler/kernel_adapter.h"
 #include "compiler/pipeline.h"
+#include "orion_test.h"
 
-static int g_passed = 0, g_failed = 0;
+static int g_passed = 0, g_failed = 0, g_skipped = 0;
+// Per-case flag: a test function sets this before returning true to signal
+// that its assertions did not actually run (ANE/mil/compile prerequisite
+// missing). The TEST macro reads (and resets) it so SKIP is distinguished
+// from PASS — without this, a skipped case on a non-ANE host would be counted
+// as PASS and main() would report success despite zero assertions running.
+static bool g_last_case_skipped = false;
 #define TEST(name) do { \
     printf("  %-50s ", #name); \
-    if (test_##name()) { printf("PASS\n"); g_passed++; } \
-    else { printf("FAIL\n"); g_failed++; } \
+    g_last_case_skipped = false; \
+    if (test_##name()) { \
+        if (g_last_case_skipped) { printf("SKIP\n"); g_skipped++; } \
+        else { printf("PASS\n"); g_passed++; } \
+    } else { printf("FAIL\n"); g_failed++; } \
+} while (0)
+// SKIP_CASE: mark this case as skipped (prerequisite unmet) and return success
+// so the TEST macro routes to the SKIP branch rather than FAIL.
+#define SKIP_CASE(reason) do { \
+    printf("SKIP(%s) ", reason); \
+    g_last_case_skipped = true; \
+    return true; \
 } while (0)
 
 static void digest_hex(NSData* data, char out[65]) {
@@ -222,13 +239,12 @@ static OrionGraph* distinct_weight_free_frontend(int layer __attribute__((unused
 
 static bool test_program_plan_accessor(void) {
     if (!orion_ane_init()) {
-        printf("SKIP(ane-unavailable) ");
-        return true;
+        SKIP_CASE("ane-unavailable");
     }
     NSString* mil = orion_kernel_adapter_generate_mil(weight_free_frontend, 0, 16, NULL);
-    if (!mil) { printf("SKIP(mil-gen) "); return true; }
+    if (!mil) { SKIP_CASE("mil-gen"); }
     OrionProgram* prog = orion_compile_mil(mil.UTF8String, @{}, "plan-accessor-test");
-    if (!prog) { printf("SKIP(ane-compile) "); return true; }
+    if (!prog) { SKIP_CASE("ane-compile"); }
     const OrionBindingPlan* cached = orion_program_plan(prog);
     bool ok = cached == NULL;
     if (prog) orion_release_program(prog);
@@ -237,17 +253,16 @@ static bool test_program_plan_accessor(void) {
 
 static bool test_program_plan_caches_plan_from_compile_with_plan(void) {
     if (!orion_ane_init()) {
-        printf("SKIP(ane-unavailable) ");
-        return true;
+        SKIP_CASE("ane-unavailable");
     }
     OrionBindingPlan plan;
     NSString* mil = orion_kernel_adapter_generate_mil_with_plan_identity(
         weight_free_frontend, 0, 16, NULL, NULL, &plan);
-    if (!mil) { printf("SKIP(mil-gen) "); return true; }
+    if (!mil) { SKIP_CASE("mil-gen"); }
     char error[256] = {0};
     OrionProgram* prog = orion_compile_mil_with_plan(
         mil.UTF8String, &plan, @{}, "plan-cache-test", error, sizeof(error));
-    if (!prog) { printf("SKIP(ane-compile) "); return true; }
+    if (!prog) { SKIP_CASE("ane-compile"); }
     const OrionBindingPlan* cached = orion_program_plan(prog);
     bool ok = cached != NULL && cached->n_inputs == plan.n_inputs &&
         strcmp(cached->graph_identity, plan.graph_identity) == 0;
@@ -259,10 +274,10 @@ static bool test_compile_with_plan_rejects_mil_mismatch(void) {
     OrionBindingPlan plan;
     NSString* mil_a = orion_kernel_adapter_generate_mil_with_plan_identity(
         weight_free_frontend, 0, 16, NULL, NULL, &plan);
-    if (!mil_a) { printf("SKIP(mil-gen) "); return true; }
+    if (!mil_a) { SKIP_CASE("mil-gen"); }
     NSString* mil_b = orion_kernel_adapter_generate_mil(
         distinct_weight_free_frontend, 0, 16, NULL);
-    if (!mil_b) { printf("SKIP(mil-gen-b) "); return true; }
+    if (!mil_b) { SKIP_CASE("mil-gen-b"); }
     char error[256] = {0};
     OrionProgram* prog = orion_compile_mil_with_plan(
         mil_b.UTF8String, &plan, @{}, "mil-mismatch-test", error, sizeof(error));
@@ -279,8 +294,7 @@ static NSDictionary* weight_free_wdict(int layer __attribute__((unused)),
 
 static bool test_adapted_kernel_compile_and_eval_path(void) {
     if (!orion_ane_init()) {
-        printf("SKIP(ane-unavailable) ");
-        return true;
+        SKIP_CASE("ane-unavailable");
     }
     OrionKernel kernel = orion_kernel_from_frontend(
         "test_weight_free", weight_free_frontend, weight_free_wdict, 1, 1);
@@ -288,7 +302,7 @@ static bool test_adapted_kernel_compile_and_eval_path(void) {
     OrionWeightsBinding wb = { .weights_id = "test-step-0", .bucket = 16 };
 
     OrionProgram* first = orion_kernel_compile(&kernel, 0, 16, &cfg, "/tmp", &wb);
-    if (!first) { printf("SKIP(ane-compile) "); return true; }
+    if (!first) { SKIP_CASE("ane-compile"); }
 
     const OrionBindingPlan* cached = orion_program_plan(first);
     if (!cached) return false;
@@ -320,8 +334,7 @@ static bool test_adapted_kernel_compile_and_eval_path(void) {
 
 static bool test_stale_cache_guard_forces_recompile(void) {
     if (!orion_ane_init()) {
-        printf("SKIP(ane-unavailable) ");
-        return true;
+        SKIP_CASE("ane-unavailable");
     }
     OrionKernel kernel_add = orion_kernel_from_frontend(
         "same-name", weight_free_frontend, weight_free_wdict, 1, 1);
@@ -331,7 +344,7 @@ static bool test_stale_cache_guard_forces_recompile(void) {
     OrionWeightsBinding wb = { .weights_id = "stale-test", .bucket = 16 };
 
     OrionProgram* first = orion_kernel_compile(&kernel_add, 0, 16, &cfg, "/tmp", &wb);
-    if (!first) { printf("SKIP(ane-compile) "); return true; }
+    if (!first) { SKIP_CASE("ane-compile"); }
 
     // Same cache key ("same-name:0:stale-test:16") but different graph/mil identity.
     // The stale-cache guard must detect the identity drift and force a recompile.
@@ -355,7 +368,14 @@ int main(void) {
         TEST(compile_with_plan_rejects_mil_mismatch);
         TEST(adapted_kernel_compile_and_eval_path);
         TEST(stale_cache_guard_forces_recompile);
-        printf("\n%d/%d passed\n", g_passed, g_passed + g_failed);
-        return g_failed ? 1 : 0;
+        // FAIL beats SKIP beats PASS: a skipped case on a non-ANE host must not
+        // be reported as a clean PASS, but a real failure still wins. Returning
+        // ORION_TEST_SKIP (77) makes the runner print SKIP so the high-value
+        // ANE-gated cases (cache identity drift, foreign-plan rejection) are
+        // visibly unrun rather than silently green.
+        ORION_TEST_SUMMARY(g_passed, g_failed, g_skipped);
+        if (g_failed) return ORION_TEST_FAIL;
+        if (g_skipped) return ORION_TEST_SKIP;
+        return ORION_TEST_PASS;
     }
 }

@@ -24,7 +24,7 @@ OrionKVCache* orion_kv_cache_create(const OrionModelConfig* cfg) {
     return cache;
 }
 
-void orion_kv_cache_store_prefill(OrionKVCache* cache, int layer,
+bool orion_kv_cache_store_prefill(OrionKVCache* cache, int layer,
                                    const float* k, const float* v, int seq_len) {
     // k, v are [seq_len, n_head * head_dim] (heads interleaved)
     // Rearrange to [n_head, seq_len, head_dim] in cache
@@ -33,11 +33,14 @@ void orion_kv_cache_store_prefill(OrionKVCache* cache, int layer,
     int ms = cache->max_seq;
 
     // Bounds check: a prompt longer than max_seq would write past the allocated
-    // K/V cache. Fail fast rather than corrupting memory.
-    if (seq_len < 0 || seq_len > ms) {
-        fprintf(stderr, "orion_kv_cache_store_prefill: seq_len %d exceeds max_seq %d\n",
-                seq_len, ms);
-        return;
+    // K/V cache, and a stray layer index would overflow in the layer dimension.
+    // Fail fast (return false, no write) so callers can propagate a hard error
+    // rather than advancing current_len on a zeroed/over-length cache.
+    if (seq_len < 0 || seq_len > ms || layer < 0 || layer >= cache->n_layer) {
+        fprintf(stderr, "orion_kv_cache_store_prefill: out of bounds "
+                "(layer=%d n_layer=%d seq_len=%d max_seq=%d)\n",
+                layer, cache->n_layer, seq_len, ms);
+        return false;
     }
 
     size_t layer_stride = (size_t)nh * ms * hd;
@@ -50,9 +53,10 @@ void orion_kv_cache_store_prefill(OrionKVCache* cache, int layer,
             memcpy(cache->v_cache + cache_off, v + src_off, hd * sizeof(float));
         }
     }
+    return true;
 }
 
-void orion_kv_cache_append(OrionKVCache* cache, int layer,
+bool orion_kv_cache_append(OrionKVCache* cache, int layer,
                             const float* k, const float* v) {
     // k, v are [n_head * head_dim] for a single position
     // Write to position current_len in each head
@@ -62,11 +66,14 @@ void orion_kv_cache_append(OrionKVCache* cache, int layer,
     int pos = cache->current_len;
 
     // Bounds check: once the cache is full, a further append would write past
-    // the allocated buffer. Fail fast rather than corrupting memory.
-    if (pos < 0 || pos >= ms) {
-        fprintf(stderr, "orion_kv_cache_append: position %d out of bounds [0, %d)\n",
-                pos, ms);
-        return;
+    // the allocated buffer; a stray layer index would overflow in the layer
+    // dimension. Fail fast (return false, no write) so callers stop decoding
+    // rather than reading an over-length/uninitialized cache row.
+    if (pos < 0 || pos >= ms || layer < 0 || layer >= cache->n_layer) {
+        fprintf(stderr, "orion_kv_cache_append: out of bounds "
+                "(layer=%d n_layer=%d pos=%d max_seq=%d)\n",
+                layer, cache->n_layer, pos, ms);
+        return false;
     }
 
     size_t layer_stride = (size_t)nh * ms * hd;
@@ -77,6 +84,7 @@ void orion_kv_cache_append(OrionKVCache* cache, int layer,
         memcpy(cache->k_cache + cache_off, k + src_off, hd * sizeof(float));
         memcpy(cache->v_cache + cache_off, v + src_off, hd * sizeof(float));
     }
+    return true;
 }
 
 void orion_kv_cache_free(OrionKVCache* cache) {

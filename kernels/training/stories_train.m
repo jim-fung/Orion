@@ -1147,30 +1147,36 @@ static bool patch_layer(OrionLayerKernels* kern, int layer_idx,
                         const OrionModelConfig* cfg, NSString* weight_dir) {
     int s = cfg->max_seq;
     NSString *base = weight_dir;
-    // Preserve the finalized binding plans from the original plan-aware compile.
-    // Weight patching does not change the ABI, so the cached plans remain valid
-    // and plan-aware eval must keep authenticating against them.
+    // Weight patching does not change the surface ABI (shapes/dtype/names), so
+    // the original plans' ABI fields remain valid. But plan-aware eval also
+    // authenticates weight provenance via sha256, and orion_program_patch_weights
+    // rebinds the plan to the PATCHED bytes (recomputed sha256). We must copy
+    // each patched program's rebound plan back into kern->plan_* so eval's
+    // provenance check passes; otherwise every post-patch eval returns
+    // ORION_EVAL_NOT_INVOKED and training silently produces zeros.
     OrionLayerKernels replacement = *kern;
 
-#define PATCH_PROGRAM(field, mil_fn, dict_fn, tag) do { \
+#define PATCH_PROGRAM(field, plan_field, mil_fn, dict_fn, tag) do { \
     NSString* patch_mil = mil_fn(layer_idx, s, cfg); \
     NSDictionary* patch_dict = dict_fn(layer_idx, s, base.UTF8String); \
     replacement.field = orion_program_patch_weights( \
         kern->field, patch_mil.UTF8String, patch_dict, tag); \
     if (!replacement.field) goto patch_failed; \
+    const OrionBindingPlan* rebound = orion_program_plan(replacement.field); \
+    if (rebound) kern->plan_field = *rebound; \
 } while (0)
 
-    PATCH_PROGRAM(fwd_attn, compiler_fwd_attn_adapter,
+    PATCH_PROGRAM(fwd_attn, plan_fwd_attn, compiler_fwd_attn_adapter,
                   wdict_fwd_attn_adapter, "fwdAttnPatch");
-    PATCH_PROGRAM(fwd_attn_core, compiler_fwd_attn_core_adapter,
+    PATCH_PROGRAM(fwd_attn_core, plan_fwd_attn_core, compiler_fwd_attn_core_adapter,
                   wdict_fwd_attn_core_adapter, "fwdAttnCorePatch");
-    PATCH_PROGRAM(fwd_ffn, compiler_fwd_ffn_adapter,
+    PATCH_PROGRAM(fwd_ffn, plan_fwd_ffn, compiler_fwd_ffn_adapter,
                   wdict_fwd_ffn_adapter, "fwdFFNPatch");
-    PATCH_PROGRAM(ffn_bwd, compiler_ffn_bwd_adapter,
+    PATCH_PROGRAM(ffn_bwd, plan_ffn_bwd, compiler_ffn_bwd_adapter,
                   wdict_ffn_bwd_adapter, "ffnBwdPatch");
-    PATCH_PROGRAM(sdpa_bwd1, compiler_sdpa_bwd1_adapter,
+    PATCH_PROGRAM(sdpa_bwd1, plan_sdpa_bwd1, compiler_sdpa_bwd1_adapter,
                   wdict_sdpa_bwd1_adapter, "sdpaBwd1Patch");
-    PATCH_PROGRAM(qkv_bwd, compiler_qkv_bwd_adapter,
+    PATCH_PROGRAM(qkv_bwd, plan_qkv_bwd, compiler_qkv_bwd_adapter,
                   wdict_qkv_bwd_adapter, "qkvBwdPatch");
 
     // The weight-free SDPA stage remains valid. Replace all weighted handles

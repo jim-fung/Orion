@@ -276,7 +276,7 @@ void orion_gpt2_forward_cpu_all(const OrionGPT2Weights* w,
 
 #pragma mark - T037: Prefill with KV Cache
 
-void orion_gpt2_prefill_kv(const OrionGPT2Weights* w,
+bool orion_gpt2_prefill_kv(const OrionGPT2Weights* w,
                              const int* tokens, int seq_len,
                              OrionKVCache* kv, float* logits) {
     int d = w->d_model;
@@ -284,6 +284,15 @@ void orion_gpt2_prefill_kv(const OrionGPT2Weights* w,
     int n_head = 12;
     int d_ff = w->d_ff;
     int vocab = w->vocab;
+
+    // Fail closed before any allocation if the prompt cannot fit. An oversized
+    // prompt would otherwise leave current_len advanced past a zeroed cache and
+    // poison every subsequent decode step (silent corruption).
+    if (seq_len < 0 || seq_len > kv->max_seq) {
+        fprintf(stderr, "orion_gpt2_prefill_kv: seq_len %d exceeds max_seq %d\n",
+                seq_len, kv->max_seq);
+        return false;
+    }
 
     float* x = (float*)malloc(seq_len * d * sizeof(float));
     float* ln_out = (float*)malloc(seq_len * d * sizeof(float));
@@ -307,8 +316,14 @@ void orion_gpt2_prefill_kv(const OrionGPT2Weights* w,
         linear(ln_out, l->wk, l->bk, seq_len, d, d, k);
         linear(ln_out, l->wv, l->bv, seq_len, d, d, v);
 
-        // Store K, V into cache for this layer
-        orion_kv_cache_store_prefill(kv, layer, k, v, seq_len);
+        // Store K, V into cache for this layer. If the store fails (it should
+        // not, since we checked seq_len above), bail without advancing
+        // current_len so the caller sees a hard failure instead of a corrupt cache.
+        if (!orion_kv_cache_store_prefill(kv, layer, k, v, seq_len)) {
+            free(q); free(k); free(v);
+            free(x); free(ln_out); free(attn_out); free(ffn_out);
+            return false;
+        }
 
         // Run attention using the freshly computed Q, K, V (same as prefill)
         attention_prefill(l, ln_out, seq_len, n_head, d, attn_out);
@@ -334,9 +349,11 @@ void orion_gpt2_prefill_kv(const OrionGPT2Weights* w,
                 1.0f, x + (seq_len - 1) * d, d, w->wte, d,
                 0.0f, logits, vocab);
 
+    // Only advance the cache length once the full prefill succeeded.
     kv->current_len = seq_len;
 
     free(x); free(ln_out); free(attn_out); free(ffn_out);
+    return true;
 }
 
 #pragma mark - T039: Single-Token Decode with KV Cache
@@ -423,6 +440,16 @@ void orion_gpt2_decode_step(const OrionGPT2Weights* w,
     int d_ff = w->d_ff;
     int vocab = w->vocab;
     int pos = kv->current_len;
+
+    // Fail closed when the cache is full: continuing would compute
+    // cache_len = pos+1 == max_seq+1, overreading the cache by one row and
+    // overflowing the fixed ws->scores buffer. Leave logits untouched and do
+    // NOT advance current_len; callers must stop generating when this fires.
+    if (pos < 0 || pos >= kv->max_seq) {
+        fprintf(stderr, "orion_gpt2_decode_step: KV cache full "
+                "(current_len=%d max_seq=%d)\n", pos, kv->max_seq);
+        return;
+    }
 
     // Use the caller's persistent workspace when provided; otherwise allocate a
     // transient one for backwards compatibility (tests/diagnostics). The

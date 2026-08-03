@@ -77,13 +77,16 @@ void orion_gpt2_forward_cpu_all(const OrionGPT2Weights* w,
 #pragma mark - Prefill + KV Cache (T037)
 
 /// Run prefill forward pass and populate KV cache.
-/// Returns logits for the last position.
+/// Returns true on success. Returns false (without mutating the cache) if
+/// seq_len exceeds max_seq — an oversized prompt is a hard failure rather than
+/// a silent zeroed/over-length cache. On success the cache is populated and
+/// current_len is advanced to seq_len.
 /// @param w         Loaded GPT-2 weights
 /// @param tokens    Input token ids [seq_len]
 /// @param seq_len   Number of tokens
 /// @param kv        KV cache (will be populated)
 /// @param logits    Output logits buffer [vocab]
-void orion_gpt2_prefill_kv(const OrionGPT2Weights* w,
+bool orion_gpt2_prefill_kv(const OrionGPT2Weights* w,
                              const int* tokens, int seq_len,
                              OrionKVCache* kv, float* logits);
 

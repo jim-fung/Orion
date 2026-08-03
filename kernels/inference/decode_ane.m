@@ -145,6 +145,15 @@ bool orion_ane_decode_step(const OrionGPT2Weights* w,
     int seq = ORION_GRAPH_DECODE_SEQ;
     int count = d * seq;
 
+    // Fail closed when the cache is full: continuing would compute
+    // cache_len = pos+1 == max_seq+1, overreading the cache by one row.
+    // Leave logits untouched and do NOT advance current_len.
+    if (pos < 0 || pos >= kv->max_seq) {
+        fprintf(stderr, "orion_ane_decode_step: KV cache full "
+                "(current_len=%d max_seq=%d)\n", pos, kv->max_seq);
+        return false;
+    }
+
     OrionModelConfig cfg = kGPT2_124M;
     OrionWeightsBinding wb = { .weights_id = "base", .bucket = seq };
 

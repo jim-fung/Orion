@@ -151,6 +151,7 @@ COMPILER_TEST_NAMES = \
 	test_compiler_equiv \
 	test_depth_serve_protocol_v2 \
 	test_blobfile \
+	test_kv_cache_bounds \
 	test_orion_error \
 	test_orion_ledger
 
@@ -264,6 +265,13 @@ $(BUILDDIR)/tests/test_depth_serve_protocol_v2: tests/test_depth_serve_protocol_
 $(BUILDDIR)/tests/test_blobfile: tests/test_blobfile.c core/blobfile.c
 	@mkdir -p $(dir $@)
 	$(CC) -O2 -Wall -Wextra -I . -I core -o $@ $^ -framework Foundation
+
+# KV-cache bounds regression (C2/C3): exercises the mutator bounds checks
+# directly with no model blobs or ANE. Links kv_cache.m (Obj-C source; the
+# Foundation link covers its transitive ane_runtime.h import).
+$(BUILDDIR)/tests/test_kv_cache_bounds: tests/test_kv_cache_bounds.m kernels/inference/kv_cache.m
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -framework Foundation -o $@ tests/test_kv_cache_bounds.m kernels/inference/kv_cache.m
 
 # Standalone pure-C compiler-only tests (ORX-400 / ORX-408): no runtime or
 # compiler object dependencies, link only Foundation.
