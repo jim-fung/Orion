@@ -9,7 +9,9 @@ LDFLAGS  = -ldl $(FRAMEWORKS)
 BUILDDIR = build
 
 # ---------------------------------------------------------------------------
-# Source files (38 total: 24 runtime + 14 compiler)
+# Source files (56 translation units: 11 core + 4 inference + 3 training +
+#               1 model + 2 tokenizer + 7 CLI + 1 runtime-C + 23 compiler-C +
+#               3 compiler-ObjC + 1 main). Run `make inventory` to verify.
 # ---------------------------------------------------------------------------
 
 CORE_SRC = \
@@ -100,7 +102,8 @@ COMPILER_M_OBJ = $(patsubst %.m,$(BUILDDIR)/%.o,$(COMPILER_M_SRC))
 COMPILER_OBJ = $(COMPILER_C_OBJ) $(COMPILER_M_OBJ)
 
 # ---------------------------------------------------------------------------
-# Test binaries (41 total: 35 runtime + 6 compiler)
+# Test binaries (43 native: 35 runtime + 8 compiler, plus 2 static Python
+#                checks run by the test target). Run `make inventory` to verify.
 # ---------------------------------------------------------------------------
 
 TEST_NAMES = \
@@ -275,6 +278,30 @@ $(BUILDDIR)/tests/test_orion_ledger: tests/test_orion_ledger.c core/orion_compil
 # Run benchmarks
 bench: orion
 	./orion bench kernels --iters 10
+
+# Print authoritative source/test inventory computed from the Makefile lists.
+# Use this to verify the header counts above never drift.
+inventory:
+	@n_core=$$(echo "$(CORE_SRC)" | wc -w | tr -d ' '); \
+	n_inf=$$(echo "$(INFERENCE_SRC)" | wc -w | tr -d ' '); \
+	n_trn=$$(echo "$(TRAINING_SRC)" | wc -w | tr -d ' '); \
+	n_mdl=$$(echo "$(MODEL_SRC)" | wc -w | tr -d ' '); \
+	n_tok=$$(echo "$(TOKENIZER_SRC)" | wc -w | tr -d ' '); \
+	n_cli=$$(echo "$(CLI_SRC)" | wc -w | tr -d ' '); \
+	n_rc=$$(echo "$(RUNTIME_C_SRC)" | wc -w | tr -d ' '); \
+	n_cc=$$(echo "$(COMPILER_C_SRC)" | wc -w | tr -d ' '); \
+	n_cm=$$(echo "$(COMPILER_M_SRC)" | wc -w | tr -d ' '); \
+	n_main=1; \
+	n_src=$$((n_core+n_inf+n_trn+n_mdl+n_tok+n_cli+n_rc+n_cc+n_cm+n_main)); \
+	n_test=$$(echo "$(TEST_NAMES)" | wc -w | tr -d ' '); \
+	n_ctest=$$(echo "$(COMPILER_TEST_NAMES)" | wc -w | tr -d ' '); \
+	n_test_total=$$((n_test+n_ctest)); \
+	echo "Source translation units: $$n_src"; \
+	echo "  core=$$n_core inference=$$n_inf training=$$n_trn model=$$n_mdl"; \
+	echo "  tokenizer=$$n_tok cli=$$n_cli runtime-c=$$n_rc"; \
+	echo "  compiler-c=$$n_cc compiler-objc=$$n_cm main=$$n_main"; \
+	echo "Test binaries: $$n_test_total ($$n_test runtime + $$n_ctest compiler)"; \
+	echo "Static Python checks: 2 (depth-serve lifecycle + protocol)"
 
 # Clean all build artifacts
 clean:

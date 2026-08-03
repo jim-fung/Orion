@@ -293,9 +293,10 @@ Orion builds on two open-source projects that reverse-engineered Apple's ANE:
 ## Building
 
 ```bash
-# Build with Makefile (~50 source files, no Xcode project required)
+# Build with Makefile (~56 source files, no Xcode project required)
 make            # Build the orion binary
-make test       # Build and run all 23 test suites
+make test       # Build and run all tests (43 native binaries + 2 static checks)
+make inventory  # Print the authoritative source/test inventory
 make bench      # Run benchmark suite
 make clean      # Remove all build artifacts
 ```
