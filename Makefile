@@ -65,6 +65,7 @@ COMPILER_C_SRC = \
 	compiler/pass_sram.c \
 	compiler/pass_uniform_outputs.c \
 	compiler/pass_ane_validate.c \
+	core/blobfile.c \
 	compiler/binding_plan.c \
 	compiler/pipeline.c \
 	compiler/frontends/gpt2_prefill.c \
@@ -146,6 +147,7 @@ COMPILER_TEST_NAMES = \
 	test_ane_passes \
 	test_compiler_equiv \
 	test_depth_serve_protocol_v2 \
+	test_blobfile \
 	test_orion_error \
 	test_orion_ledger
 
@@ -243,6 +245,10 @@ $(BUILDDIR)/tests/test_compiler_equiv: tests/test_compiler_equiv.m $(COMPILER_OB
 $(BUILDDIR)/tests/test_depth_serve_protocol_v2: tests/test_depth_serve_protocol_v2.m apps/cli/commands/depth_serve_support.m
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -framework Foundation -o $@ $^
+
+$(BUILDDIR)/tests/test_blobfile: tests/test_blobfile.c core/blobfile.c
+	@mkdir -p $(dir $@)
+	$(CC) -O2 -Wall -Wextra -I . -I core -o $@ $^ -framework Foundation
 
 # Standalone pure-C compiler-only tests (ORX-400 / ORX-408): no runtime or
 # compiler object dependencies, link only Foundation.

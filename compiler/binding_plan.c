@@ -1,5 +1,6 @@
 // compiler/binding_plan.c — Generated ABI contract for ANE programs.
 #include "binding_plan.h"
+#include "core/blobfile.h"
 
 #include <limits.h>
 #include <stdarg.h>
@@ -8,7 +9,6 @@
 #include <stdlib.h>
 #include <CommonCrypto/CommonDigest.h>
 #include <fcntl.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 static void set_error(char* error, size_t error_size, const char* fmt, ...) {
@@ -190,64 +190,11 @@ static int open_confined_fd(const char* weight_root, const char* relative_path,
     return current_fd;
 }
 
-static uint32_t read_le32(const unsigned char *bytes) {
-    return (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
-           ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24);
-}
-
-// Validate the individual 64-byte BLOBFILE chunk named by a plan weight.
-// The payload declaration belongs to that chunk header, not to the first chunk
-// or to the aggregate file as a whole.
-static bool validate_blobfile_for_weight(int fd, uint64_t offset, size_t logical_bytes,
-                                         uint64_t* out_payload_offset) {
-    unsigned char preamble[5];
-    unsigned char header[64];
-    struct stat statbuf;
-    if (fstat(fd, &statbuf) != 0 || !S_ISREG(statbuf.st_mode) ||
-        statbuf.st_size < (off_t)sizeof(preamble) ||
-        pread(fd, preamble, sizeof(preamble), 0) != (ssize_t)sizeof(preamble) ||
-        preamble[0] != 0x01 || preamble[4] != 0x02 ||
-        offset > UINT64_MAX - sizeof(header) ||
-        offset > (uint64_t)statbuf.st_size ||
-        sizeof(header) > (uint64_t)statbuf.st_size - offset ||
-        pread(fd, header, sizeof(header), (off_t)offset) != (ssize_t)sizeof(header)) return false;
-    uint64_t payload_size = read_le32(header + 8);
-    uint64_t payload_offset = read_le32(header + 16);
-    if (memcmp(header, (unsigned char[]){0xef, 0xbe, 0xad, 0xde}, 4) != 0 ||
-        header[4] != 0x01 || payload_size != logical_bytes ||
-        payload_offset < offset + sizeof(header) ||
-        payload_offset > (uint64_t)statbuf.st_size ||
-        payload_size > (uint64_t)statbuf.st_size - payload_offset) return false;
-    if (out_payload_offset) *out_payload_offset = payload_offset;
-    return true;
-}
-
 static bool ranges_overlap(uint64_t left_offset, size_t left_size,
                            uint64_t right_offset, size_t right_size) {
     if (left_offset > UINT64_MAX - left_size || right_offset > UINT64_MAX - right_size)
         return true;
     return left_offset < right_offset + right_size && right_offset < left_offset + left_size;
-}
-
-// Hash a byte range [offset, offset+length) within an open file descriptor.
-static bool fd_range_sha256(int fd, uint64_t offset, size_t length, char out[65]) {
-    CC_SHA256_CTX context;
-    CC_SHA256_Init(&context);
-    unsigned char buffer[16384];
-    size_t remaining = length;
-    uint64_t pos = offset;
-    while (remaining > 0) {
-        size_t to_read = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
-        ssize_t count = pread(fd, buffer, to_read, (off_t)pos);
-        if (count <= 0) return false;
-        CC_SHA256_Update(&context, buffer, (CC_LONG)count);
-        remaining -= (size_t)count;
-        pos += (uint64_t)count;
-    }
-    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
-    CC_SHA256_Final(digest, &context);
-    hex_digest(digest, out);
-    return true;
 }
 
 static bool copy_string(char* dst, size_t dst_size, const char* src,
@@ -379,30 +326,38 @@ bool orion_binding_plan_generate_with_identity(
             set_error(error, error_size, "cannot open weight '%s'", weight->name);
             return false;
         }
-        uint64_t payload_offset = 0;
-        bool valid_file = validate_blobfile_for_weight(fd, weight->offset,
-                                                       weight->logical_bytes,
-                                                       &payload_offset);
+        OrionBlobfileValidationOptions blob_options = {
+            .chunk_offset = weight->offset,
+            .expected_payload_size = weight->logical_bytes,
+            .expected_sha256 = NULL,
+            .compute_sha256 = true,
+        };
+        OrionBlobfileChunk blob_chunk;
+        OrionBlobfileStatus blob_status = orion_blobfile_validate_fd(
+            fd, &blob_options, &blob_chunk);
+        bool valid_file = blob_status == ORION_BLOBFILE_OK;
         if (valid_file) {
             for (int prior = 0; prior < out_plan->n_weights - 1; prior++) {
                 const OrionBindingPlanWeight* other = &out_plan->weights[prior];
                 if (strcmp(other->path, weight->path) == 0 &&
                     ranges_overlap(payload_offsets[prior], other->logical_bytes,
-                                   payload_offset, weight->logical_bytes)) {
+                                   blob_chunk.payload_offset, weight->logical_bytes)) {
                     valid_file = false;
                     break;
                 }
             }
         }
         if (valid_file)
-            valid_file = fd_range_sha256(fd, payload_offset, weight->logical_bytes,
-                                         weight->sha256);
+            memcpy(weight->sha256, blob_chunk.sha256, sizeof(weight->sha256));
         if (fd >= 0) close(fd);
         if (!valid_file) {
-            set_error(error, error_size, "cannot hash weight '%s'", weight->name);
+            set_error(error, error_size, "cannot validate weight '%s' chunk: %s",
+                      weight->name,
+                      blob_status == ORION_BLOBFILE_OK ?
+                          "payload-overlap" : orion_blobfile_status_string(blob_status));
             return false;
         }
-        payload_offsets[out_plan->n_weights - 1] = payload_offset;
+        payload_offsets[out_plan->n_weights - 1] = blob_chunk.payload_offset;
     }
     qsort(out_plan->weights, (size_t)out_plan->n_weights,
           sizeof(out_plan->weights[0]), weight_compare);

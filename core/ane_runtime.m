@@ -1,4 +1,5 @@
 #import "ane_runtime.h"
+#include "blobfile.h"
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <dlfcn.h>
@@ -17,44 +18,18 @@ static Class g_AIO;   // _ANEIOSurfaceObject
 static bool  g_init;
 static int   g_compile_count;
 
-static uint32_t read_le32(const uint8_t* bytes) {
-    return (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
-           ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24);
-}
-
-static NSString* sha256_hex(NSData* data) {
-    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
-    CC_SHA256(data.bytes, (CC_LONG)data.length, digest);
-    NSMutableString* text = [NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH * 2];
-    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) [text appendFormat:@"%02x", digest[i]];
-    return text;
-}
-
-// A plan weight offset identifies its 64-byte chunk header.  Each chunk carries
-// its own declared payload range; the header at byte 64 is not a file-wide
-// aggregate header.
-static bool blobfile_chunk_payload_range(NSData* data, uint64_t chunk_offset,
-                                         size_t logical_bytes, NSRange* out_range) {
-    static const uint64_t chunk_header_size = 64;
-    if (![data isKindOfClass:[NSData class]] || data.length < 5 ||
-        ((const uint8_t*)data.bytes)[0] != 0x01 ||
-        ((const uint8_t*)data.bytes)[4] != 0x02 ||
-        chunk_offset > UINT64_MAX - chunk_header_size ||
-        chunk_offset > (uint64_t)data.length ||
-        chunk_header_size > (uint64_t)data.length - chunk_offset) return false;
-    const uint8_t* header = (const uint8_t*)data.bytes + (NSUInteger)chunk_offset;
-    uint64_t payload_size = read_le32(header + 8);
-    uint64_t payload_offset = read_le32(header + 16);
-    if (header[0] != 0xef || header[1] != 0xbe || header[2] != 0xad ||
-        header[3] != 0xde || header[4] != 0x01 ||
-        payload_size != logical_bytes ||
-        payload_offset > (uint64_t)data.length ||
-        payload_size > (uint64_t)data.length - payload_offset ||
-        payload_offset < chunk_offset + chunk_header_size ||
-        payload_offset > NSUIntegerMax || payload_size > NSUIntegerMax) return false;
-    if (out_range) *out_range = NSMakeRange((NSUInteger)payload_offset,
-                                             (NSUInteger)payload_size);
-    return true;
+static bool blobfile_chunk(NSData* data, uint64_t chunk_offset,
+                           size_t logical_bytes, const char* expected_sha256,
+                           bool compute_sha256, OrionBlobfileChunk* out_chunk) {
+    if (![data isKindOfClass:[NSData class]]) return false;
+    OrionBlobfileValidationOptions options = {
+        .chunk_offset = chunk_offset,
+        .expected_payload_size = logical_bytes,
+        .expected_sha256 = expected_sha256,
+        .compute_sha256 = compute_sha256,
+    };
+    return orion_blobfile_validate_memory(data.bytes, data.length, &options, out_chunk) ==
+        ORION_BLOBFILE_OK;
 }
 
 bool orion_validate_weight_dictionary_for_plan(
@@ -78,13 +53,13 @@ bool orion_validate_weight_dictionary_for_plan(
                 [entry[@"offset"] unsignedLongLongValue] != 0 ||
                 ![entry[@"data"] isKindOfClass:[NSData class]]) return false;
             NSData* data = entry[@"data"];
-            NSRange range;
-            if (!blobfile_chunk_payload_range(data, weight->offset, weight->logical_bytes, &range))
-                return false;
-            NSData* payload = [data subdataWithRange:range];
-            if (![[sha256_hex(payload) lowercaseString] isEqualToString:
-                  [[NSString stringWithUTF8String:weight->sha256] lowercaseString]])
-                return false;
+            OrionBlobfileChunk chunk;
+            if (!blobfile_chunk(data, weight->offset, weight->logical_bytes,
+                                weight->sha256, false, &chunk)) return false;
+            if (chunk.payload_offset > NSUIntegerMax ||
+                chunk.payload_size > NSUIntegerMax) return false;
+            NSRange range = NSMakeRange((NSUInteger)chunk.payload_offset,
+                                        (NSUInteger)chunk.payload_size);
             NSMutableArray<NSValue*>* ranges = payload_ranges[path];
             if (!ranges) {
                 ranges = [NSMutableArray array];
@@ -123,12 +98,11 @@ static bool rebound_plan_for_weights(const OrionProgram* donor,
         NSDictionary* entry = weight_dict[path];
         NSData* data = [entry isKindOfClass:[NSDictionary class]] ? entry[@"data"] : nil;
         if (![data isKindOfClass:[NSData class]]) return false;
-        NSRange range;
-        if (!blobfile_chunk_payload_range(data, out_plan->weights[i].offset,
-                                    out_plan->weights[i].logical_bytes, &range)) return false;
-        NSData* payload = [data subdataWithRange:range];
-        NSString* digest = sha256_hex(payload);
-        strlcpy(out_plan->weights[i].sha256, digest.UTF8String,
+        OrionBlobfileChunk chunk;
+        if (!blobfile_chunk(data, out_plan->weights[i].offset,
+                            out_plan->weights[i].logical_bytes,
+                            NULL, true, &chunk)) return false;
+        strlcpy(out_plan->weights[i].sha256, chunk.sha256,
                 sizeof(out_plan->weights[i].sha256));
     }
     if (!orion_binding_plan_set_mil_identity(out_plan, patched_mil)) return false;

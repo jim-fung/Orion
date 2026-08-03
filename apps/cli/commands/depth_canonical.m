@@ -19,6 +19,7 @@
 #include "compiler/pipeline.h"
 #include "compiler/validate.h"
 #include "core/ane_runtime.h"
+#include "core/blobfile.h"
 
 #define LAYERS ORION_VOXTREAM_DEPTH_LAYERS
 
@@ -172,35 +173,37 @@ bool depth_canonical_load_layer_artifact(NSString *root, int wanted_layer,
         NSNumber *offset = item[@"offset"], *bytes = item[@"payload_bytes"];
         if (![name isKindOfClass:[NSString class]] || !name.length || offsets[name] ||
             !can_is_hex_sha256(payload_sha) ||
-            ![offset isKindOfClass:[NSNumber class]] || ![bytes isKindOfClass:[NSNumber class]] ||
-            offset.unsignedLongLongValue < ORION_DEPTH_CANONICAL_BLOB_HEADER_BYTES || bytes.unsignedLongLongValue == 0 ||
-            offset.unsignedLongLongValue < previous_end ||
-            offset.unsignedLongLongValue > UINT64_MAX - 64 ||
-            offset.unsignedLongLongValue + 64 > UINT64_MAX - bytes.unsignedLongLongValue ||
-            offset.unsignedLongLongValue + 64 + bytes.unsignedLongLongValue > blob.length) {
+            ![offset isKindOfClass:[NSNumber class]] || ![bytes isKindOfClass:[NSNumber class]]) {
+            if (failure_detail) *failure_detail = @"aggregate-chunk-record";
+            return false;
+        }
+        uint64_t chunk_offset = offset.unsignedLongLongValue;
+        uint64_t payload_bytes = bytes.unsignedLongLongValue;
+        if (chunk_offset < ORION_DEPTH_CANONICAL_BLOB_HEADER_BYTES || payload_bytes == 0 ||
+            chunk_offset < previous_end) {
             if (failure_detail) *failure_detail = @"aggregate-chunk-range";
             return false;
         }
-        const uint8_t *header = (const uint8_t *)blob.bytes + offset.unsignedLongLongValue;
-        uint64_t payload_bytes = (uint64_t)header[8] | ((uint64_t)header[9] << 8) |
-            ((uint64_t)header[10] << 16) | ((uint64_t)header[11] << 24);
-        uint64_t payload_offset = (uint64_t)header[16] | ((uint64_t)header[17] << 8) |
-            ((uint64_t)header[18] << 16) | ((uint64_t)header[19] << 24);
-        if (header[0] != 0xef || header[1] != 0xbe || header[2] != 0xad ||
-            header[3] != 0xde || header[4] != 1 || payload_bytes != bytes.unsignedLongLongValue ||
-            payload_offset < offset.unsignedLongLongValue + 64 ||
-            payload_offset > blob.length || payload_bytes > blob.length - payload_offset) {
-            if (failure_detail) *failure_detail = @"aggregate-chunk-header";
-            return false;
-        }
-        NSData *payload = [blob subdataWithRange:NSMakeRange((NSUInteger)payload_offset,
-                                                       (NSUInteger)payload_bytes)];
-        if ([can_sha256_data(payload) caseInsensitiveCompare:payload_sha] != NSOrderedSame) {
+        OrionBlobfileValidationOptions options = {
+            .chunk_offset = chunk_offset,
+            .expected_payload_size = payload_bytes,
+            .expected_sha256 = payload_sha.UTF8String,
+            .compute_sha256 = false,
+        };
+        OrionBlobfileChunk chunk;
+        OrionBlobfileStatus status = orion_blobfile_validate_memory(
+            blob.bytes, blob.length, &options, &chunk);
+        if (status == ORION_BLOBFILE_SHA256_MISMATCH ||
+            status == ORION_BLOBFILE_SHA256_READ_ERROR) {
             if (failure_detail) *failure_detail = @"aggregate-chunk-hash";
             return false;
         }
+        if (status != ORION_BLOBFILE_OK) {
+            if (failure_detail) *failure_detail = @"aggregate-chunk-header";
+            return false;
+        }
         offsets[name] = offset;
-        previous_end = payload_offset + payload_bytes;
+        previous_end = chunk.payload_end;
     }
     out->mil_path = [@"@model_path/" stringByAppendingString:blob_rel];
     out->data = blob;
