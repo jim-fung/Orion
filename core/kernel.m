@@ -69,12 +69,58 @@ bool orion_kernel_eval(const OrionKernel* kernel,
                        const OrionWeightsBinding* wb,
                        IOSurfaceRef* inputs, int n_inputs,
                        IOSurfaceRef* outputs, int n_outputs) {
-    OrionProgram* prog = orion_kernel_compile(kernel, layer_idx, bucket,
-                                              cfg, blob_dir, wb);
-    if (!prog) return false;
+    // Compile (or fetch from cache) first. On a cache hit we must hold a lease
+    // for the duration of evaluation: a concurrent eviction could otherwise
+    // remove the entry and free the program between lookup and eval.
+    OrionBindingPlan plan;
+    NSString* mil = nil;
+    void* lease = NULL;
+    OrionProgram* prog = NULL;
 
-    if (!kernel->adapter_frontend) return orion_eval(prog, inputs, n_inputs, outputs, n_outputs);
-    const OrionBindingPlan* cached = orion_program_plan(prog);
-    if (!cached) return false;
-    return orion_eval_with_plan(prog, cached, inputs, n_inputs, outputs, n_outputs);
+    if (kernel->adapter_frontend) {
+        mil = adapter_mil_and_plan(kernel, layer_idx, bucket, cfg, blob_dir, &plan);
+        if (!mil) return false;
+        // Use the retained lookup so eval is protected from concurrent eviction.
+        prog = orion_cache_lookup_retained(kernel->name, layer_idx, wb, &lease);
+        const OrionBindingPlan* cached_plan = prog ? orion_program_plan(prog) : NULL;
+        if (!prog || !cached_plan ||
+            strcmp(cached_plan->graph_identity, plan.graph_identity) != 0 ||
+            strcmp(cached_plan->mil_identity, plan.mil_identity) != 0) {
+            // Miss or stale: drop the lease before compiling.
+            orion_cache_release(lease);
+            lease = NULL;
+            prog = NULL;
+        }
+    }
+
+    if (!prog) {
+        // Cache miss path — compile, store, then take a fresh lease for eval.
+        NSDictionary* wdict = kernel->build_wdict(layer_idx, bucket, blob_dir);
+        char tag[64];
+        snprintf(tag, sizeof(tag), "%s_L%d", kernel->name, layer_idx);
+        char plan_error[256] = {0};
+        prog = kernel->adapter_frontend
+            ? orion_compile_mil_with_plan(mil.UTF8String, &plan, wdict, tag,
+                                          plan_error, sizeof(plan_error))
+            : (orion_compile_mil((kernel->generate_mil
+                                  ? kernel->generate_mil(layer_idx, bucket, cfg)
+                                  : nil).UTF8String, wdict, tag));
+        if (!prog) return false;
+        orion_cache_store(kernel->name, layer_idx, wb, prog);
+        // Re-acquire a lease on the freshly stored program so eval is protected.
+        prog = orion_cache_lookup_retained(kernel->name, layer_idx, wb, &lease);
+        if (!prog) return false;
+    }
+
+    bool ok;
+    if (!kernel->adapter_frontend) {
+        ok = orion_eval(prog, inputs, n_inputs, outputs, n_outputs);
+    } else {
+        const OrionBindingPlan* cached = orion_program_plan(prog);
+        ok = cached && orion_eval_with_plan(prog, cached, inputs, n_inputs, outputs, n_outputs);
+    }
+
+    // Drop the lease now that evaluation is complete.
+    orion_cache_release(lease);
+    return ok;
 }

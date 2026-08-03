@@ -3,9 +3,20 @@
 
 #import "../../core/ane_runtime.h"
 
-// Stories110M (Llama2-style) model configuration
+// Stories110M model configuration
 // Matches ANEgpt stories_config.h
-// Architecture: 12-layer transformer with RMSNorm, SwiGLU, RoPE
+// Architecture: 12-layer transformer with RMSNorm and SwiGLU.
+//
+// IMPORTANT — positional encoding contract:
+//   The active training frontend (compiler/frontends/stories_train.c) computes
+//   attention as raw Q@K^T followed by a causal mask. It applies NO positional
+//   encoding: there is no RoPE, learned position embedding, or position input.
+//   The trained model is therefore POSITIONLESS — token order is visible to the
+//   model only through the causal mask, not through any positional operation.
+//   This is an intentional documented contract, not a missing feature. Do not
+//   claim Llama2-style RoPE equivalence for this model until a verified RoPE
+//   forward/backward path is implemented and independently tested. See
+//   backlog task ORION-0070.
 // Total params: ~109.53M (84.95M transformer + 24.58M embedding)
 
 static const OrionModelConfig kStories110M = {

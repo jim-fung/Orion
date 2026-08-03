@@ -44,6 +44,14 @@ NSString* orion_kernel_adapter_generate_mil_2arg(OrionFrontend2Fn frontend,
                                                   int layer_idx,
                                                   const OrionModelConfig* cfg);
 
+// As above, but also returns a generated, validated, finalized ABI binding plan.
+// Used by plan-bound callers (e.g. training) that compile via the plan-aware
+// runtime path and allocate/bind surfaces from plan entries.
+NSString* orion_kernel_adapter_generate_mil_2arg_with_plan(OrionFrontend2Fn frontend,
+                                                            int layer_idx,
+                                                            const OrionModelConfig* cfg,
+                                                            OrionBindingPlan* out_plan);
+
 // Create an OrionKernel from a compiler frontend.
 // The generate_mil implementation: call frontend -> optimize -> codegen -> return MIL string.
 // This is a drop-in replacement for hand-written milgen functions.

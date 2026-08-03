@@ -5,6 +5,7 @@
 #import "../../core/iosurface_tensor.h"
 #import "../../model/configs/stories110m.h"
 #import "stories_cpu_ops.h"
+#import "../../compiler/binding_plan.h"
 
 // T072: Single training step for Stories110M on ANE.
 // Forward (ANE) → Loss (CPU) → Backward (ANE) → dW (CPU) → Adam (CPU)
@@ -24,7 +25,10 @@
 //   rmsnorm1_bwd: dx_attn, x → dx_rms1  (CPU)
 //   dy = dx_rms1 + dx2  (residual merge)
 
-/// Per-layer ANE kernel programs.
+/// Per-layer ANE kernel programs and their finalized binding plans.
+/// Plans are generated, finalized, and stored at compile time so that surface
+/// allocation and eval binding are authenticated against the cached program ABI
+/// rather than fragile hard-coded array indexes (see ORION-0069).
 typedef struct {
     OrionProgram *fwd_attn;   // RMS/Q/K/V stage, 4 outputs
     OrionProgram *fwd_attn_core; // attention/Wo stage, 2 outputs
@@ -33,6 +37,16 @@ typedef struct {
     OrionProgram *sdpa_bwd1;  // 3 outputs
     OrionProgram *sdpa_bwd2;  // 2 outputs
     OrionProgram *qkv_bwd;    // 1 output
+
+    // Finalized binding plans (one per program). Inputs/outputs are sorted
+    // alphabetically by MIL name, matching the surface order used by eval.
+    OrionBindingPlan plan_fwd_attn;
+    OrionBindingPlan plan_fwd_attn_core;
+    OrionBindingPlan plan_fwd_ffn;
+    OrionBindingPlan plan_ffn_bwd;
+    OrionBindingPlan plan_sdpa_bwd1;
+    OrionBindingPlan plan_sdpa_bwd2;
+    OrionBindingPlan plan_qkv_bwd;
 } OrionLayerKernels;
 
 /// Per-layer weight arrays (fp32, CPU-side).

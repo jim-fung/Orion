@@ -1,4 +1,10 @@
 // compiler/frontends/stories_train.c — T136: Stories110M training frontends
+//
+// Positional encoding contract: these frontends apply NO positional encoding.
+// Attention is raw Q@K^T + causal mask. The model is positionless; see
+// model/configs/stories110m.h and backlog task ORION-0070. If verified RoPE
+// forward/backward is added later, the positionless contract below must be
+// updated or removed.
 
 #include "stories_train.h"
 #include "../builder.h"

@@ -266,6 +266,53 @@ static bool test_stories_qkv_bwd(void) {
     return mil != nil && [mil containsString:@"dx"];
 }
 
+// Test: Stories frontend is a POSITIONLESS contract — no RoPE/positional op
+// or positional weight appears in any of the seven training graphs. This
+// codifies the documented architecture (see model/configs/stories110m.h and
+// backlog ORION-0070). If a future change adds RoPE, update or remove this
+// test and the positionless contract together.
+static bool graph_has_positional_op(const OrionGraph* g) {
+    for (int i = 0; i < g->n_nodes; i++) {
+        const OrionNode* n = &g->nodes[i];
+        if (!n->is_live) continue;
+        // No dedicated positional op exists yet, but guard against future ops
+        // and against positional weight references by name substring.
+        if (strstr(n->name, "rope") || strstr(n->name, "rotary") ||
+            strstr(n->name, "pos") || strstr(n->name, "position")) {
+            return true;
+        }
+        if (n->op == ORION_OP_CONST && n->attrs.blob_path[0] &&
+            (strstr(n->attrs.blob_path, "rope") ||
+             strstr(n->attrs.blob_path, "pos"))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool test_stories_positionless_contract(void) {
+    // All seven Stories training programs.
+    OrionGraph* graphs[7];
+    graphs[0] = orion_frontend_fwd_attn(0, &kTestStories);
+    graphs[1] = orion_frontend_fwd_attn_core(0, &kTestStories);
+    graphs[2] = orion_frontend_fwd_ffn(0, &kTestStories);
+    graphs[3] = orion_frontend_ffn_bwd(0, &kTestStories);
+    graphs[4] = orion_frontend_sdpa_bwd1(0, &kTestStories);
+    graphs[5] = orion_frontend_sdpa_bwd2(0, &kTestStories);
+    graphs[6] = orion_frontend_qkv_bwd(0, &kTestStories);
+
+    bool ok = true;
+    for (int i = 0; i < 7; i++) {
+        if (!graphs[i]) { ok = false; continue; }
+        if (graph_has_positional_op(graphs[i])) {
+            NSLog(@"Stories graph %d contains an unexpected positional operation", i);
+            ok = false;
+        }
+        orion_graph_free(graphs[i]);
+    }
+    return ok;
+}
+
 static const OrionNode* live_node_named(const OrionGraph* g, const char* name) {
     for (int i = 0; i < g->n_nodes; i++) {
         if (g->nodes[i].is_live && strcmp(g->nodes[i].name, name) == 0) return &g->nodes[i];
@@ -433,6 +480,7 @@ int main(int argc __attribute__((unused)), char* argv[] __attribute__((unused)))
         TEST(stories_sdpa_bwd1);
         TEST(stories_sdpa_bwd2);
         TEST(stories_qkv_bwd);
+        TEST(stories_positionless_contract);
         TEST(voxtream_depth_layer);
         TEST(voxtream_depth_adapter_path);
         TEST(voxtream_depth_all_layers_have_distinct_paths);

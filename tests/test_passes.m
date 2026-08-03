@@ -33,7 +33,7 @@ static bool test_dce_removes_dead(void) {
     int shape[4] = {1, 768, 1, 64};
     int x = orion_gb_input(g, "x", ORION_DTYPE_FP16, shape);
     int y = orion_gb_add(g, x, x, "y");        // used
-    int z = orion_gb_mul(g, x, x, "z_dead");   // NOT used by output
+    (void)orion_gb_mul(g, x, x, "z_dead");     // NOT used by output
     orion_gb_output(g, y, "y");
 
     int before = count_live(g);
@@ -74,20 +74,39 @@ static bool test_identity_removes_identity_op(void) {
     return changed && after < before;
 }
 
-// Test: cast round-trip elimination
+// Test: cast round-trip elimination (widening intermediate — lossless)
 static bool test_cast_roundtrip(void) {
     OrionGraph* g = orion_graph_create();
     int shape[4] = {1, 768, 1, 64};
     int x = orion_gb_input(g, "x", ORION_DTYPE_FP16, shape);
 
-    // fp16 -> fp32 -> fp16 (round-trip)
+    // fp16 -> fp32 -> fp16 (round-trip through a wider dtype — lossless)
     int y = orion_gb_cast(g, x, ORION_DTYPE_FP32, "y", NULL);
     int z = orion_gb_cast(g, y, ORION_DTYPE_FP16, "z", NULL);
     orion_gb_output(g, z, "z");
 
     bool changed = orion_pass_cast(g);
     orion_graph_free(g);
-    return changed; // Should eliminate the round-trip
+    return changed; // Should eliminate the lossless round-trip
+}
+
+// Test: narrowing cast round-trip must be preserved (lossy)
+static bool test_cast_roundtrip_lossy_preserved(void) {
+    OrionGraph* g = orion_graph_create();
+    int shape[4] = {1, 768, 1, 64};
+    int x = orion_gb_input(g, "x", ORION_DTYPE_FP32, shape);
+
+    // fp32 -> fp16 -> fp32 (round-trip through a narrower dtype — LOSSY)
+    int y = orion_gb_cast(g, x, ORION_DTYPE_FP16, "y", NULL);
+    int z = orion_gb_cast(g, y, ORION_DTYPE_FP32, "z", NULL);
+    orion_gb_output(g, z, "z");
+
+    bool changed = orion_pass_cast(g);
+    int live = count_live(g);
+    orion_graph_free(g);
+    // Must NOT eliminate: fp16 intermediate narrows, the round trip loses data.
+    // Live nodes: x (input) + y (cast fp16) + z (cast fp32) = 3.
+    return !changed && live == 3;
 }
 
 // Test: pipeline reaches fixpoint
@@ -101,6 +120,7 @@ static bool test_pipeline_fixpoint(void) {
     int z = orion_gb_cast(g, y, ORION_DTYPE_FP16, "cast_same", NULL); // same dtype
     int w = orion_gb_mul(g, z, z, "w");
     int dead = orion_gb_add(g, x, x, "dead"); // unreachable
+    (void)dead;
     orion_gb_output(g, w, "w");
 
     int before = count_live(g);
@@ -136,6 +156,7 @@ int main(int argc __attribute__((unused)), char* argv[] __attribute__((unused)))
         TEST(identity_removes_same_cast);
         TEST(identity_removes_identity_op);
         TEST(cast_roundtrip);
+        TEST(cast_roundtrip_lossy_preserved);
         TEST(pipeline_fixpoint);
         TEST(pipeline_no_infinite_loop);
 

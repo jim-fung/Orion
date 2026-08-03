@@ -23,7 +23,7 @@ typedef struct {
     int grad_accum;             // --grad_accum
     int checkpoint_every;       // --checkpoint_every
     float lr;                   // --lr
-    int seq_len;                // --seq (override config)
+    int seq_len;                // --seq (must match compiled max_seq; rejected otherwise)
     bool help;
 } TrainArgs;
 
@@ -40,7 +40,7 @@ static void print_train_usage(void) {
         "  --grad_accum N      Gradient accumulation steps (default: %d)\n"
         "  --checkpoint_every N Save checkpoint every N steps (default: 25)\n"
         "  --lr F              Learning rate (default: 3e-4)\n"
-        "  --seq N             Sequence length (default: %d)\n"
+        "  --seq N             Sequence length (must match the compiled %d; variable-length is not yet supported)\n"
         "  --help              Show this help\n",
         STORIES_ACCUM_STEPS, kStories110M.max_seq
     );
@@ -138,6 +138,20 @@ int orion_cmd_train(int argc, const char* argv[]) {
 
         // Create config (use Stories110M as base)
         const OrionModelConfig *cfg = &kStories110M;
+
+        // --seq is parsed but the training graphs, causal masks, and surface
+        // allocations are baked at cfg->max_seq. Silently ignoring a different
+        // value would mislead users into thinking they changed the sequence
+        // length. Fail closed until a validated variable-length path exists.
+        if (args.seq_len != cfg->max_seq) {
+            fprintf(stderr,
+                "Error: --seq %d is not supported. The Stories110M training "
+                "graph is compiled at a fixed sequence length of %d (causal "
+                "mask and surface shapes are baked in). Re-run without --seq, "
+                "or pass --seq %d. See backlog task ORION-0070.\n",
+                args.seq_len, cfg->max_seq, cfg->max_seq);
+            return 1;
+        }
 
         // Create trainer
         double t0 = time_seconds();

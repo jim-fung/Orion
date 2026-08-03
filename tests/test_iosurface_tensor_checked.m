@@ -28,6 +28,39 @@ static bool test_prefix_round_trip(void) {
     return ok;
 }
 
+static bool test_seqpack_surface_requires_dtype_metadata(void) {
+    const int channels = 1024;
+    const int seq_len = 64;
+    const size_t bytes = (size_t)channels * seq_len * sizeof(_Float16);
+    IOSurfaceRef legacy = orion_tensor_create(channels, seq_len);
+    OrionSurfaceStatus status = ORION_SURFACE_OK;
+    IOSurfaceRef checked = orion_tensor_create_checked(
+        ORION_SURFACE_DTYPE_FP16, channels, seq_len, bytes, &status);
+    uint8_t *input = calloc(bytes, 1);
+    uint8_t *output = calloc(bytes, 1);
+    if (input) input[bytes - 1] = 1;
+    bool ok = legacy && checked && input && output &&
+        status == ORION_SURFACE_OK &&
+        orion_tensor_write_packed_checked(
+            legacy, ORION_SURFACE_DTYPE_FP16, input,
+            bytes) == ORION_SURFACE_DTYPE_MISMATCH &&
+        orion_tensor_read_packed_checked(
+            legacy, ORION_SURFACE_DTYPE_FP16, output,
+            bytes) == ORION_SURFACE_DTYPE_MISMATCH &&
+        orion_tensor_write_packed_checked(
+            checked, ORION_SURFACE_DTYPE_FP16, input,
+            bytes) == ORION_SURFACE_OK &&
+        orion_tensor_read_packed_checked(
+            checked, ORION_SURFACE_DTYPE_FP16, output,
+            bytes) == ORION_SURFACE_OK &&
+        memcmp(input, output, bytes) == 0;
+    if (legacy) CFRelease(legacy);
+    if (checked) CFRelease(checked);
+    free(input);
+    free(output);
+    return ok;
+}
+
 static bool test_rejects_overrun_and_small_allocation(void) {
     OrionSurfaceStatus small_status = ORION_SURFACE_OK;
     IOSurfaceRef too_small = orion_tensor_create_checked(
@@ -135,6 +168,7 @@ int main(void) {
     @autoreleasepool {
         printf("test_iosurface_tensor_checked:\n");
         TEST(prefix_round_trip);
+        TEST(seqpack_surface_requires_dtype_metadata);
         TEST(rejects_overrun_and_small_allocation);
         TEST(copy_bounds_and_f32_conversion);
         TEST(plan_bound_prefix_and_dtype);

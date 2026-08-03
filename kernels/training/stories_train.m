@@ -238,14 +238,70 @@ static NSString* compiler_sdpa_bwd1_adapter(int layer_idx, int bucket, const Ori
     return orion_kernel_adapter_generate_mil_2arg(orion_frontend_sdpa_bwd1, layer_idx, cfg);
 }
 
-static NSString* compiler_sdpa_bwd2_adapter(int layer_idx, int bucket, const OrionModelConfig* cfg) {
-    (void)bucket;
-    return orion_kernel_adapter_generate_mil_2arg(orion_frontend_sdpa_bwd2, layer_idx, cfg);
-}
-
 static NSString* compiler_qkv_bwd_adapter(int layer_idx, int bucket, const OrionModelConfig* cfg) {
     (void)bucket;
     return orion_kernel_adapter_generate_mil_2arg(orion_frontend_qkv_bwd, layer_idx, cfg);
+}
+
+// Plan-generating variants — produce MIL plus a finalized binding plan so the
+// runtime compiles via the plan-aware path and eval authenticates the cached ABI.
+// Each plan's inputs/outputs are sorted alphabetically by MIL name; the surface
+// arrays passed to eval must follow that same order.
+static NSString* compiler_fwd_attn_with_plan(int layer_idx, const OrionModelConfig* cfg,
+                                              OrionBindingPlan* out_plan) {
+    return orion_kernel_adapter_generate_mil_2arg_with_plan(
+        orion_frontend_fwd_attn, layer_idx, cfg, out_plan);
+}
+static NSString* compiler_fwd_attn_core_with_plan(int layer_idx, const OrionModelConfig* cfg,
+                                                   OrionBindingPlan* out_plan) {
+    return orion_kernel_adapter_generate_mil_2arg_with_plan(
+        orion_frontend_fwd_attn_core, layer_idx, cfg, out_plan);
+}
+static NSString* compiler_fwd_ffn_with_plan(int layer_idx, const OrionModelConfig* cfg,
+                                            OrionBindingPlan* out_plan) {
+    return orion_kernel_adapter_generate_mil_2arg_with_plan(
+        orion_frontend_fwd_ffn, layer_idx, cfg, out_plan);
+}
+static NSString* compiler_ffn_bwd_with_plan(int layer_idx, const OrionModelConfig* cfg,
+                                            OrionBindingPlan* out_plan) {
+    return orion_kernel_adapter_generate_mil_2arg_with_plan(
+        orion_frontend_ffn_bwd, layer_idx, cfg, out_plan);
+}
+static NSString* compiler_sdpa_bwd1_with_plan(int layer_idx, const OrionModelConfig* cfg,
+                                              OrionBindingPlan* out_plan) {
+    return orion_kernel_adapter_generate_mil_2arg_with_plan(
+        orion_frontend_sdpa_bwd1, layer_idx, cfg, out_plan);
+}
+static NSString* compiler_sdpa_bwd2_with_plan(int layer_idx, const OrionModelConfig* cfg,
+                                              OrionBindingPlan* out_plan) {
+    return orion_kernel_adapter_generate_mil_2arg_with_plan(
+        orion_frontend_sdpa_bwd2, layer_idx, cfg, out_plan);
+}
+static NSString* compiler_qkv_bwd_with_plan(int layer_idx, const OrionModelConfig* cfg,
+                                            OrionBindingPlan* out_plan) {
+    return orion_kernel_adapter_generate_mil_2arg_with_plan(
+        orion_frontend_qkv_bwd, layer_idx, cfg, out_plan);
+}
+
+// Verify that a surface array slot holds the plan entry with the expected
+// semantic name. This converts fragile hard-coded array indexes (previously
+// documented only by comments) into checked name lookups: a frontend rename
+// or output reordering now fails loudly instead of silently corrupting
+// activations or gradients.
+static bool verify_plan_output_name(const OrionBindingPlan* plan, int slot,
+                                    const char* expected_name) {
+    if (!plan || slot < 0 || slot >= plan->n_outputs) {
+        NSLog(@"training plan-bind: output slot %d out of range (plan has %d outputs)",
+              slot, plan ? plan->n_outputs : -1);
+        return false;
+    }
+    if (strcmp(plan->outputs[slot].name, expected_name) != 0) {
+        NSLog(@"training plan-bind: output slot %d is '%s', expected '%s' — "
+              @"alphabetical binding order changed; surface mapping is now wrong",
+              slot, plan->outputs[slot].name, expected_name);
+        return false;
+    }
+    return true;
 }
 
 // Weight dict adapters
@@ -319,54 +375,97 @@ static NSDictionary* wdict_qkv_bwd_adapter(int layer_idx, int bucket, const char
 
 static bool compile_layer(OrionLayerKernels* kern, int layer_idx,
                            const OrionModelConfig* cfg, NSString* weight_dir) {
-    // Training compiles directly — no cache (weights change every recompile)
+    // Training compiles directly — no cache (weights change every recompile).
+    // Each program is now plan-bound: MIL and a finalized binding plan come from
+    // the same optimized graph, the weight dictionary is authenticated against
+    // the plan, and compilation goes through the plan-aware runtime so eval can
+    // verify the cached ABI/provenance. This prevents a frontend rename or output
+    // reorder from silently corrupting activations or gradients (ORION-0069).
     static unsigned long s_compile_generation = 0;
     unsigned long generation = __sync_add_and_fetch(&s_compile_generation, 1);
     int s = cfg->max_seq;
     NSString *base = weight_dir;
 
-    NSString *mil;
-    NSDictionary *wdict;
+    char plan_err[512] = {0};
 
-    mil = [compiler_fwd_attn_adapter(layer_idx, s, cfg)
-        stringByAppendingFormat:@"\n// orion-training-generation:%lu\n", generation];
-    wdict = wdict_fwd_attn_adapter(layer_idx, s, base.UTF8String);
-    kern->fwd_attn = orion_compile_mil(mil.UTF8String, wdict, "fwdAttn");
-    if (!kern->fwd_attn) return false;
-    mil = [compiler_fwd_attn_core_adapter(layer_idx, s, cfg)
-        stringByAppendingFormat:@"\n// orion-training-generation:%lu\n", generation];
-    wdict = wdict_fwd_attn_core_adapter(layer_idx, s, base.UTF8String);
-    kern->fwd_attn_core = orion_compile_mil(mil.UTF8String, wdict, "fwdAttnCore");
-    if (!kern->fwd_attn_core) return false;
+    // Helper macro: generate MIL+plan, finalize, validate weight dict, compile.
+    // Each weight-bearing program validates its dictionary against the finalized
+    // plan before any private compile consumes it.
+    #define COMPILE_PLAN(fn_plan, fn_wdict, prog_field, plan_field, tag, wdict_expr) \
+        do { \
+            OrionBindingPlan* _plan = &kern->plan_field; \
+            NSString* _mil = [fn_plan(layer_idx, cfg, _plan) \
+                stringByAppendingFormat:@"\n// orion-training-generation:%lu\n", generation]; \
+            if (!_mil || \
+                !orion_binding_plan_set_mil_identity(_plan, _mil.UTF8String) || \
+                !orion_binding_plan_validate_finalized(_plan, plan_err, sizeof(plan_err))) { \
+                NSLog(@"training plan-bind: " tag " finalized plan rejected: %s", \
+                      plan_err[0] ? plan_err : "invalid MIL/plan"); \
+                return false; \
+            } \
+            NSDictionary* _wdict = wdict_expr; \
+            if (!orion_validate_weight_dictionary_for_plan(_plan, _wdict)) { \
+                NSLog(@"training plan-bind: " tag " weight dictionary does not match plan"); \
+                return false; \
+            } \
+            kern->prog_field = orion_compile_mil_with_plan(_mil.UTF8String, _plan, _wdict, \
+                                                           tag, plan_err, sizeof(plan_err)); \
+            if (!kern->prog_field) { \
+                NSLog(@"training plan-bind: " tag " compile failed: %s", \
+                      plan_err[0] ? plan_err : "private compiler failure"); \
+                return false; \
+            } \
+        } while (0)
 
-    mil = [compiler_fwd_ffn_adapter(layer_idx, s, cfg)
-        stringByAppendingFormat:@"\n// orion-training-generation:%lu\n", generation];
-    wdict = wdict_fwd_ffn_adapter(layer_idx, s, base.UTF8String);
-    kern->fwd_ffn = orion_compile_mil(mil.UTF8String, wdict, "fwdFFN");
-    if (!kern->fwd_ffn) return false;
+    COMPILE_PLAN(compiler_fwd_attn_with_plan, wdict_fwd_attn_adapter,
+                 fwd_attn, plan_fwd_attn, "fwdAttn",
+                 wdict_fwd_attn_adapter(layer_idx, s, base.UTF8String));
+    COMPILE_PLAN(compiler_fwd_attn_core_with_plan, wdict_fwd_attn_core_adapter,
+                 fwd_attn_core, plan_fwd_attn_core, "fwdAttnCore",
+                 wdict_fwd_attn_core_adapter(layer_idx, s, base.UTF8String));
+    COMPILE_PLAN(compiler_fwd_ffn_with_plan, wdict_fwd_ffn_adapter,
+                 fwd_ffn, plan_fwd_ffn, "fwdFFN",
+                 wdict_fwd_ffn_adapter(layer_idx, s, base.UTF8String));
+    COMPILE_PLAN(compiler_ffn_bwd_with_plan, wdict_ffn_bwd_adapter,
+                 ffn_bwd, plan_ffn_bwd, "ffnBwd",
+                 wdict_ffn_bwd_adapter(layer_idx, s, base.UTF8String));
+    COMPILE_PLAN(compiler_sdpa_bwd1_with_plan, wdict_sdpa_bwd1_adapter,
+                 sdpa_bwd1, plan_sdpa_bwd1, "sdpaBwd1",
+                 wdict_sdpa_bwd1_adapter(layer_idx, s, base.UTF8String));
+    // sdpaBwd2 is weight-free.
+    COMPILE_PLAN(compiler_sdpa_bwd2_with_plan, NULL,
+                 sdpa_bwd2, plan_sdpa_bwd2, "sdpaBwd2", @{});
+    COMPILE_PLAN(compiler_qkv_bwd_with_plan, wdict_qkv_bwd_adapter,
+                 qkv_bwd, plan_qkv_bwd, "qkvBwd",
+                 wdict_qkv_bwd_adapter(layer_idx, s, base.UTF8String));
 
-    mil = [compiler_ffn_bwd_adapter(layer_idx, s, cfg)
-        stringByAppendingFormat:@"\n// orion-training-generation:%lu\n", generation];
-    wdict = wdict_ffn_bwd_adapter(layer_idx, s, base.UTF8String);
-    kern->ffn_bwd = orion_compile_mil(mil.UTF8String, wdict, "ffnBwd");
-    if (!kern->ffn_bwd) return false;
+    #undef COMPILE_PLAN
 
-    mil = [compiler_sdpa_bwd1_adapter(layer_idx, s, cfg)
-        stringByAppendingFormat:@"\n// orion-training-generation:%lu\n", generation];
-    wdict = wdict_sdpa_bwd1_adapter(layer_idx, s, base.UTF8String);
-    kern->sdpa_bwd1 = orion_compile_mil(mil.UTF8String, wdict, "sdpaBwd1");
-    if (!kern->sdpa_bwd1) return false;
-
-    mil = [compiler_sdpa_bwd2_adapter(layer_idx, s, cfg)
-        stringByAppendingFormat:@"\n// orion-training-generation:%lu\n", generation];
-    kern->sdpa_bwd2 = orion_compile_mil(mil.UTF8String, @{}, "sdpaBwd2");
-    if (!kern->sdpa_bwd2) return false;
-
-    mil = [compiler_qkv_bwd_adapter(layer_idx, s, cfg)
-        stringByAppendingFormat:@"\n// orion-training-generation:%lu\n", generation];
-    wdict = wdict_qkv_bwd_adapter(layer_idx, s, base.UTF8String);
-    kern->qkv_bwd = orion_compile_mil(mil.UTF8String, wdict, "qkvBwd");
-    if (!kern->qkv_bwd) return false;
+    // Verify the hard-coded surface indexes used by eval still match the plan's
+    // alphabetical output order. This is the checked replacement for the old
+    // comment-only assumptions.
+    if (!verify_plan_output_name(&kern->plan_fwd_attn, 0, "k_out") ||
+        !verify_plan_output_name(&kern->plan_fwd_attn, 1, "q_out") ||
+        !verify_plan_output_name(&kern->plan_fwd_attn, 2, "rms1_out") ||
+        !verify_plan_output_name(&kern->plan_fwd_attn, 3, "v_out") ||
+        !verify_plan_output_name(&kern->plan_fwd_attn_core, 0, "attn_out") ||
+        !verify_plan_output_name(&kern->plan_fwd_attn_core, 1, "wo_out") ||
+        !verify_plan_output_name(&kern->plan_fwd_ffn, 0, "gate") ||
+        !verify_plan_output_name(&kern->plan_fwd_ffn, 1, "rms2_out") ||
+        !verify_plan_output_name(&kern->plan_fwd_ffn, 2, "w1_out") ||
+        !verify_plan_output_name(&kern->plan_fwd_ffn, 3, "w2_out") ||
+        !verify_plan_output_name(&kern->plan_fwd_ffn, 4, "w3_out") ||
+        !verify_plan_output_name(&kern->plan_ffn_bwd, 0, "dh1") ||
+        !verify_plan_output_name(&kern->plan_ffn_bwd, 1, "dh3") ||
+        !verify_plan_output_name(&kern->plan_ffn_bwd, 2, "dx") ||
+        !verify_plan_output_name(&kern->plan_sdpa_bwd1, 0, "dpf") ||
+        !verify_plan_output_name(&kern->plan_sdpa_bwd1, 1, "dvf") ||
+        !verify_plan_output_name(&kern->plan_sdpa_bwd1, 2, "pf") ||
+        !verify_plan_output_name(&kern->plan_sdpa_bwd2, 0, "dkf") ||
+        !verify_plan_output_name(&kern->plan_sdpa_bwd2, 1, "dqf") ||
+        !verify_plan_output_name(&kern->plan_qkv_bwd, 0, "dx")) {
+        return false;
+    }
 
     return true;
 }
@@ -708,15 +807,17 @@ float orion_train_step(OrionTrainer* trainer,
 
             // Stage 1 outputs are k, q, rms1, v in alphabetical order.
             IOSurfaceRef attn_in[] = {io->fwd_attn_in};
-            bool ok = orion_eval(kern->fwd_attn, attn_in, 1, io->fwd_attn_qkv_out, 4);
+            bool ok = orion_eval_with_plan(kern->fwd_attn, &kern->plan_fwd_attn,
+                                            attn_in, 1, io->fwd_attn_qkv_out, 4);
             if (!ok) { NSLog(@"fwdAttn eval failed layer %d", L); return -1.0f; }
 
             // Stage 2 inputs are k, q, v; outputs are attn, wo.
             IOSurfaceRef core_in[] = {io->fwd_attn_qkv_out[0],
                                       io->fwd_attn_qkv_out[1],
                                       io->fwd_attn_qkv_out[3]};
-            ok = orion_eval(kern->fwd_attn_core, core_in, 3,
-                            io->fwd_attn_core_out, 2);
+            ok = orion_eval_with_plan(kern->fwd_attn_core, &kern->plan_fwd_attn_core,
+                                       core_in, 3,
+                                       io->fwd_attn_core_out, 2);
             if (!ok) { NSLog(@"fwdAttnCore eval failed layer %d", L); return -1.0f; }
 
             // Residual: x2 = x_in + wo_out  (CPU)
@@ -728,7 +829,8 @@ float orion_train_step(OrionTrainer* trainer,
 
             // fwdFFN outputs use the alphabetical MIL binding order.
             IOSurfaceRef ffn_in[] = {io->fwd_ffn_in};
-            ok = orion_eval(kern->fwd_ffn, ffn_in, 1, io->fwd_ffn_out, 5);
+            ok = orion_eval_with_plan(kern->fwd_ffn, &kern->plan_fwd_ffn,
+                                       ffn_in, 1, io->fwd_ffn_out, 5);
             if (!ok) { NSLog(@"fwdFFN eval failed layer %d", L); return -1.0f; }
 
             // Residual: x_out = x2 + w2_out  (CPU)
@@ -812,7 +914,8 @@ float orion_train_step(OrionTrainer* trainer,
                                     io->fwd_ffn_out[4], h, s);  // w3_out = h3
 
             IOSurfaceRef ffn_bwd_in[] = {io->ffn_bwd_in};
-            bool ok = orion_eval(kern->ffn_bwd, ffn_bwd_in, 1, io->ffn_bwd_out, 3);
+            bool ok = orion_eval_with_plan(kern->ffn_bwd, &kern->plan_ffn_bwd,
+                                            ffn_bwd_in, 1, io->ffn_bwd_out, 3);
             if (!ok) { NSLog(@"ffnBwd eval failed layer %d", L); free(dy); return -1.0f; }
 
             // Read dx_ffn for RMSNorm backward
@@ -866,7 +969,8 @@ float orion_train_step(OrionTrainer* trainer,
             }
 
             IOSurfaceRef sdpa1_in[] = {io->sdpa_bwd1_in};
-            ok = orion_eval(kern->sdpa_bwd1, sdpa1_in, 1, io->sdpa_bwd1_out, 3);
+            ok = orion_eval_with_plan(kern->sdpa_bwd1, &kern->plan_sdpa_bwd1,
+                                       sdpa1_in, 1, io->sdpa_bwd1_out, 3);
             if (!ok) { NSLog(@"sdpaBwd1 eval failed layer %d", L); free(dy); free(dx2); return -1.0f; }
 
             // sdpaBwd2 input: [pf(sc_ch), dpf(sc_ch), qf(d), kf(d)]
@@ -880,7 +984,8 @@ float orion_train_step(OrionTrainer* trainer,
                                     io->fwd_attn_qkv_out[0], d, s);       // k_out
 
             IOSurfaceRef sdpa2_in[] = {io->sdpa_bwd2_in};
-            ok = orion_eval(kern->sdpa_bwd2, sdpa2_in, 1, io->sdpa_bwd2_out, 2);
+            ok = orion_eval_with_plan(kern->sdpa_bwd2, &kern->plan_sdpa_bwd2,
+                                       sdpa2_in, 1, io->sdpa_bwd2_out, 2);
             if (!ok) { NSLog(@"sdpaBwd2 eval failed layer %d", L); free(dy); free(dx2); return -1.0f; }
 
             // dW for attention — async dispatch to GCD serial queue
@@ -921,7 +1026,8 @@ float orion_train_step(OrionTrainer* trainer,
 
             IOSurfaceRef qkv_in[] = {io->qkv_bwd_in};
             IOSurfaceRef qkv_out[] = {io->qkv_bwd_out};
-            ok = orion_eval(kern->qkv_bwd, qkv_in, 1, qkv_out, 1);
+            ok = orion_eval_with_plan(kern->qkv_bwd, &kern->plan_qkv_bwd,
+                                       qkv_in, 1, qkv_out, 1);
             if (!ok) { NSLog(@"qkvBwd eval failed layer %d", L); free(dy); free(dx2); return -1.0f; }
 
             // RMSNorm1 backward (CPU)
@@ -1041,7 +1147,10 @@ static bool patch_layer(OrionLayerKernels* kern, int layer_idx,
                         const OrionModelConfig* cfg, NSString* weight_dir) {
     int s = cfg->max_seq;
     NSString *base = weight_dir;
-    OrionLayerKernels replacement = {0};
+    // Preserve the finalized binding plans from the original plan-aware compile.
+    // Weight patching does not change the ABI, so the cached plans remain valid
+    // and plan-aware eval must keep authenticating against them.
+    OrionLayerKernels replacement = *kern;
 
 #define PATCH_PROGRAM(field, mil_fn, dict_fn, tag) do { \
     NSString* patch_mil = mil_fn(layer_idx, s, cfg); \

@@ -531,8 +531,10 @@ static bool depth_worker_compile(DepthWorker *w, NSString *root, int max_compile
         OrionSurfaceStatus surface_status = ORION_SURFACE_OK;
         if (w->seqpack) {
             // Seqpack has no canonical plans; allocate the fixed [DIM, seq64]
-            // surface directly.
-            w->chain[i] = orion_tensor_create(DIM, w->seq_len);
+            // FP16 surface with the metadata required by checked I/O.
+            w->chain[i] = orion_tensor_create_checked(
+                ORION_SURFACE_DTYPE_FP16, DIM, w->seq_len,
+                (size_t)surf_bytes, &surface_status);
         } else if (i == 0) {
             w->chain[i] = orion_tensor_create_for_binding(
                 &w->layer_plans[0].inputs[0], &surface_status);
@@ -546,7 +548,7 @@ static bool depth_worker_compile(DepthWorker *w, NSString *root, int max_compile
             w->chain[i] = orion_tensor_create_for_binding(
                 &w->final_norm_plan.outputs[0], &surface_status);
         }
-        if (!w->chain[i] || (!w->seqpack && surface_status != ORION_SURFACE_OK)) {
+        if (!w->chain[i] || surface_status != ORION_SURFACE_OK) {
             fprintf(stderr, "depth-serve: surface allocation failed at chain[%d]\n", i);
             depth_worker_cleanup(w);
             return false;

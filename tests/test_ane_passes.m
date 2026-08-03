@@ -559,6 +559,7 @@ static bool test_artifact_pair_publication(void) {
 
     OrionBindingPlan plan;
     char error[256] = {0};
+    (void)error; // artifacts path; adapter does not yet surface diagnostics here
     NSString* mil = orion_kernel_adapter_generate_mil_with_artifacts(
         adapter_weight_free_frontend, 0, 16, NULL, &identity,
         jsonPath.fileSystemRepresentation, mdPath.fileSystemRepresentation, &plan);

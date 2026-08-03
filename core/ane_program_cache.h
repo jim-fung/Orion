@@ -15,11 +15,39 @@ typedef struct {
 /// @param layer_idx    Layer index (-1 for non-layer-specific kernels)
 /// @param wb           Weights binding (checkpoint id + bucket)
 /// @return Cached program, or NULL on miss. Caller must NOT release the returned program.
+///
+/// WARNING: the returned pointer is borrowed. A concurrent eviction can remove
+/// the entry and release the program after this call returns. For any path that
+/// evaluates after lookup, use orion_cache_lookup_retained + orion_cache_release
+/// so the program stays alive for the lifetime of the lease.
 OrionProgram* orion_cache_lookup(
     const char* kernel_name,
     int layer_idx,
     const OrionWeightsBinding* wb
 );
+
+/// Look up a cached program and retain a lease on it.
+///
+/// The returned OrionProgram* is guaranteed to remain valid until the matching
+/// orion_cache_release() call, even if orion_cache_evict() runs concurrently.
+/// Use this (instead of orion_cache_lookup) whenever the caller evaluates the
+/// program after the lookup, so a concurrent eviction cannot free the program
+/// between lookup and eval (use-after-release).
+///
+/// @return (program, lease) where program is NULL on miss. On miss, lease is
+///         set to NULL and must still be passed to orion_cache_release (which
+///         is a no-op for NULL).
+OrionProgram* orion_cache_lookup_retained(
+    const char* kernel_name,
+    int layer_idx,
+    const OrionWeightsBinding* wb,
+    void** out_lease
+);
+
+/// Release a lease previously acquired via orion_cache_lookup_retained.
+/// Passing NULL is a no-op. After release, the program pointer from the
+/// matching lookup is no longer guaranteed valid (eviction may free it).
+void orion_cache_release(void* lease);
 
 /// Store a compiled program in the cache.
 /// The cache takes ownership — caller must NOT release the program after storing.

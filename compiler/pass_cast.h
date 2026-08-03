@@ -4,10 +4,11 @@
 
 #include "graph.h"
 
-// Eliminate redundant casts:
-// - fp32->fp16 followed by fp16->fp32 → eliminate both
-// - fp16->fp32 followed by fp32->fp16 → eliminate both
-// ANE computes in fp16 internally, so internal casts are waste.
+// Eliminate redundant round-trip casts:
+// - fp16->fp32 followed by fp32->fp16 → eliminate both (fp32 intermediate is wider)
+// - fp32->fp16 followed by fp16->fp32 → PRESERVED (fp16 intermediate narrows/loses data)
+// Only round trips whose intermediate dtype is not narrower than the endpoints
+// are folded; a narrowing intermediate preserves a lossy conversion on purpose.
 // Casts at graph boundaries (inputs/outputs) are preserved.
 // Returns true if any casts were eliminated.
 bool orion_pass_cast(OrionGraph* graph);

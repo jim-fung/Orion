@@ -59,6 +59,39 @@ OrionProgram* orion_cache_lookup(
     }
 }
 
+OrionProgram* orion_cache_lookup_retained(
+    const char* kernel_name,
+    int layer_idx,
+    const OrionWeightsBinding* wb,
+    void** out_lease
+) {
+    if (!out_lease) return NULL;
+    *out_lease = NULL;
+    @synchronized ([_OrionCacheEntry class]) {
+        _ensureCache();
+        NSString *key = _cacheKey(kernel_name, layer_idx, wb);
+        _OrionCacheEntry *entry = _programCache[key];
+        if (!entry) return NULL;
+        // Hand the caller a retained reference to the entry itself. While the
+        // caller holds this lease, the entry (and therefore its program) cannot
+        // be deallocated even if orion_cache_evict removes it from the
+        // dictionary concurrently. The program pointer stays valid until
+        // orion_cache_release drops the lease.
+        *out_lease = (__bridge_retained void *)entry;
+        return entry.program;
+    }
+}
+
+void orion_cache_release(void* lease) {
+    if (!lease) return;
+    // Transfer ownership back to ARC, which immediately releases it. If the
+    // entry is still in the dictionary, the dictionary's strong reference keeps
+    // it alive; if evicted, this was the last reference and dealloc frees the
+    // program now that evaluation is complete.
+    _OrionCacheEntry *entry = (__bridge_transfer _OrionCacheEntry *)lease;
+    (void)entry;
+}
+
 void orion_cache_store(
     const char* kernel_name,
     int layer_idx,

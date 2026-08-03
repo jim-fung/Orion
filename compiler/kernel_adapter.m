@@ -160,6 +160,17 @@ NSString* orion_kernel_adapter_generate_mil_2arg(OrionFrontend2Fn frontend,
     return generate_mil(g, NULL, NULL, NULL, NULL);
 }
 
+// Direct API: generate MIL and a finalized binding plan from a 2-arg frontend.
+NSString* orion_kernel_adapter_generate_mil_2arg_with_plan(OrionFrontend2Fn frontend,
+                                                            int layer_idx,
+                                                            const OrionModelConfig* cfg,
+                                                            OrionBindingPlan* out_plan) {
+    if (!frontend || !out_plan) return nil;
+    OrionGraph* g = frontend(layer_idx, cfg);
+    if (!g) return nil;
+    return generate_mil(g, NULL, NULL, NULL, out_plan);
+}
+
 OrionKernel orion_kernel_from_frontend(const char* name,
                                         OrionFrontendFn frontend,
                                         OrionWDictFn wdict,
