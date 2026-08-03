@@ -2,6 +2,9 @@
 #import "../model/configs/stories110m.h"
 #import <stdio.h>
 #import <string.h>
+#import <stdlib.h>
+#import <unistd.h>
+#import <libgen.h>
 
 // T075: Checkpoint save
 // T076: Checkpoint resume
@@ -102,16 +105,46 @@ static bool read_layer_adam(FILE *f, OrionLayerAdam *a,
     return true;
 }
 
+// Total bytes a checkpoint occupies for a given config (header + all sections).
+// Used to validate a file is complete before mutating trainer state on load.
+static size_t checkpoint_total_bytes(const OrionModelConfig *cfg, int nl) {
+    int d = cfg->d_model, h = cfg->hidden_dim, v = cfg->vocab;
+    size_t layer_weights = (size_t)(d + 4*d*d + d + 2*h*d + d*h) * sizeof(float);
+    size_t layer_adam = 2 * layer_weights;
+    size_t embed_rms = ((size_t)v * d + d) * sizeof(float);
+    size_t embed_rms_adam = 2 * embed_rms;
+    return sizeof(OrionCkptHdr) + (size_t)nl * (layer_weights + layer_adam) +
+           embed_rms + embed_rms_adam;
+}
+
 #pragma mark - Save
 
 bool orion_checkpoint_save(const OrionTrainer* t, const char* path,
                            int step, float loss) {
-    FILE *f = fopen(path, "wb");
-    if (!f) return false;
-
     const OrionModelConfig *cfg = t->cfg;
     int d = cfg->d_model, h = cfg->hidden_dim, v = cfg->vocab;
     int nl = t->n_layers;
+
+    // Transactional save: write to a temp file in the same directory, fsync,
+    // then atomically rename over the destination. A crash or disk-full leaves
+    // the previous good checkpoint intact rather than a truncated partial file.
+    char dir[1024];
+    strncpy(dir, path, sizeof(dir) - 1);
+    dir[sizeof(dir) - 1] = '\0';
+    char *dirpart = dirname(dir);
+    char tmp[1024];
+    if (snprintf(tmp, sizeof(tmp), "%s/.orion-ckpt-XXXXXX",
+                 dirpart && dirpart[0] ? dirpart : ".") >= (int)sizeof(tmp)) {
+        fprintf(stderr, "Checkpoint: path too long for temp staging\n");
+        return false;
+    }
+    int fd = mkstemp(tmp);
+    if (fd < 0) {
+        fprintf(stderr, "Checkpoint: cannot create temp file: %s\n", tmp);
+        return false;
+    }
+    FILE *f = fdopen(fd, "wb");
+    if (!f) { close(fd); unlink(tmp); return false; }
 
     // Write header
     OrionCkptHdr hdr = {0};
@@ -127,29 +160,46 @@ bool orion_checkpoint_save(const OrionTrainer* t, const char* path,
     hdr.lr = t->lr;
     hdr.loss = loss;
     hdr.adam_t = t->adam_t;
-    if (!write_buf(f, &hdr, sizeof(hdr))) { fclose(f); return false; }
+    bool ok = write_buf(f, &hdr, sizeof(hdr));
 
     // Per-layer weights
-    for (int L = 0; L < nl; L++) {
-        if (!write_layer_weights(f, &t->weights[L], d, h)) { fclose(f); return false; }
+    for (int L = 0; L < nl && ok; L++) {
+        ok = write_layer_weights(f, &t->weights[L], d, h);
     }
 
     // Per-layer Adam state
-    for (int L = 0; L < nl; L++) {
-        if (!write_layer_adam(f, &t->adam[L], d, h)) { fclose(f); return false; }
+    for (int L = 0; L < nl && ok; L++) {
+        ok = write_layer_adam(f, &t->adam[L], d, h);
     }
 
     // Embedding + final RMSNorm
-    if (!write_buf(f, t->embed, v * d * sizeof(float))) { fclose(f); return false; }
-    if (!write_buf(f, t->rms_final, d * sizeof(float))) { fclose(f); return false; }
+    if (ok) ok = write_buf(f, t->embed, (size_t)v * d * sizeof(float));
+    if (ok) ok = write_buf(f, t->rms_final, (size_t)d * sizeof(float));
 
     // Adam state for embed + rms_final
-    if (!write_buf(f, t->m_embed, v * d * sizeof(float))) { fclose(f); return false; }
-    if (!write_buf(f, t->v_embed, v * d * sizeof(float))) { fclose(f); return false; }
-    if (!write_buf(f, t->m_rms_final, d * sizeof(float))) { fclose(f); return false; }
-    if (!write_buf(f, t->v_rms_final, d * sizeof(float))) { fclose(f); return false; }
+    if (ok) ok = write_buf(f, t->m_embed, (size_t)v * d * sizeof(float));
+    if (ok) ok = write_buf(f, t->v_embed, (size_t)v * d * sizeof(float));
+    if (ok) ok = write_buf(f, t->m_rms_final, (size_t)d * sizeof(float));
+    if (ok) ok = write_buf(f, t->v_rms_final, (size_t)d * sizeof(float));
 
+    // Flush to OS, fsync for durability, then close.
+    if (ok && fflush(f) != 0) ok = false;
+    if (ok && fdatasync(fd) != 0) ok = false;
     fclose(f);
+
+    if (!ok) {
+        fprintf(stderr, "Checkpoint: write/sync failed; keeping previous file\n");
+        unlink(tmp);
+        return false;
+    }
+
+    // Atomically replace the destination. rename() on the same filesystem is
+    // atomic: readers see either the old or the new file, never a partial one.
+    if (rename(tmp, path) != 0) {
+        fprintf(stderr, "Checkpoint: rename(%s -> %s) failed\n", tmp, path);
+        unlink(tmp);
+        return false;
+    }
     return true;
 }
 
@@ -163,6 +213,22 @@ bool orion_checkpoint_load(OrionTrainer* t, const char* path,
     const OrionModelConfig *cfg = t->cfg;
     int d = cfg->d_model, h = cfg->hidden_dim, v = cfg->vocab;
     int nl = t->n_layers;
+
+    // Validate the file is complete BEFORE mutating any trainer state. A
+    // truncated/partial checkpoint (e.g. from an interrupted save) must be
+    // rejected up front rather than partway through restoring weights, which
+    // would leave the trainer in a mixed half-restored state.
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; }
+    long file_size = ftell(f);
+    if (file_size < 0) { fclose(f); return false; }
+    size_t expected = checkpoint_total_bytes(cfg, nl);
+    if ((size_t)file_size != expected) {
+        NSLog(@"Checkpoint: file size %ld bytes != expected %zu bytes (truncated or corrupt)",
+              file_size, expected);
+        fclose(f);
+        return false;
+    }
+    rewind(f);
 
     // Read and validate header
     OrionCkptHdr hdr;
@@ -189,7 +255,8 @@ bool orion_checkpoint_load(OrionTrainer* t, const char* path,
     if (out_step) *out_step = hdr.step;
     if (out_loss) *out_loss = hdr.loss;
 
-    // Per-layer weights
+    // Per-layer weights — the file is known-complete, so a failed read here is
+    // a genuine I/O error, not truncation.
     for (int L = 0; L < nl; L++) {
         if (!read_layer_weights(f, &t->weights[L], d, h)) { fclose(f); return false; }
     }
@@ -200,14 +267,14 @@ bool orion_checkpoint_load(OrionTrainer* t, const char* path,
     }
 
     // Embedding + final RMSNorm
-    if (!read_buf(f, t->embed, v * d * sizeof(float))) { fclose(f); return false; }
-    if (!read_buf(f, t->rms_final, d * sizeof(float))) { fclose(f); return false; }
+    if (!read_buf(f, t->embed, (size_t)v * d * sizeof(float))) { fclose(f); return false; }
+    if (!read_buf(f, t->rms_final, (size_t)d * sizeof(float))) { fclose(f); return false; }
 
     // Adam state for embed + rms_final
-    if (!read_buf(f, t->m_embed, v * d * sizeof(float))) { fclose(f); return false; }
-    if (!read_buf(f, t->v_embed, v * d * sizeof(float))) { fclose(f); return false; }
-    if (!read_buf(f, t->m_rms_final, d * sizeof(float))) { fclose(f); return false; }
-    if (!read_buf(f, t->v_rms_final, d * sizeof(float))) { fclose(f); return false; }
+    if (!read_buf(f, t->m_embed, (size_t)v * d * sizeof(float))) { fclose(f); return false; }
+    if (!read_buf(f, t->v_embed, (size_t)v * d * sizeof(float))) { fclose(f); return false; }
+    if (!read_buf(f, t->m_rms_final, (size_t)d * sizeof(float))) { fclose(f); return false; }
+    if (!read_buf(f, t->v_rms_final, (size_t)d * sizeof(float))) { fclose(f); return false; }
 
     fclose(f);
     return true;
