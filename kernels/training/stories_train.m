@@ -1187,9 +1187,12 @@ static bool patch_layer(OrionLayerKernels* kern, int layer_idx,
                   wdict_qkv_bwd_adapter, "qkvBwdPatch");
 
     // Success: all six weighted programs patched. Preserve the weight-free
-    // sdpa_bwd2 handle (ownership transfers to the replacement), release the old
-    // weighted donors, then commit the fully built replacement into *kern.
+    // sdpa_bwd2 program AND its finalized binding plan — the program is reused
+    // unchanged, but eval authenticates the supplied plan, so a zeroed plan would
+    // be rejected. Release the old weighted donors, then commit the fully built
+    // replacement into *kern.
     replacement.sdpa_bwd2 = kern->sdpa_bwd2;
+    replacement.plan_sdpa_bwd2 = kern->plan_sdpa_bwd2;
     orion_release_program(kern->fwd_attn);
     orion_release_program(kern->fwd_attn_core);
     orion_release_program(kern->fwd_ffn);

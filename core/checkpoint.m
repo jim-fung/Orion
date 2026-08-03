@@ -90,9 +90,16 @@ bool orion_checkpoint_save(const OrionTrainer* t, const char* path,
     // Transactional save: write to a temp file in the same directory, fsync,
     // then atomically rename over the destination. A crash or disk-full leaves
     // the previous good checkpoint intact rather than a truncated partial file.
+    // Reject an oversized path up front rather than silently truncating it into
+    // a fixed buffer (which could stage the temp file in the wrong directory
+    // and break the same-filesystem atomic-rename guarantee).
     char dir[1024];
-    strncpy(dir, path, sizeof(dir) - 1);
-    dir[sizeof(dir) - 1] = '\0';
+    size_t path_len = path ? strlen(path) : 0;
+    if (path_len == 0 || path_len >= sizeof(dir)) {
+        fprintf(stderr, "Checkpoint: destination path too long (%zu bytes)\n", path_len);
+        return false;
+    }
+    memcpy(dir, path, path_len + 1);  // path_len < sizeof(dir), includes NUL
     char *dirpart = dirname(dir);
     char tmp[1024];
     if (snprintf(tmp, sizeof(tmp), "%s/.orion-ckpt-XXXXXX",
@@ -144,10 +151,16 @@ bool orion_checkpoint_save(const OrionTrainer* t, const char* path,
     if (ok) ok = write_buf(f, t->m_rms_final, (size_t)d * sizeof(float));
     if (ok) ok = write_buf(f, t->v_rms_final, (size_t)d * sizeof(float));
 
-    // Flush to OS, fsync for durability, then close. fclose can surface a
+    // Flush to OS, then force full barrier durability. fclose can surface a
     // deferred write error, so its return is part of the success predicate.
     if (ok && fflush(f) != 0) ok = false;
-    if (ok && fdatasync(fd) != 0) ok = false;
+    // F_FULLFSYNC forces the drive to flush its volatile write cache to stable
+    // storage, giving the strongest macOS power-loss guarantee (stronger than
+    // fdatasync/fsync, which may only flush to the device). Fall back to
+    // fdatasync if the filesystem rejects F_FULLFSYNC.
+    if (ok) {
+        if (fcntl(fd, F_FULLFSYNC) != 0 && fdatasync(fd) != 0) ok = false;
+    }
     if (fclose(f) != 0) ok = false;
 
     if (!ok) {
@@ -165,17 +178,30 @@ bool orion_checkpoint_save(const OrionTrainer* t, const char* path,
     }
 
     // The rename is atomic but not crash-durable until the parent directory
-    // entry update is flushed. fsync the directory so a power loss after a
-    // reported-successful checkpoint cannot revert to the previous file. A
-    // directory we cannot open (e.g. restricted parent) is logged but not
-    // fatal: the file content is durable, only the rename's metadata is not.
-    int dirfd = open(dirpart && dirpart[0] ? dirpart : ".", O_RDONLY);
-    if (dirfd >= 0) {
-        if (fsync(dirfd) != 0) {
-            fprintf(stderr, "Checkpoint: directory fsync failed (errno=%d); "
-                    "rename may not survive power loss\n", errno);
-        }
+    // entry update is flushed. fsync the directory so a reported-successful
+    // checkpoint cannot revert to the previous file after power loss. Unlike
+    // the file fsync, failure here is fatal to "success": the function must not
+    // report success if the rename is not durable. Note that rename has already
+    // committed the new pathname, so we cannot restore the old file; we report
+    // the failure honestly so the caller knows durability was not guaranteed.
+    const char *dir_for_sync = dirpart && dirpart[0] ? dirpart : ".";
+    int dirfd = open(dir_for_sync, O_RDONLY);
+    if (dirfd < 0) {
+        fprintf(stderr, "Checkpoint: replaced %s but could not open parent dir '%s' "
+                "for fsync (errno=%d); rename may not survive power loss\n",
+                path, dir_for_sync, errno);
+        return false;
+    }
+    if (fsync(dirfd) != 0) {
+        fprintf(stderr, "Checkpoint: replaced %s but directory fsync failed (errno=%d); "
+                "rename may not survive power loss\n", path, errno);
         close(dirfd);
+        return false;
+    }
+    if (close(dirfd) != 0) {
+        fprintf(stderr, "Checkpoint: replaced %s but directory close failed (errno=%d); "
+                "rename may not survive power loss\n", path, errno);
+        return false;
     }
     return true;
 }

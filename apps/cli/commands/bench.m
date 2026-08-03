@@ -2,6 +2,8 @@
 #import <stdio.h>
 #import <stdlib.h>
 #import <string.h>
+#import <errno.h>
+#import <limits.h>
 #import <mach/mach.h>
 #import <mach/mach_time.h>
 #import "../../../core/ane_runtime.h"
@@ -64,6 +66,20 @@ static int cmp_double(const void *a, const void *b) {
     double da = *(const double *)a;
     double db = *(const double *)b;
     return (da > db) - (da < db);
+}
+
+// Parse a non-negative integer CLI argument. Returns true on success (value in
+// [0, INT_MAX], fully consumed, no errno overflow); false otherwise. Using this
+// instead of atoi prevents negatives from slipping through and reaching malloc
+// as huge size_t values, and avoids UB from atoi's domain.
+static bool parse_nonneg_int(const char *s, int *out) {
+    if (!s || !*s) return false;
+    errno = 0;
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (errno != 0 || !end || *end != '\0' || v < 0 || v > INT_MAX) return false;
+    *out = (int)v;
+    return true;
 }
 
 #pragma mark - T108: Baseline JSON Helpers
@@ -827,12 +843,13 @@ static int bench_inference(const char *prompt_text, int max_tokens, int warmup,
     // requested generation must fit, or decode would stop advancing the cache
     // and the benchmark would sample stale logits. Reject up front rather than
     // emit a misleading timing run (matches the infer command's preflight).
+    // Use subtraction (not prompt_len + max_tokens) so the check cannot overflow.
     int max_seq = kGPT2_124M.max_seq;
-    if (prompt_len + max_tokens > max_seq) {
+    if (max_tokens > max_seq - prompt_len) {
         fprintf(stderr,
-            "bench inference: prompt (%d tokens) + max_tokens (%d) = %d exceeds the "
+            "bench inference: prompt (%d tokens) + max_tokens (%d) exceeds the "
             "model's max_seq (%d). Use a shorter prompt or fewer --max_tokens.\n",
-            prompt_len, max_tokens, prompt_len + max_tokens, max_seq);
+            prompt_len, max_tokens, max_seq);
         orion_gpt2_weights_free(w);
         orion_gpt2_tokenizer_free(tok);
         return 1;
@@ -1227,9 +1244,21 @@ int orion_cmd_bench(int argc, const char* argv[]) {
             if (strcmp(argv[i], "--prompt") == 0 && i + 1 < argc) {
                 prompt = argv[++i];
             } else if (strcmp(argv[i], "--max_tokens") == 0 && i + 1 < argc) {
-                max_tokens = atoi(argv[++i]);
+                const char *arg = argv[++i];
+                int v;
+                if (!parse_nonneg_int(arg, &v)) {
+                    fprintf(stderr, "bench inference: --max_tokens requires a non-negative integer <= INT_MAX (got '%s')\n", arg);
+                    return 1;
+                }
+                max_tokens = v;
             } else if (strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) {
-                warmup = atoi(argv[++i]);
+                const char *arg = argv[++i];
+                int v;
+                if (!parse_nonneg_int(arg, &v)) {
+                    fprintf(stderr, "bench inference: --warmup requires a non-negative integer <= INT_MAX (got '%s')\n", arg);
+                    return 1;
+                }
+                warmup = v;
             } else if (strcmp(argv[i], "--ane") == 0) {
                 use_ane = true;
                 ane_decode = true;

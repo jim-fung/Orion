@@ -279,22 +279,22 @@ void orion_gpt2_forward_cpu_all(const OrionGPT2Weights* w,
 bool orion_gpt2_prefill_kv(const OrionGPT2Weights* w,
                              const int* tokens, int seq_len,
                              OrionKVCache* kv, float* logits) {
-    int d = w->d_model;
-    int n_layer = w->n_layer;
-    int n_head = 12;
-    int d_ff = w->d_ff;
-    int vocab = w->vocab;
-
-    // Fail closed before any allocation if the prompt cannot fit. An oversized
-    // prompt would otherwise leave current_len advanced past a zeroed cache and
-    // poison every subsequent decode step (silent corruption). An empty prompt
-    // is also invalid: the final logits GEMM addresses x + (seq_len-1)*d, which
-    // points before the allocation when seq_len == 0.
+    // Validate all arguments BEFORE reading any field. An oversized prompt
+    // would otherwise leave current_len advanced past a zeroed cache and poison
+    // every subsequent decode step (silent corruption). An empty prompt is also
+    // invalid: the final logits GEMM addresses x + (seq_len-1)*d, which points
+    // before the allocation when seq_len == 0.
     if (!w || !tokens || !kv || !logits || seq_len <= 0 || seq_len > kv->max_seq) {
         fprintf(stderr, "orion_gpt2_prefill_kv: invalid args (seq_len=%d max_seq=%d)\n",
                 seq_len, kv ? kv->max_seq : -1);
         return false;
     }
+
+    int d = w->d_model;
+    int n_layer = w->n_layer;
+    int n_head = 12;
+    int d_ff = w->d_ff;
+    int vocab = w->vocab;
 
     float* x = (float*)malloc(seq_len * d * sizeof(float));
     float* ln_out = (float*)malloc(seq_len * d * sizeof(float));
@@ -435,6 +435,20 @@ void orion_gpt2_decode_step(const OrionGPT2Weights* w,
                               int token,
                               float* logits,
                               OrionDecodeWorkspace* ws) {
+    // Validate before any field dereference: a null w/kv/logits would otherwise
+    // crash, and a workspace sized for a different model/cache could under-size
+    // the per-layer buffers (overflowing ws->scores / ws->q etc.).
+    if (!w || !kv || !logits) {
+        fprintf(stderr, "orion_gpt2_decode_step: null argument\n");
+        return;
+    }
+    if (ws && (ws->d_model != w->d_model || ws->max_seq != kv->max_seq)) {
+        fprintf(stderr, "orion_gpt2_decode_step: workspace mismatch "
+                "(ws d_model=%d/%d max_seq=%d/%d)\n",
+                ws->d_model, w->d_model, ws->max_seq, kv->max_seq);
+        return;
+    }
+
     int d = w->d_model;
     int n_layer = w->n_layer;
     int n_head = kv->n_head;

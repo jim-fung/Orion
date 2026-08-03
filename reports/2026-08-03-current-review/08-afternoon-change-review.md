@@ -1,9 +1,9 @@
 # Orion Afternoon Change Review — Logic and Failure Semantics
 
-> **Review date:** 2026-08-03  
-> **Review window:** commits authored from 2026-08-03 12:00 local through 20:14 local  
-> **Git range:** `e47398dc7a5435fd47b43d4f920cbab9089bf27f..9518d39b50097f91d92a78be92e0b11827a87f13`  
-> **Branch:** `feat/voxtream-depth-integrity`  
+> **Review date:** 2026-08-03
+> **Review window:** commits authored from 2026-08-03 12:00 local through 20:14 local
+> **Git range:** `e47398dc7a5435fd47b43d4f920cbab9089bf27f..9518d39b50097f91d92a78be92e0b11827a87f13`
+> **Branch:** `feat/voxtream-depth-integrity`
 > **Review emphasis:** production logic, ownership, transactionality, state transitions, bounds, and failure propagation. Test mechanics are secondary except where they obscure production behavior.
 
 ## Executive assessment
