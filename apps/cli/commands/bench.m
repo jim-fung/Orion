@@ -2,8 +2,8 @@
 #import <stdio.h>
 #import <stdlib.h>
 #import <string.h>
-#import <sys/time.h>
 #import <mach/mach.h>
+#import <mach/mach_time.h>
 #import "../../../core/ane_runtime.h"
 #import "../../../core/ane_program_cache.h"
 #import "../../../core/iosurface_tensor.h"
@@ -34,10 +34,12 @@
 
 #pragma mark - Shared Helpers
 
+// Monotonic millisecond clock (Mach absolute time). gettimeofday is wall-clock
+// and can jump backwards on NTP adjustments; benchmarks need a monotonic source.
 static double time_ms(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+    static mach_timebase_info_data_t tb;
+    if (tb.denom == 0) mach_timebase_info(&tb);
+    return (double)mach_absolute_time() * tb.numer / tb.denom / 1e6;
 }
 
 static size_t get_rss_bytes(void) {
@@ -110,17 +112,42 @@ static bool baseline_save(NSDictionary *metrics) {
     return [json writeToFile:baseline_path() atomically:YES];
 }
 
-static void baseline_compare(NSDictionary *current) {
+// Metric direction policy. Most benchmark metrics are latency/resource-like
+// (lower is better): *_ms, decode_p50/p90/avg, rss_ratio, *_eval_ms.
+// Throughput (tok_per_sec) is the exception: higher is better. A regression for
+// a lower-is-better metric is an increase; for throughput it is a decrease.
+// Treating all metrics as "higher is worse" was the prior bug: a throughput
+// collapse passed while a throughput improvement warned.
+typedef enum {
+    METRIC_LOWER_IS_BETTER = 0,
+    METRIC_HIGHER_IS_BETTER = 1,
+} MetricDirection;
+
+static MetricDirection metric_direction(NSString *key) {
+    // Throughput is the only higher-is-better metric today.
+    if ([key containsString:@"tok_per_sec"]) return METRIC_HIGHER_IS_BETTER;
+    return METRIC_LOWER_IS_BETTER;
+}
+
+// Result of a single metric comparison or the whole gate.
+typedef enum {
+    BENCH_OK = 0,
+    BENCH_WARN = 1,
+    BENCH_NO_BASELINE = 2,
+} BenchCompareResult;
+
+static BenchCompareResult baseline_compare(NSDictionary *current) {
     NSDictionary *saved = baseline_load();
     if (!saved) {
         fprintf(stderr, "\nNo baseline found. Run with --save-baseline first.\n");
-        return;
+        return BENCH_NO_BASELINE;
     }
 
     fprintf(stderr, "\n=== Regression Check ===\n");
     fprintf(stderr, "  %-40s  %10s  %10s  %s\n", "Metric", "Baseline", "Current", "Status");
 
     int pass_count = 0, warn_count = 0, skip_count = 0;
+    const double threshold_pct = 15.0;
 
     for (NSString *key in [current.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
         NSNumber *cur_val = current[key];
@@ -136,16 +163,23 @@ static void baseline_compare(NSDictionary *current) {
         double base = base_val.doubleValue;
         double cur = cur_val.doubleValue;
         double pct = (base > 0) ? ((cur - base) / base) * 100.0 : 0;
+        MetricDirection dir = metric_direction(key);
 
-        if (pct > 15.0) {
+        // A regression moves the metric in the bad direction: latency up or
+        // throughput down. Sign pct accordingly so the threshold test is right.
+        double regression_pct = (dir == METRIC_HIGHER_IS_BETTER) ? -pct : pct;
+        bool is_regression = regression_pct > threshold_pct;
+
+        if (is_regression) {
             warn_count++;
         } else {
             pass_count++;
         }
 
-        if (pct > 15.0) {
-            fprintf(stderr, "  %-40s  %10.4f  %10.4f  WARN (+%.1f%%)\n",
-                    key.UTF8String, base, cur, pct);
+        if (is_regression) {
+            fprintf(stderr, "  %-40s  %10.4f  %10.4f  WARN (%+.1f%%, %s)\n",
+                    key.UTF8String, base, cur, pct,
+                    dir == METRIC_HIGHER_IS_BETTER ? "higher-is-better" : "lower-is-better");
         } else {
             fprintf(stderr, "  %-40s  %10.4f  %10.4f  PASS\n",
                     key.UTF8String, base, cur);
@@ -154,6 +188,7 @@ static void baseline_compare(NSDictionary *current) {
 
     fprintf(stderr, "  ---\n");
     fprintf(stderr, "  %d PASS, %d WARN, %d NEW\n", pass_count, warn_count, skip_count);
+    return warn_count > 0 ? BENCH_WARN : BENCH_OK;
 }
 
 #pragma mark - T105: Weight Dict Builders (for kernel bench)
@@ -475,7 +510,12 @@ static int bench_swap(const char* weights_a, const char* weights_b,
             @"swap.avg_evict_ms": @(avg_evict),
             @"swap.rss_ratio": @(rss_ratio),
         };
-        baseline_compare(current);
+        BenchCompareResult r = baseline_compare(current);
+        if (r == BENCH_WARN) {
+            fprintf(stderr, "\nBenchmark regression detected (exit 2).\n");
+            CFRelease(ioX); CFRelease(ioY); CFRelease(ioZ);
+            return 2;
+        }
     }
 
     CFRelease(ioX); CFRelease(ioY); CFRelease(ioZ);
@@ -728,7 +768,11 @@ static int bench_kernels(const char *model_dir, int iters, int bucket,
             fprintf(stderr, "\nBaseline saved to %s\n", baseline_path().UTF8String);
         }
     } else {
-        baseline_compare(metrics);
+        BenchCompareResult r = baseline_compare(metrics);
+        if (r == BENCH_WARN) {
+            fprintf(stderr, "\nBenchmark regression detected (exit 2).\n");
+            return 2;
+        }
     }
 
     return 0;
@@ -894,7 +938,16 @@ static int bench_inference(const char *prompt_text, int max_tokens, int warmup,
             fprintf(stderr, "\nBaseline saved to %s\n", baseline_path().UTF8String);
         }
     } else {
-        baseline_compare(metrics);
+        BenchCompareResult r = baseline_compare(metrics);
+        if (r == BENCH_WARN) {
+            fprintf(stderr, "\nBenchmark regression detected (exit 2).\n");
+            free(decode_samples);
+            free(logits);
+            orion_kv_cache_free(kv);
+            orion_gpt2_weights_free(w);
+            orion_gpt2_tokenizer_free(tok);
+            return 2;
+        }
     }
 
     free(decode_samples);
@@ -951,26 +1004,27 @@ static int bench_training(int steps, int grad_accum, const char *weights_path,
 
     fprintf(stderr, "\n=== Training Benchmark (Stories110M, %d steps, grad_accum=%d) ===\n",
             steps, grad_accum);
-    fprintf(stderr, "  %-6s  %10s  %10s  %10s  %10s  %8s\n",
-            "Step", "Fwd ms", "Bwd+dW ms", "Adam ms", "Total ms", "Loss");
+    fprintf(stderr, "  %-6s  %12s  %10s  %10s  %10s  %8s\n",
+            "Step", "Compute ms", "Adam ms", "Recomp ms", "Total ms", "Loss");
 
-    double total_fwd = 0, total_bwd = 0, total_adam = 0, total_recomp = 0;
+    // NOTE: orion_train_step includes forward + loss + backward + dW in one
+    // call. The prior benchmark split that wall time into fabricated 40/60
+    // forward/backward "phases" without instrumenting the actual boundaries.
+    // Report one honest train_compute_ms metric instead; per-phase timing
+    // requires internal instrumentation in orion_train_step (see backlog).
+    double total_compute = 0, total_adam = 0, total_recomp = 0;
 
     for (int s = 0; s < steps; s++) {
         orion_trainer_zero_grads(trainer);
 
-        double step_fwd = 0, step_bwd = 0;
+        double step_compute = 0;
 
         for (int a = 0; a < grad_accum; a++) {
             double t0 = time_ms();
             float loss = orion_train_step(trainer, input_tokens, target_tokens);
             double t1 = time_ms();
 
-            // orion_train_step includes fwd + loss + bwd + dW
-            // We report the whole thing as fwd+bwd combined per micro-batch
-            double step_ms = t1 - t0;
-            step_fwd += step_ms * 0.4;   // approximate split: 40% fwd
-            step_bwd += step_ms * 0.6;   // 60% bwd+dW
+            step_compute += (t1 - t0);  // fwd + loss + bwd + dW, unsplit
 
             if (a == grad_accum - 1) {
                 // Scale grads by 1/accum
@@ -987,37 +1041,33 @@ static int bench_training(int steps, int grad_accum, const char *weights_path,
                 orion_trainer_recompile_delta(trainer, weights_path);
                 double recomp_ms = time_ms() - tr0;
 
-                double total_step = step_fwd + step_bwd + adam_ms + recomp_ms;
+                double total_step = step_compute + adam_ms + recomp_ms;
 
-                fprintf(stderr, "  %4d    %8.1f    %8.1f    %8.1f    %8.1f    %.4f\n",
-                        s + 1, step_fwd, step_bwd, adam_ms, total_step, loss);
+                fprintf(stderr, "  %4d    %10.1f    %8.1f    %8.1f    %8.1f    %.4f\n",
+                        s + 1, step_compute, adam_ms, recomp_ms, total_step, loss);
 
-                total_fwd += step_fwd;
-                total_bwd += step_bwd;
+                total_compute += step_compute;
                 total_adam += adam_ms;
                 total_recomp += recomp_ms;
             }
         }
     }
 
-    double avg_fwd = steps > 0 ? total_fwd / steps : 0;
-    double avg_bwd = steps > 0 ? total_bwd / steps : 0;
+    double avg_compute = steps > 0 ? total_compute / steps : 0;
     double avg_adam = steps > 0 ? total_adam / steps : 0;
     double avg_recomp = steps > 0 ? total_recomp / steps : 0;
-    double avg_total = avg_fwd + avg_bwd + avg_adam + avg_recomp;
+    double avg_total = avg_compute + avg_adam + avg_recomp;
 
     fprintf(stderr, "\n  --- Summary ---\n");
-    fprintf(stderr, "  Avg forward:   %.1f ms\n", avg_fwd);
-    fprintf(stderr, "  Avg bwd+dW:    %.1f ms\n", avg_bwd);
-    fprintf(stderr, "  Avg Adam:      %.1f ms\n", avg_adam);
-    fprintf(stderr, "  Avg recompile: %.1f ms\n", avg_recomp);
-    fprintf(stderr, "  Avg total:     %.1f ms/step\n", avg_total);
-    fprintf(stderr, "  RSS:           %.0f MB\n", get_rss_bytes() / (1024.0 * 1024.0));
+    fprintf(stderr, "  Avg compute (fwd+loss+bwd+dW): %.1f ms\n", avg_compute);
+    fprintf(stderr, "  Avg Adam:                      %.1f ms\n", avg_adam);
+    fprintf(stderr, "  Avg recompile:                 %.1f ms\n", avg_recomp);
+    fprintf(stderr, "  Avg total:                     %.1f ms/step\n", avg_total);
+    fprintf(stderr, "  RSS:                           %.0f MB\n", get_rss_bytes() / (1024.0 * 1024.0));
 
     // T108: baseline
     NSMutableDictionary *metrics = [NSMutableDictionary dictionaryWithDictionary:@{
-        @"training.avg_fwd_ms": @(avg_fwd),
-        @"training.avg_bwd_ms": @(avg_bwd),
+        @"training.avg_compute_ms": @(avg_compute),
         @"training.avg_adam_ms": @(avg_adam),
         @"training.avg_recomp_ms": @(avg_recomp),
         @"training.avg_total_ms": @(avg_total),
@@ -1028,7 +1078,14 @@ static int bench_training(int steps, int grad_accum, const char *weights_path,
             fprintf(stderr, "\nBaseline saved to %s\n", baseline_path().UTF8String);
         }
     } else {
-        baseline_compare(metrics);
+        BenchCompareResult r = baseline_compare(metrics);
+        if (r == BENCH_WARN) {
+            fprintf(stderr, "\nBenchmark regression detected (exit 2).\n");
+            free(input_tokens);
+            free(target_tokens);
+            orion_trainer_free(trainer);
+            return 2;
+        }
     }
 
     free(input_tokens);
