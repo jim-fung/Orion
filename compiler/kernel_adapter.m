@@ -177,10 +177,20 @@ NSString* orion_kernel_adapter_generate_mil_2arg_with_plan(OrionFrontend2Fn fron
                                                             int layer_idx,
                                                             const OrionModelConfig* cfg,
                                                             OrionBindingPlan* out_plan) {
+    return orion_kernel_adapter_generate_mil_2arg_with_plan_identity(
+        frontend, layer_idx, cfg, NULL, out_plan);
+}
+
+// As above, with a source identity. Weighted graphs require identity->weight_root
+// so plan generation can hash each BLOBFILE chunk; passing NULL here is only
+// valid for weight-free graphs (the no-identity wrapper above).
+NSString* orion_kernel_adapter_generate_mil_2arg_with_plan_identity(
+    OrionFrontend2Fn frontend, int layer_idx, const OrionModelConfig* cfg,
+    const OrionBindingPlanIdentity* identity, OrionBindingPlan* out_plan) {
     if (!frontend || !out_plan) return nil;
     OrionGraph* g = frontend(layer_idx, cfg);
     if (!g) return nil;
-    return generate_mil(g, NULL, NULL, NULL, out_plan);
+    return generate_mil(g, identity, NULL, NULL, out_plan);
 }
 
 OrionKernel orion_kernel_from_frontend(const char* name,

@@ -52,6 +52,15 @@ NSString* orion_kernel_adapter_generate_mil_2arg_with_plan(OrionFrontend2Fn fron
                                                             const OrionModelConfig* cfg,
                                                             OrionBindingPlan* out_plan);
 
+// As above, with the source identity required for weighted plans. Weighted
+// graphs require identity->weight_root so the plan can hash each BLOBFILE
+// chunk; the no-identity variant above is only valid for weight-free graphs.
+// Callers that already have a weight directory (e.g. training's compile_layer)
+// should use this variant.
+NSString* orion_kernel_adapter_generate_mil_2arg_with_plan_identity(
+    OrionFrontend2Fn frontend, int layer_idx, const OrionModelConfig* cfg,
+    const OrionBindingPlanIdentity* identity, OrionBindingPlan* out_plan);
+
 // Create an OrionKernel from a compiler frontend.
 // The generate_mil implementation: call frontend -> optimize -> codegen -> return MIL string.
 // This is a drop-in replacement for hand-written milgen functions.

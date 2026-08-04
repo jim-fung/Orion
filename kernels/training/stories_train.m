@@ -246,41 +246,51 @@ static NSString* compiler_qkv_bwd_adapter(int layer_idx, int bucket, const Orion
 // Plan-generating variants — produce MIL plus a finalized binding plan so the
 // runtime compiles via the plan-aware path and eval authenticates the cached ABI.
 // Each plan's inputs/outputs are sorted alphabetically by MIL name; the surface
-// arrays passed to eval must follow that same order.
+// arrays passed to eval must follow that same order. Each forwards the caller's
+// identity (which must carry weight_root for any weighted program) so plan
+// generation can hash each BLOBFILE chunk.
 static NSString* compiler_fwd_attn_with_plan(int layer_idx, const OrionModelConfig* cfg,
+                                              const OrionBindingPlanIdentity* identity,
                                               OrionBindingPlan* out_plan) {
-    return orion_kernel_adapter_generate_mil_2arg_with_plan(
-        orion_frontend_fwd_attn, layer_idx, cfg, out_plan);
+    return orion_kernel_adapter_generate_mil_2arg_with_plan_identity(
+        orion_frontend_fwd_attn, layer_idx, cfg, identity, out_plan);
 }
 static NSString* compiler_fwd_attn_core_with_plan(int layer_idx, const OrionModelConfig* cfg,
+                                                   const OrionBindingPlanIdentity* identity,
                                                    OrionBindingPlan* out_plan) {
-    return orion_kernel_adapter_generate_mil_2arg_with_plan(
-        orion_frontend_fwd_attn_core, layer_idx, cfg, out_plan);
+    return orion_kernel_adapter_generate_mil_2arg_with_plan_identity(
+        orion_frontend_fwd_attn_core, layer_idx, cfg, identity, out_plan);
 }
 static NSString* compiler_fwd_ffn_with_plan(int layer_idx, const OrionModelConfig* cfg,
+                                            const OrionBindingPlanIdentity* identity,
                                             OrionBindingPlan* out_plan) {
-    return orion_kernel_adapter_generate_mil_2arg_with_plan(
-        orion_frontend_fwd_ffn, layer_idx, cfg, out_plan);
+    return orion_kernel_adapter_generate_mil_2arg_with_plan_identity(
+        orion_frontend_fwd_ffn, layer_idx, cfg, identity, out_plan);
 }
 static NSString* compiler_ffn_bwd_with_plan(int layer_idx, const OrionModelConfig* cfg,
+                                            const OrionBindingPlanIdentity* identity,
                                             OrionBindingPlan* out_plan) {
-    return orion_kernel_adapter_generate_mil_2arg_with_plan(
-        orion_frontend_ffn_bwd, layer_idx, cfg, out_plan);
+    return orion_kernel_adapter_generate_mil_2arg_with_plan_identity(
+        orion_frontend_ffn_bwd, layer_idx, cfg, identity, out_plan);
 }
 static NSString* compiler_sdpa_bwd1_with_plan(int layer_idx, const OrionModelConfig* cfg,
+                                              const OrionBindingPlanIdentity* identity,
                                               OrionBindingPlan* out_plan) {
-    return orion_kernel_adapter_generate_mil_2arg_with_plan(
-        orion_frontend_sdpa_bwd1, layer_idx, cfg, out_plan);
+    return orion_kernel_adapter_generate_mil_2arg_with_plan_identity(
+        orion_frontend_sdpa_bwd1, layer_idx, cfg, identity, out_plan);
 }
 static NSString* compiler_sdpa_bwd2_with_plan(int layer_idx, const OrionModelConfig* cfg,
+                                              const OrionBindingPlanIdentity* identity,
                                               OrionBindingPlan* out_plan) {
-    return orion_kernel_adapter_generate_mil_2arg_with_plan(
-        orion_frontend_sdpa_bwd2, layer_idx, cfg, out_plan);
+    // Weight-free; identity is accepted for uniformity but not required.
+    return orion_kernel_adapter_generate_mil_2arg_with_plan_identity(
+        orion_frontend_sdpa_bwd2, layer_idx, cfg, identity, out_plan);
 }
 static NSString* compiler_qkv_bwd_with_plan(int layer_idx, const OrionModelConfig* cfg,
+                                            const OrionBindingPlanIdentity* identity,
                                             OrionBindingPlan* out_plan) {
-    return orion_kernel_adapter_generate_mil_2arg_with_plan(
-        orion_frontend_qkv_bwd, layer_idx, cfg, out_plan);
+    return orion_kernel_adapter_generate_mil_2arg_with_plan_identity(
+        orion_frontend_qkv_bwd, layer_idx, cfg, identity, out_plan);
 }
 
 // Verify that a surface array slot holds the plan entry with the expected
@@ -386,6 +396,15 @@ static bool compile_layer(OrionLayerKernels* kern, int layer_idx,
     int s = cfg->max_seq;
     NSString *base = weight_dir;
 
+    // Identity for plan generation. Weighted programs require weight_root so
+    // each BLOBFILE chunk can be hashed; without it plan generation rejects
+    // any weighted graph with "requires a weight root for hashing".
+    OrionBindingPlanIdentity identity = {
+        .orion_revision = "stories-training",
+        .compiler_build = "kernel-adapter",
+        .weight_root = base.fileSystemRepresentation,
+    };
+
     char plan_err[512] = {0};
 
     // Helper macro: generate MIL+plan, finalize, validate weight dict, compile.
@@ -394,7 +413,7 @@ static bool compile_layer(OrionLayerKernels* kern, int layer_idx,
     #define COMPILE_PLAN(fn_plan, fn_wdict, prog_field, plan_field, tag, wdict_expr) \
         do { \
             OrionBindingPlan* _plan = &kern->plan_field; \
-            NSString* _mil = [fn_plan(layer_idx, cfg, _plan) \
+            NSString* _mil = [fn_plan(layer_idx, cfg, &identity, _plan) \
                 stringByAppendingFormat:@"\n// orion-training-generation:%lu\n", generation]; \
             if (!_mil || \
                 !orion_binding_plan_set_mil_identity(_plan, _mil.UTF8String) || \
@@ -442,27 +461,39 @@ static bool compile_layer(OrionLayerKernels* kern, int layer_idx,
     #undef COMPILE_PLAN
 
     // Verify the hard-coded surface indexes used by eval still match the plan's
-    // alphabetical output order. This is the checked replacement for the old
-    // comment-only assumptions.
-    if (!verify_plan_output_name(&kern->plan_fwd_attn, 0, "k_out") ||
-        !verify_plan_output_name(&kern->plan_fwd_attn, 1, "q_out") ||
+    // alphabetical output order. The plan orders outputs alphabetically by the
+    // post-optimization MIL variable name (identity/same-cast passes bypass the
+    // *_out alias nodes, so linear outputs are named {prefix}_conv and rms/silu
+    // keep their plain names). These names are authoritative: if a frontend
+    // rename or output reorder changes them, the slot mapping in eval would
+    // silently bind the wrong tensor — fail loudly here instead.
+    //
+    // fwd_attn alphabetical: k_conv, q_conv, rms1_out, v_conv
+    if (!verify_plan_output_name(&kern->plan_fwd_attn, 0, "k_conv") ||
+        !verify_plan_output_name(&kern->plan_fwd_attn, 1, "q_conv") ||
         !verify_plan_output_name(&kern->plan_fwd_attn, 2, "rms1_out") ||
-        !verify_plan_output_name(&kern->plan_fwd_attn, 3, "v_out") ||
+        !verify_plan_output_name(&kern->plan_fwd_attn, 3, "v_conv") ||
+        // fwd_attn_core alphabetical: attn_out, wo_conv
         !verify_plan_output_name(&kern->plan_fwd_attn_core, 0, "attn_out") ||
-        !verify_plan_output_name(&kern->plan_fwd_attn_core, 1, "wo_out") ||
+        !verify_plan_output_name(&kern->plan_fwd_attn_core, 1, "wo_conv") ||
+        // fwd_ffn alphabetical: gate, rms2_out, w1_conv, w2_conv, w3_conv
         !verify_plan_output_name(&kern->plan_fwd_ffn, 0, "gate") ||
         !verify_plan_output_name(&kern->plan_fwd_ffn, 1, "rms2_out") ||
-        !verify_plan_output_name(&kern->plan_fwd_ffn, 2, "w1_out") ||
-        !verify_plan_output_name(&kern->plan_fwd_ffn, 3, "w2_out") ||
-        !verify_plan_output_name(&kern->plan_fwd_ffn, 4, "w3_out") ||
+        !verify_plan_output_name(&kern->plan_fwd_ffn, 2, "w1_conv") ||
+        !verify_plan_output_name(&kern->plan_fwd_ffn, 3, "w2_conv") ||
+        !verify_plan_output_name(&kern->plan_fwd_ffn, 4, "w3_conv") ||
+        // ffn_bwd alphabetical: dh1, dh3, dx
         !verify_plan_output_name(&kern->plan_ffn_bwd, 0, "dh1") ||
         !verify_plan_output_name(&kern->plan_ffn_bwd, 1, "dh3") ||
         !verify_plan_output_name(&kern->plan_ffn_bwd, 2, "dx") ||
+        // sdpa_bwd1 alphabetical: dpf, dvf, pf
         !verify_plan_output_name(&kern->plan_sdpa_bwd1, 0, "dpf") ||
         !verify_plan_output_name(&kern->plan_sdpa_bwd1, 1, "dvf") ||
         !verify_plan_output_name(&kern->plan_sdpa_bwd1, 2, "pf") ||
+        // sdpa_bwd2 alphabetical: dkf, dqf
         !verify_plan_output_name(&kern->plan_sdpa_bwd2, 0, "dkf") ||
         !verify_plan_output_name(&kern->plan_sdpa_bwd2, 1, "dqf") ||
+        // qkv_bwd: dx
         !verify_plan_output_name(&kern->plan_qkv_bwd, 0, "dx")) {
         return false;
     }
